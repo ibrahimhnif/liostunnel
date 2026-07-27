@@ -81,6 +81,16 @@ russh::keys::{PrivateKeyWithHashAlg, HashAlg, ssh_key}
 // acceptance path: an attacker answers with RSA for a host recorded as ed25519 and
 // is trusted AND persisted. Check known_host_keys_path for existing entries first;
 // TOFU only when that list is empty.
+//
+// Second trap: known_host_keys_path swallows EVERY File::open error and returns
+// Ok(vec![]) (known_hosts.rs:70-74), so an empty list is ambiguous between three
+// cases. Discriminate on READABILITY, not existence:
+//   file absent                         -> first contact, TOFU
+//   file opens, no entry for this host  -> first contact for THIS host, TOFU
+//                                          (this is how a second profile is added;
+//                                           failing closed here breaks multi-server
+//                                           use permanently after the first host)
+//   file exists but will not open       -> unverifiable, reject
 ```
 
 ## File structure
