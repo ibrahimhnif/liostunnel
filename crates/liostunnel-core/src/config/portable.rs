@@ -1,0 +1,267 @@
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::config::profile::{AuthMethod, DnsConfig, ProtocolKind, ServerProfile, SplitTunnelRule};
+use crate::config::secret::{SecretRef, SecretStore};
+use crate::error::TunnelError;
+
+pub const EXPORT_WARNING: &str = "This export contains private keys and passwords in \
+     plaintext. Anyone who obtains this file gains full access to the server. Transfer it \
+     over a secure channel and delete it once imported.";
+
+/// The shareable `.liostunnel.json` format (PRD §5.2) and future QR payload.
+/// Carries inline secrets, unlike [`ServerProfile`]. Spec §6.3.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PortableProfile {
+    pub id: Uuid,
+    pub name: String,
+    pub protocol: ProtocolKind,
+    pub host: String,
+    pub port: u16,
+    pub auth: PortableAuth,
+    pub dns: DnsConfig,
+    pub split_tunnel: SplitTunnelRule,
+    pub kill_switch: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PortableAuth {
+    Password {
+        password: String,
+    },
+    PrivateKey {
+        private_key: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        passphrase: Option<String>,
+    },
+    PresharedKey {
+        private_key: String,
+        peer_public_key: String,
+    },
+}
+
+impl PortableProfile {
+    /// Moves inline secrets onto disk at mode 0600 and returns a profile that
+    /// only references them.
+    pub fn import(self, secret_dir: &Path) -> Result<ServerProfile, TunnelError> {
+        std::fs::create_dir_all(secret_dir).map_err(|e| {
+            TunnelError::config(
+                format!("secret dir {}", secret_dir.display()),
+                format!("cannot create: {e}"),
+            )
+        })?;
+
+        let write = |field: &str, value: &str| -> Result<SecretRef, TunnelError> {
+            let path = secret_dir.join(format!("{}.{field}", self.id));
+            write_secret_file(&path, value)?;
+            Ok(SecretRef::File { path })
+        };
+
+        let auth = match &self.auth {
+            PortableAuth::Password { password } => AuthMethod::Password {
+                password: write("password", password)?,
+            },
+            PortableAuth::PrivateKey {
+                private_key,
+                passphrase,
+            } => AuthMethod::PrivateKey {
+                private_key: write("private_key", private_key)?,
+                passphrase: match passphrase {
+                    Some(p) => Some(write("passphrase", p)?),
+                    None => None,
+                },
+            },
+            PortableAuth::PresharedKey {
+                private_key,
+                peer_public_key,
+            } => AuthMethod::PresharedKey {
+                private_key: write("private_key", private_key)?,
+                peer_public_key: peer_public_key.clone(),
+            },
+        };
+
+        Ok(ServerProfile {
+            id: self.id,
+            name: self.name,
+            protocol: self.protocol,
+            host: self.host,
+            port: self.port,
+            auth,
+            dns: self.dns,
+            split_tunnel: self.split_tunnel,
+            kill_switch: self.kill_switch,
+        })
+    }
+
+    /// Resolves every `SecretRef` back to inline material. Callers must show
+    /// [`EXPORT_WARNING`] first.
+    pub fn export(profile: &ServerProfile, store: &dyn SecretStore) -> Result<Self, TunnelError> {
+        let auth = match &profile.auth {
+            AuthMethod::Password { password } => PortableAuth::Password {
+                password: store.resolve(password)?.into_inner(),
+            },
+            AuthMethod::PrivateKey {
+                private_key,
+                passphrase,
+            } => PortableAuth::PrivateKey {
+                private_key: store.resolve(private_key)?.into_inner(),
+                passphrase: match passphrase {
+                    Some(p) => Some(store.resolve(p)?.into_inner()),
+                    None => None,
+                },
+            },
+            AuthMethod::PresharedKey {
+                private_key,
+                peer_public_key,
+            } => PortableAuth::PresharedKey {
+                private_key: store.resolve(private_key)?.into_inner(),
+                peer_public_key: peer_public_key.clone(),
+            },
+        };
+
+        Ok(Self {
+            id: profile.id,
+            name: profile.name.clone(),
+            protocol: profile.protocol,
+            host: profile.host.clone(),
+            port: profile.port,
+            auth,
+            dns: profile.dns.clone(),
+            split_tunnel: profile.split_tunnel.clone(),
+            kill_switch: profile.kill_switch,
+        })
+    }
+}
+
+/// Creates the file with 0600 already set, so the secret is never briefly
+/// world-readable between `create` and `set_permissions`.
+fn write_secret_file(path: &Path, value: &str) -> Result<(), TunnelError> {
+    use std::io::Write;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).map_err(|e| {
+        TunnelError::config(
+            format!("secret file {}", path.display()),
+            format!("cannot write: {e}"),
+        )
+    })?;
+    f.write_all(value.as_bytes())
+        .map_err(|e| TunnelError::config(format!("secret file {}", path.display()), e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::profile::{DnsMode, ProtocolKind, SplitTunnelRule};
+    use crate::config::secret::FileSecretStore;
+
+    #[test]
+    fn the_prd_example_parses_as_a_portable_profile() {
+        // PRD §5.2's JSON has inline secrets, which makes it a PortableProfile
+        // by definition — this test is the proof that the split in spec §6.3
+        // matches the PRD's own example.
+        let raw = include_str!("../../tests/fixtures/prd_example.json");
+        let p: PortableProfile = serde_json::from_str(raw).unwrap();
+
+        assert_eq!(p.name, "Home VPS - SG");
+        assert_eq!(p.protocol, ProtocolKind::WireGuard);
+        assert_eq!(p.port, 51820);
+        assert_eq!(p.dns.mode, DnsMode::Tcp);
+        assert_eq!(p.dns.servers.len(), 2);
+        assert_eq!(p.split_tunnel, SplitTunnelRule::AllTraffic);
+        assert!(p.kill_switch);
+        assert!(matches!(p.auth, PortableAuth::PresharedKey { .. }));
+    }
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("lios-portable-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn import_writes_secrets_to_disk_at_mode_600_and_returns_refs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmpdir("import");
+        let portable = PortableProfile {
+            id: uuid::Uuid::nil(),
+            name: "lab".into(),
+            protocol: ProtocolKind::Ssh,
+            host: "198.51.100.7".into(),
+            port: 22,
+            auth: PortableAuth::PrivateKey {
+                private_key: "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n".into(),
+                passphrase: None,
+            },
+            dns: serde_json::from_str(r#"["1.1.1.1"]"#).unwrap(),
+            split_tunnel: SplitTunnelRule::AllTraffic,
+            kill_switch: false,
+        };
+
+        let profile = portable.import(&dir).unwrap();
+
+        let SecretRef::File { path } = (match &profile.auth {
+            AuthMethod::PrivateKey { private_key, .. } => private_key.clone(),
+            other => panic!("wrong auth variant: {other:?}"),
+        }) else {
+            panic!("import must produce a file-backed SecretRef");
+        };
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "imported secret must be 0600, got {mode:o}");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("BEGIN OPENSSH")
+        );
+
+        // And the resulting ServerProfile is safe to serialise.
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(
+            !json.contains("BEGIN OPENSSH"),
+            "key material leaked: {json}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn export_round_trips_back_to_the_same_secret() {
+        let dir = tmpdir("export");
+        let original = PortableProfile {
+            id: uuid::Uuid::nil(),
+            name: "lab".into(),
+            protocol: ProtocolKind::Ssh,
+            host: "198.51.100.7".into(),
+            port: 22,
+            auth: PortableAuth::Password {
+                password: "hunter2".into(),
+            },
+            dns: serde_json::from_str(r#"["1.1.1.1"]"#).unwrap(),
+            split_tunnel: SplitTunnelRule::AllTraffic,
+            kill_switch: false,
+        };
+
+        let imported = original.clone().import(&dir).unwrap();
+        let exported = PortableProfile::export(&imported, &FileSecretStore).unwrap();
+
+        assert_eq!(exported.auth, original.auth);
+        assert_eq!(exported.name, original.name);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_export_warning_mentions_plaintext() {
+        assert!(EXPORT_WARNING.to_lowercase().contains("plaintext"));
+    }
+}
