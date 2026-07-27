@@ -2,8 +2,9 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use liostunnel_core::TunnelError;
-use liostunnel_core::config::profile::ServerProfile;
+use liostunnel_core::config::profile::{DnsMode, ServerProfile};
 use liostunnel_core::config::secret::FileSecretStore;
+use liostunnel_core::dns::over_tcp::TcpResolver;
 use liostunnel_core::dns::{Resolver, UnimplementedResolver};
 use liostunnel_core::engine::Engine;
 use liostunnel_core::net::smoltcp_stack::poll::SmoltcpStack;
@@ -156,15 +157,24 @@ pub async fn run(
     )?;
 
     // 5. Run until interrupted.
-    // TODO(Task 19/20): select the real resolver from `profile.dns` (DNS-over-TCP
-    // or DoH) once those backends exist. Until then every DNS query fails and
-    // drops silently on the wire -- the client's own resolver retries, which is
-    // strictly better than this CLI fabricating an answer. `resolve_one`'s
-    // per-query failure is only logged at `debug`, which would otherwise make
-    // "every DNS query fails" indistinguishable from "DNS is working
-    // silently" -- so say it once, loudly, here instead.
-    tracing::warn!("DNS resolution is not yet implemented; DNS queries will fail");
-    let resolver: Arc<dyn Resolver> = Arc::new(UnimplementedResolver);
+    // Select the real resolver backend from `profile.dns.mode`. Task 19 wires
+    // up DNS-over-TCP (RFC 7766, the zero-dependency default); DoH (Task 20)
+    // is still unimplemented -- until it lands, every DNS query in that mode
+    // fails and drops silently on the wire, which is strictly better than
+    // this CLI fabricating an answer. `resolve_one`'s per-query failure is
+    // only logged at `debug`, which would otherwise make "every DNS query
+    // fails" indistinguishable from "DNS is working silently" -- so say it
+    // once, loudly, here instead.
+    let resolver: Arc<dyn Resolver> = match profile.dns.mode {
+        DnsMode::Tcp => Arc::new(TcpResolver::new(
+            protocol.clone(),
+            profile.dns.servers.clone(),
+        )),
+        DnsMode::Https => {
+            tracing::warn!("DNS-over-HTTPS is not yet implemented; DNS queries will fail");
+            Arc::new(UnimplementedResolver)
+        }
+    };
     let engine = Engine::new(protocol, resolver, handles);
     let shutdown = engine.shutdown_handle();
     let stats = engine.stats_handle();
