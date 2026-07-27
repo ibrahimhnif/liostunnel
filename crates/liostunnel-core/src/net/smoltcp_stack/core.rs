@@ -166,7 +166,16 @@ fn awaits_peer(state: tcp::State) -> bool {
         // Not states a promoted flow is ever in: a socket only becomes a `Flow`
         // once it has left `Listen`/`SynReceived`, and this stack never dials
         // out, so `SynSent` is unreachable.
-        tcp::State::Listen | tcp::State::SynSent | tcp::State::SynReceived => false,
+        //
+        // If one of these ever becomes reachable — an outbound `connect()` is
+        // added, or `promote_accepted`'s filter loosens — the flow would fall
+        // through BOTH writers of `winding_down_since` and leak silently,
+        // exactly as `CloseWait` did. Fail loudly in debug rather than repeat
+        // this file's most expensive bug a fifth time.
+        state @ (tcp::State::Listen | tcp::State::SynSent | tcp::State::SynReceived) => {
+            debug_assert!(false, "unreachable for a promoted flow: {state:?}");
+            false
+        }
     }
 }
 
@@ -382,11 +391,20 @@ impl StackCore {
             //
             // Gated on `may_send()` rather than a hand-written state list.
             // `may_send()` is exactly `Established | CloseWait` (smoltcp
-            // src/socket/tcp.rs:1162), which is precisely the complement of
-            // `awaits_peer` among the states a live flow can occupy. Deriving it
-            // from smoltcp keeps the two writers of `winding_down_since`
-            // provably exhaustive instead of restating a list that can drift —
-            // and drift is what left `CloseWait` with no deadline at all.
+            // src/socket/tcp.rs:1162). Deriving it from smoltcp rather than
+            // restating a list is what stops the drift that previously left
+            // `CloseWait` with no deadline at all.
+            //
+            // These two writers are NOT a complete partition of `tcp::State`,
+            // and it would be dangerous to read them as one. Four mechanisms
+            // together cover a live flow:
+            //   - `awaits_peer`  -> FinWait1, FinWait2, Closing, LastAck
+            //   - `may_send()`   -> Established, CloseWait
+            //   - `reap_closed`  -> Closed (runs in this same `step`, just below)
+            //   - smoltcp itself -> TimeWait, via its 10s `Timer::Close`, which
+            //     also publishes `poll_at` so the caller's sleep stays bounded
+            // Listen/SynSent/SynReceived are unreachable for a promoted flow;
+            // `awaits_peer` asserts that rather than assuming it.
             let orphaned = flow.from_stream.is_closed() && socket.may_send();
 
             if awaits_peer(state) || orphaned {
@@ -659,14 +677,43 @@ impl StackCore {
         self.device.drain_tx()
     }
 
-    /// Step 5's timeout. `None` means "nothing is pending; sleep until a packet
-    /// or a wakeup arrives".
+    /// Step 5's timeout. `None` means "nothing is pending *that this stack knows
+    /// about*; sleep until a packet or an external wakeup arrives".
     ///
-    /// This is the value Task 14's loop sleeps on, so it must account for our
-    /// own sweeps as well as smoltcp's timers. smoltcp answers `Ingress` — which
+    /// This is the value the driving loop sleeps on, so it accounts for our own
+    /// sweeps as well as smoltcp's timers. smoltcp answers `Ingress` — which
     /// collapses to `None` — for every listening socket, so a `SocketSet` full of
     /// listeners would otherwise never wake the loop and the sweeps in
-    /// `sweep_stale_listeners`/`sweep_stale_flows` would never run.
+    /// `sweep_stale_listeners`/`abort_expired_flows` would never run.
+    ///
+    /// # Contract for the driving loop — read this before writing one
+    ///
+    /// **`None` does not mean "nothing will ever need doing."** This stack is
+    /// synchronous and holds no waker, no channel handle you can select on, and
+    /// no file descriptor: it cannot observe that a `LocalStream`'s peer became
+    /// readable or was dropped. A flow in `CloseWait` awaiting a slow response
+    /// reports `None` both before *and* after the tunnel side drops its stream.
+    /// A loop that blocks on this value alone will sleep through that forever.
+    ///
+    /// A correct driver must therefore:
+    ///
+    /// 1. Block on its own wakeup primitive **and** this timeout together —
+    ///    whichever fires first — never on this timeout alone.
+    /// 2. Signal that primitive from the tunnel task on **every** exit path,
+    ///    including errors and cancellation, not just the success path.
+    /// 3. Drop the `LocalStream` when the tunnel task finishes. That drop is
+    ///    what `observe_flow_states` detects (via `from_stream.is_closed()`)
+    ///    to start the shutdown clock; without it the flow is never reclaimed.
+    ///
+    /// No wakeup handle is exposed from here deliberately: the driver owns the
+    /// loop and the blocking primitive, so it should pick one (`Condvar`,
+    /// `mpsc::recv_timeout`, a `polling` registration) rather than have this
+    /// stack impose an unrelated one. That does mean points 2 and 3 are an
+    /// obligation this type cannot enforce — hence stating them here.
+    ///
+    /// Note `poll_delay` is commonly `Some(0)` immediately after a `step`
+    /// (`pump_inbound` frees receive buffer, so smoltcp owes a window update).
+    /// The precise claim is: once quiescent, `None`.
     pub fn poll_delay(&mut self, now: Instant) -> Option<Duration> {
         let smoltcp = self.iface.poll_delay(now, &self.sockets);
         let sweep = self.next_sweep_deadline().map(|at| {
@@ -683,7 +730,7 @@ impl StackCore {
     }
 
     /// When the next sweep has work to do. Must agree with the predicates in
-    /// `sweep_stale_listeners` and `sweep_stale_flows`: a deadline that comes due
+    /// `sweep_stale_listeners` and `abort_expired_flows`: a deadline that comes due
     /// without the matching sweep removing anything would spin the caller's loop.
     fn next_sweep_deadline(&self) -> Option<Instant> {
         let listeners = self
@@ -719,8 +766,12 @@ impl StackCore {
         self.malformed_dropped
     }
 
-    /// Bytes that were queued towards an application but never delivered
-    /// because its flow was retired first.
+    /// Bytes queued towards an application whose flow was retired first.
+    ///
+    /// An **upper bound**, not an exact count: the socket's own transmit queue
+    /// is included, and smoltcp exposes no way to tell bytes still unsent from
+    /// bytes already on the wire awaiting an ACK. A flow retired holding
+    /// segments the peer had in fact received will over-report by that much.
     pub fn bytes_discarded(&self) -> u64 {
         self.bytes_discarded
     }
@@ -1063,10 +1114,13 @@ mod tests {
         // A/B measured: fails with observation moved back to the start of the
         // step (the placement this whole class of bug came from), passes with it
         // in the shipped position. It does *not* catch observation placed
-        // between the poll and `pump_inbound`; nothing can, because the only
-        // state change `pump_inbound` makes is a `close()` that requires the
-        // `LocalStream` to be gone, which the orphan clock has already stamped.
-        // That part of the ordering is defensive, not load-bearing.
+        // between the poll and `pump_inbound`; nothing can, *given today's
+        // `LocalStream`* — the only state change `pump_inbound` makes is a
+        // `close()` that requires the `LocalStream` to be gone, which the orphan
+        // clock has already stamped. That rests on `LocalStream` owning both
+        // channel ends with no split API, so its read half cannot be dropped
+        // independently. Nothing pins that invariant; if `LocalStream` ever
+        // gains a half-shutdown, revisit this. Defensive today, not load-bearing.
         let mut core = StackCore::new(StackConfig::default());
         let mut clock = Clock(0);
         let (flow, cseq, sseq) = handshake(&mut core, &mut clock, APP, WEB, 1000);
