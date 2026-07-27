@@ -86,7 +86,12 @@ impl std::fmt::Debug for Wakeup {
     }
 }
 
-#[derive(Clone, Default)]
+/// Deliberately not `Default`. A handle with no wakeup still *works* — the
+/// loop's idle ceiling notices the flag eventually — which is exactly what
+/// makes it a footgun worth removing: the failure is a half-second stall, not
+/// an error. Anyone who genuinely wants a deaf handle can say
+/// `with_wakeup(Wakeup::default())` and mean it.
+#[derive(Clone)]
 pub struct ShutdownHandle {
     flag: Arc<AtomicBool>,
     /// So a shutdown is acted on at once rather than whenever the loop next

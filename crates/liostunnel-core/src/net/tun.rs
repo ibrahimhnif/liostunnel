@@ -127,13 +127,70 @@ impl PacketIo for FakePacketIo {
     }
 }
 
+/// The macOS utun address-family framing, and the two buffers it needs.
+///
+/// Split out from [`TunDevice`] for one reason: the buffers *are* the subtlety
+/// here, and opening a real device needs root, so this is the only way the
+/// invariant below can have a test at all.
+///
+/// **Read and write must not share a buffer.** A shared one works right up
+/// until the first write, which truncates it to that packet's framed length —
+/// 48 bytes for a SYN-ACK. Every subsequent `recv` is then handed 48 bytes
+/// instead of `mtu + 4`, and on a `SOCK_DGRAM` utun descriptor the excess is
+/// discarded *silently* rather than erroring. So reads keep succeeding and
+/// every inbound packet after the first outbound one arrives truncated, with
+/// no error anywhere to explain it.
+pub(crate) struct UtunFraming {
+    /// Sized for one full framed packet, and never resized.
+    read: Vec<u8>,
+    /// Rebuilt from scratch on every write. Never handed to a read.
+    write: Vec<u8>,
+}
+
+impl UtunFraming {
+    pub(crate) fn new(mtu: usize) -> Self {
+        Self {
+            read: vec![0u8; mtu + 4],
+            write: Vec::with_capacity(mtu + 4),
+        }
+    }
+
+    /// The buffer to hand to the device's `recv`. Always the full length.
+    pub(crate) fn read_buf(&mut self) -> &mut [u8] {
+        &mut self.read
+    }
+
+    /// Strips the address-family prefix off the `n` bytes just read into
+    /// [`Self::read_buf`], copying the bare IP packet into `out`.
+    pub(crate) fn finish_read(&self, n: usize, out: &mut [u8]) -> Result<usize, TunnelError> {
+        let ip = strip_af_prefix(&self.read[..n])?;
+        if ip.len() > out.len() {
+            return Err(TunnelError::Tun(format!(
+                "packet of {} bytes exceeds the {}-byte read buffer",
+                ip.len(),
+                out.len()
+            )));
+        }
+        out[..ip.len()].copy_from_slice(ip);
+        Ok(ip.len())
+    }
+
+    /// The framed bytes to hand to the device's `send`.
+    pub(crate) fn frame_for_write(&mut self, packet: &[u8]) -> Result<&[u8], TunnelError> {
+        self.write.clear();
+        self.write.extend_from_slice(&af_prefix_for(packet)?);
+        self.write.extend_from_slice(packet);
+        Ok(&self.write)
+    }
+}
+
 /// The real TUN device. macOS framing is applied here and nowhere else.
 pub struct TunDevice {
     inner: tun_rs::SyncDevice,
     mtu: usize,
     /// True on macOS, where utun prepends the address family.
     framed: bool,
-    scratch: Vec<u8>,
+    framing: UtunFraming,
 }
 
 impl TunDevice {
@@ -161,7 +218,7 @@ impl TunDevice {
             inner,
             mtu: cfg.mtu as usize,
             framed: cfg!(target_os = "macos"),
-            scratch: vec![0u8; cfg.mtu as usize + 4],
+            framing: UtunFraming::new(cfg.mtu as usize),
         })
     }
 
@@ -188,25 +245,17 @@ impl PacketIo for TunDevice {
                 Err(e) => Err(TunnelError::Tun(format!("read failed: {e}"))),
             };
         }
-        let n = match self.inner.recv(&mut self.scratch) {
+        let n = match self.inner.recv(self.framing.read_buf()) {
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(0),
             Err(e) => return Err(TunnelError::Tun(format!("read failed: {e}"))),
         };
-        let ip = strip_af_prefix(&self.scratch[..n])?;
-        if ip.len() > buf.len() {
-            return Err(TunnelError::Tun("read buffer too small".into()));
-        }
-        buf[..ip.len()].copy_from_slice(ip);
-        Ok(ip.len())
+        self.framing.finish_read(n, buf)
     }
 
     fn write_packet(&mut self, packet: &[u8]) -> Result<(), TunnelError> {
         let out = if self.framed {
-            self.scratch.clear();
-            self.scratch.extend_from_slice(&af_prefix_for(packet)?);
-            self.scratch.extend_from_slice(packet);
-            &self.scratch[..]
+            self.framing.frame_for_write(packet)?
         } else {
             packet
         };
@@ -293,6 +342,70 @@ mod tests {
 
         io.write_packet(&ipv6()).unwrap();
         assert_eq!(io.take_outbound(), vec![ipv6()]);
+    }
+
+    #[test]
+    fn a_write_never_shrinks_the_buffer_the_next_read_uses() {
+        // Read and write shared one `scratch` buffer until this pass. The first
+        // framed write truncated it to that packet's length, so every later
+        // `recv` was handed a fraction of the MTU.
+        let mut framing = UtunFraming::new(1500);
+        assert_eq!(framing.read_buf().len(), 1504);
+
+        let mut synack = vec![0u8; 44];
+        synack[0] = 0x45;
+        assert_eq!(framing.frame_for_write(&synack).unwrap().len(), 48);
+
+        assert_eq!(
+            framing.read_buf().len(),
+            1504,
+            "a write must not resize the buffer reads are handed"
+        );
+    }
+
+    #[test]
+    fn a_full_mtu_packet_still_reads_whole_after_a_write() {
+        // The behavioural half: not just "the buffer is the right length" but
+        // "a full-MTU packet survives a read that follows a write". With the
+        // shared buffer this lost 1456 of 1500 bytes, and a `SOCK_DGRAM` utun
+        // descriptor discards the excess silently — no error, no log, just a
+        // corrupt packet handed to `StackCore::ingest`.
+        const MTU: usize = 1500;
+        let mut framing = UtunFraming::new(MTU);
+
+        let mut synack = vec![0u8; 44];
+        synack[0] = 0x45;
+        framing.frame_for_write(&synack).unwrap();
+
+        let mut inbound = vec![0u8; MTU];
+        inbound[0] = 0x45;
+        inbound[MTU - 1] = 0xEE; // the tail the truncation used to eat
+        let mut delivered = AF_INET_BE.to_vec();
+        delivered.extend_from_slice(&inbound);
+
+        let read_buf = framing.read_buf();
+        assert!(
+            read_buf.len() >= delivered.len(),
+            "the read buffer holds only {} bytes, so the device would truncate",
+            read_buf.len()
+        );
+        read_buf[..delivered.len()].copy_from_slice(&delivered);
+
+        let mut out = vec![0u8; MTU];
+        let n = framing.finish_read(delivered.len(), &mut out).unwrap();
+        assert_eq!(n, MTU, "the whole packet must survive the round trip");
+        assert_eq!(out[..n], inbound[..]);
+    }
+
+    #[test]
+    fn a_packet_too_large_for_the_callers_buffer_is_an_error_not_a_panic() {
+        let mut framing = UtunFraming::new(1500);
+        let mut delivered = AF_INET_BE.to_vec();
+        delivered.extend_from_slice(&[0x45u8; 100]);
+        framing.read_buf()[..delivered.len()].copy_from_slice(&delivered);
+
+        let mut out = [0u8; 64];
+        assert!(framing.finish_read(delivered.len(), &mut out).is_err());
     }
 
     #[test]

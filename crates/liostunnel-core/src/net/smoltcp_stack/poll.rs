@@ -38,6 +38,11 @@ use crate::net::{Datagram, NetStack, ShutdownHandle, StackConfig, StackHandles, 
 /// idle tunnel — twice a second, for a few microseconds. It is kept because
 /// `poll_delay`'s contract has obligations this file cannot enforce on its
 /// callers, and a bounded stall is a far better failure than a permanent one.
+///
+/// "Twice a second" is the *idle* figure and only that. A saturated engine
+/// falls to [`BACKLOG_RETRY`] instead, which is around a hundred passes a
+/// second — deliberate, since the flows in the backlog are already accepted and
+/// waiting, but not something to quote as this loop's resting cost.
 const MAX_IDLE: StdDuration = StdDuration::from_millis(500);
 
 /// How soon to retry handing over flows the engine's channel could not take.
@@ -57,79 +62,144 @@ const READ_ERROR_BACKOFF: StdDuration = StdDuration::from_millis(50);
 /// Poller key for the TUN descriptor. Only one source is ever registered.
 const TUN_KEY: usize = 7;
 
-/// What the poller was told to watch, in the form `Poller::modify` and
-/// `Poller::delete` need. They take an `AsSource`, which is `AsFd`; a bare
-/// `RawFd` deliberately does not implement `AsFd`, because a raw descriptor
-/// carries no lifetime, so a borrow has to be minted by hand.
-#[cfg(unix)]
-type TunRegistration = Option<std::os::fd::BorrowedFd<'static>>;
-#[cfg(not(unix))]
-type TunRegistration = Option<std::convert::Infallible>;
-
-/// Registers the device's descriptor, if it has one.
+/// How many consecutive `Poller::wait` failures to tolerate before giving up.
 ///
-/// The returned borrow is `'static` only because there is nowhere shorter to
-/// tie it to; its real lifetime is argued in the `SAFETY` note and bounded by
-/// [`unregister_tun`].
+/// `polling` retries `Interrupted` itself, so anything that reaches us is
+/// non-transient. Ten attempts at [`READ_ERROR_BACKOFF`] apart is half a second
+/// of patience, after which the loop can no longer do its one job and should
+/// say so by closing its channels rather than spinning behind a wall of
+/// identical log lines.
+const MAX_WAIT_FAILURES: u32 = 10;
+
+/// Most packets to take off the device in one pass.
+///
+/// The drain is otherwise unbounded, so a device that never returns `Ok(0)`
+/// would starve `step`, the shutdown check and the re-arm indefinitely while
+/// `QueuedDevice`'s receive queue grew. Hitting the cap costs nothing: the
+/// descriptor is still readable, so the wait after it returns at once.
+const DRAIN_BATCH: usize = 256;
+
+/// The poller's registration for the TUN descriptor, released on drop.
+///
+/// `Poller::add` requires a source to be deleted before the descriptor it names
+/// is closed. An explicit call at the bottom of the loop does not achieve that:
+/// `thread::Builder::spawn` can fail and simply drop the closure — and the
+/// device with it — while the registration is live, and a panic unwinds
+/// straight past any explicit call. A guard covers both structurally, which is
+/// the only way this stays true as the loop changes.
+///
+/// It is held next to the device in [`Device`], whose field order guarantees
+/// this is dropped first.
 #[cfg(unix)]
-fn register_tun(poller: &Poller, io: &dyn PacketIo) -> Result<TunRegistration, TunnelError> {
-    let Some(raw) = io.pollable_fd() else {
-        return Ok(None);
-    };
-    // SAFETY: `raw` belongs to `io`. The caller moves `io` into the stack
-    // thread and drops it only after calling `unregister_tun`, so this borrow
-    // never names a closed descriptor. Nothing else in this crate takes or
-    // closes a `PacketIo`'s descriptor, and `PacketIo` has no method that
-    // would let one be closed early.
-    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
-    // SAFETY: `Poller::add` requires the source to stay registered until it is
-    // deleted or the poller is dropped. `unregister_tun` runs on every exit
-    // path out of the loop, while `io` is still alive.
-    unsafe { poller.add(raw, Event::readable(TUN_KEY)) }
-        .map_err(|e| TunnelError::Tun(format!("cannot watch the TUN descriptor: {e}")))?;
-    Ok(Some(borrowed))
+struct Registration {
+    poller: Arc<Poller>,
+    /// `Poller::modify` and `Poller::delete` take an `AsSource`, which is
+    /// `AsFd`; a bare `RawFd` deliberately does not implement `AsFd`, because a
+    /// raw descriptor carries no lifetime. So a borrow has to be minted by hand.
+    fd: Option<std::os::fd::BorrowedFd<'static>>,
 }
 
-#[cfg(not(unix))]
-fn register_tun(_poller: &Poller, _io: &dyn PacketIo) -> Result<TunRegistration, TunnelError> {
-    Ok(None)
+#[cfg(unix)]
+impl Registration {
+    fn new(poller: Arc<Poller>, io: &dyn PacketIo) -> Result<Self, TunnelError> {
+        let Some(raw) = io.pollable_fd() else {
+            return Ok(Self { poller, fd: None });
+        };
+        // SAFETY: `raw` belongs to `io`. This borrow lives in a `Registration`,
+        // which `Device` declares before its `io` field and which is therefore
+        // dropped first on every path — normal exit, a failed `spawn` dropping
+        // the closure, or a panic unwinding through it. So it never names a
+        // closed descriptor. Nothing else in this crate takes or closes a
+        // `PacketIo`'s descriptor, and `PacketIo` exposes no method that would
+        // let one be closed early. The `'static` is only because there is no
+        // shorter lifetime to tie it to.
+        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
+        // SAFETY: as above — `Drop for Registration` deletes the source, and it
+        // runs before the descriptor is closed on every path.
+        unsafe { poller.add(raw, Event::readable(TUN_KEY)) }
+            .map_err(|e| TunnelError::Tun(format!("cannot watch the TUN descriptor: {e}")))?;
+        Ok(Self {
+            poller,
+            fd: Some(fd),
+        })
+    }
+
+    /// Renews the registration ahead of a wait.
+    ///
+    /// `polling` hands out one-shot registrations: once an event is delivered
+    /// the source is disarmed, and a loop that forgets this goes permanently
+    /// deaf after its first packet — a failure that passes any single-packet
+    /// test. Re-arming one that did *not* fire is a no-op, so this is
+    /// unconditional.
+    fn rearm(&self) -> std::io::Result<()> {
+        match self.fd {
+            Some(fd) => self.poller.modify(fd, Event::readable(TUN_KEY)),
+            None => Ok(()),
+        }
+    }
 }
 
-/// Renews the registration ahead of a wait.
-///
-/// `polling` hands out one-shot registrations: once an event is delivered the
-/// source is disarmed, and a loop that forgets this goes permanently deaf after
-/// its first packet — a failure that passes any single-packet test. Re-arming a
-/// registration that did *not* fire is a no-op, so this is unconditional.
 #[cfg(unix)]
-fn rearm_tun(poller: &Poller, reg: TunRegistration) -> std::io::Result<()> {
-    match reg {
-        Some(fd) => poller.modify(fd, Event::readable(TUN_KEY)),
-        None => Ok(()),
+impl Drop for Registration {
+    fn drop(&mut self) {
+        if let Some(fd) = self.fd
+            && let Err(e) = self.poller.delete(fd)
+        {
+            tracing::debug!(%e, "cannot unregister the TUN descriptor");
+        }
     }
 }
 
 #[cfg(not(unix))]
-fn rearm_tun(_poller: &Poller, _reg: TunRegistration) -> std::io::Result<()> {
-    Ok(())
-}
+struct Registration;
 
-/// Drops the registration while the descriptor is still open.
-///
-/// Done explicitly rather than left to the poller's own drop: the order in
-/// which a closure's captured variables are dropped is not specified, so `io`
-/// could close the descriptor first.
-#[cfg(unix)]
-fn unregister_tun(poller: &Poller, reg: TunRegistration) {
-    if let Some(fd) = reg
-        && let Err(e) = poller.delete(fd)
-    {
-        tracing::debug!(%e, "cannot unregister the TUN descriptor");
+#[cfg(not(unix))]
+impl Registration {
+    fn new(_poller: Arc<Poller>, _io: &dyn PacketIo) -> Result<Self, TunnelError> {
+        Ok(Self)
+    }
+    fn rearm(&self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
-#[cfg(not(unix))]
-fn unregister_tun(_poller: &Poller, _reg: TunRegistration) {}
+/// The device and its poller registration, kept together so that the one is
+/// always released before the other is closed.
+struct Device {
+    /// Declared before `io`, and therefore dropped before it: struct fields
+    /// drop in declaration order, whereas a closure's captured variables have
+    /// no defined order at all. That difference is the whole reason this type
+    /// exists.
+    registration: Registration,
+    io: Box<dyn PacketIo>,
+}
+
+/// What the loop does after a `Poller::wait`.
+#[derive(Debug, PartialEq, Eq)]
+enum AfterWait {
+    /// Carry on.
+    Continue,
+    /// Failed, but not hopelessly yet. Sleep before retrying: a failed `wait`
+    /// returns *instantly*, so without this the loop spins at 100% CPU.
+    Backoff,
+    /// Failed too many times in a row. Stop, and close the channels on the way.
+    GiveUp,
+}
+
+/// The give-up policy, split out because there is no safe way to make a real
+/// `Poller` fail on demand — so this is the part that can have a test.
+fn after_wait(failed: bool, consecutive: &mut u32) -> AfterWait {
+    if !failed {
+        *consecutive = 0;
+        return AfterWait::Continue;
+    }
+    *consecutive += 1;
+    if *consecutive >= MAX_WAIT_FAILURES {
+        AfterWait::GiveUp
+    } else {
+        AfterWait::Backoff
+    }
+}
 
 /// The default `NetStack`: a dedicated thread around [`StackCore`]. Decision D7.
 #[derive(Default)]
@@ -157,11 +227,7 @@ impl NetStack for SmoltcpStack {
     ///
     /// Must be called from within a tokio runtime: the datagram bridge between
     /// `udp_outbound` and the synchronous loop is a spawned task.
-    fn start(
-        self,
-        mut io: Box<dyn PacketIo>,
-        cfg: StackConfig,
-    ) -> Result<StackHandles, TunnelError> {
+    fn start(self, io: Box<dyn PacketIo>, cfg: StackConfig) -> Result<StackHandles, TunnelError> {
         let (tcp_tx, tcp_accept) = mpsc::channel::<TcpFlow>(cfg.channel_depth);
         let (udp_in_tx, udp_inbound) = mpsc::channel::<Datagram>(cfg.channel_depth);
         let (udp_outbound, mut udp_out_rx) = mpsc::channel::<Datagram>(cfg.channel_depth);
@@ -202,7 +268,10 @@ impl NetStack for SmoltcpStack {
             });
         }
 
-        let tun = register_tun(&poller, io.as_ref())?;
+        let mut device = Device {
+            registration: Registration::new(Arc::clone(&poller), io.as_ref())?,
+            io,
+        };
 
         let shutdown_thread = shutdown.clone();
         let poller_thread = Arc::clone(&poller);
@@ -210,7 +279,7 @@ impl NetStack for SmoltcpStack {
         std::thread::Builder::new()
             .name("liostunnel-stack".into())
             .spawn(move || {
-                let mtu = io.mtu();
+                let mtu = device.io.mtu();
                 let mut core = StackCore::with_seed(cfg, random_seed());
                 // Every `LocalStream` promoted from here on carries this, so a
                 // write, a read, a half-close or a drop on the tunnel side is
@@ -228,6 +297,7 @@ impl NetStack for SmoltcpStack {
                 // already counted against `StackCore`'s own caps.
                 let mut backlog: VecDeque<TcpFlow> = VecDeque::new();
                 let mut read_errors: u64 = 0;
+                let mut wait_failures: u32 = 0;
 
                 loop {
                     if let Some(n) = &iterations {
@@ -238,9 +308,11 @@ impl NetStack for SmoltcpStack {
                     }
 
                     // Step 1: drain the device, inspecting on the way past.
+                    // Bounded by `DRAIN_BATCH` so a device that never reports
+                    // itself empty cannot starve everything below.
                     let mut read_failed = false;
-                    loop {
-                        match io.read_packet(&mut buf) {
+                    for _ in 0..DRAIN_BATCH {
+                        match device.io.read_packet(&mut buf) {
                             Ok(0) => break,
                             Ok(n) => core.ingest(&buf[..n]),
                             Err(e) => {
@@ -275,7 +347,7 @@ impl NetStack for SmoltcpStack {
 
                     // Step 3.
                     for packet in core.drain_tx() {
-                        if let Err(e) = io.write_packet(&packet) {
+                        if let Err(e) = device.io.write_packet(&packet) {
                             tracing::warn!(%e, "TUN write failed");
                         }
                     }
@@ -321,7 +393,11 @@ impl NetStack for SmoltcpStack {
                     if !backlog.is_empty() {
                         timeout = timeout.min(BACKLOG_RETRY);
                     }
-                    if read_failed {
+                    // A single failure is treated as transient — `EINTR`, a
+                    // momentary `ENOBUFS` — and costs one immediate retry
+                    // rather than a whole backoff of deafness. Only a second
+                    // consecutive one means the device is actually broken.
+                    if read_errors > 1 {
                         // The descriptor is *ready* and failing, so no timeout
                         // on its own can slow this down: `wait` returns the
                         // instant a re-armed ready descriptor is watched, and
@@ -330,22 +406,38 @@ impl NetStack for SmoltcpStack {
                         // listening to it for a beat and sleep on the timer.
                         // Applied last, so it wins over the other two bounds.
                         timeout = timeout.max(READ_ERROR_BACKOFF);
-                    } else if let Err(e) = rearm_tun(&poller_thread, tun) {
+                    } else if let Err(e) = device.registration.rearm() {
                         // Not fatal: the idle ceiling keeps the loop limping at
                         // reduced responsiveness rather than dropping every
                         // connection. Loud, because that is a real degradation.
                         tracing::error!(%e, "cannot re-arm the TUN descriptor; \
                              falling back to timed polling");
                     }
+
                     events.clear();
-                    if let Err(e) = poller_thread.wait(&mut events, Some(timeout)) {
-                        tracing::warn!(%e, "poller wait failed");
+                    let failed = poller_thread
+                        .wait(&mut events, Some(timeout))
+                        .inspect_err(|e| tracing::error!(%e, "poller wait failed"))
+                        .is_err();
+                    match after_wait(failed, &mut wait_failures) {
+                        AfterWait::Continue => {}
+                        // A failed `wait` returns instantly, so the sleep it
+                        // owed us never happened. Without this the loop spins
+                        // at 100% CPU — the same shape `READ_ERROR_BACKOFF`
+                        // exists for, on the one path that had not got it.
+                        AfterWait::Backoff => std::thread::sleep(READ_ERROR_BACKOFF),
+                        AfterWait::GiveUp => {
+                            tracing::error!(
+                                "giving up after {MAX_WAIT_FAILURES} consecutive poller failures"
+                            );
+                            break;
+                        }
                     }
                 }
 
-                // While `io` is still alive; see `unregister_tun`.
-                unregister_tun(&poller_thread, tun);
-                drop(io);
+                // `Device`'s field order releases the registration before the
+                // descriptor it names is closed; see `Registration`.
+                drop(device);
                 // Dropping `core` drops every flow, which closes both halves of
                 // every `LocalStream` still out there — the engine's tasks see
                 // EOF rather than hanging.
@@ -392,6 +484,39 @@ mod tests {
     /// Comfortably inside [`MAX_IDLE`], so a test that asserts on it fails if
     /// the loop fell back to the idle ceiling instead of being woken properly.
     const PROMPT: Duration = Duration::from_millis(200);
+
+    #[test]
+    fn a_successful_wait_clears_the_failure_count() {
+        let mut consecutive = 3;
+        assert_eq!(after_wait(false, &mut consecutive), AfterWait::Continue);
+        assert_eq!(consecutive, 0, "a good wait must not count against us");
+    }
+
+    #[test]
+    fn repeated_wait_failures_back_off_and_then_give_up() {
+        // A failed `wait` returns instantly, so "keep going" is a 100% CPU spin
+        // and an unbounded log flood. Every failure has to cost a sleep, and a
+        // poller that never recovers has to end the thread rather than burn the
+        // battery flat pretending to work.
+        let mut consecutive = 0;
+        for attempt in 1..MAX_WAIT_FAILURES {
+            assert_eq!(
+                after_wait(true, &mut consecutive),
+                AfterWait::Backoff,
+                "failure {attempt} should still be given a chance"
+            );
+        }
+        assert_eq!(after_wait(true, &mut consecutive), AfterWait::GiveUp);
+    }
+
+    #[test]
+    fn an_intermittent_wait_failure_never_reaches_the_give_up_threshold() {
+        let mut consecutive = 0;
+        for _ in 0..MAX_WAIT_FAILURES * 3 {
+            assert_eq!(after_wait(true, &mut consecutive), AfterWait::Backoff);
+            assert_eq!(after_wait(false, &mut consecutive), AfterWait::Continue);
+        }
+    }
 
     /// A `PacketIo` over one end of a `UnixDatagram` pair: a real, pollable
     /// descriptor with packet boundaries, needing no privileges, no network and
