@@ -26,7 +26,7 @@ pub struct PortableProfile {
     pub kill_switch: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PortableAuth {
     Password {
@@ -41,6 +41,34 @@ pub enum PortableAuth {
         private_key: String,
         peer_public_key: String,
     },
+}
+
+/// Manual impl so a stray `{:?}` (log line, panic backtrace, CLI error path)
+/// can never print a private key or password. Mirrors `Redacted<T>`'s intent
+/// in `secret.rs`, applied here because `PortableAuth` holds raw `String`
+/// secrets rather than `SecretRef`s. `peer_public_key` is public by
+/// definition, so it stays visible.
+impl std::fmt::Debug for PortableAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PortableAuth::Password { .. } => f
+                .debug_struct("Password")
+                .field("password", &"<redacted>")
+                .finish(),
+            PortableAuth::PrivateKey { passphrase, .. } => f
+                .debug_struct("PrivateKey")
+                .field("private_key", &"<redacted>")
+                .field("passphrase", &passphrase.as_ref().map(|_| "<redacted>"))
+                .finish(),
+            PortableAuth::PresharedKey {
+                peer_public_key, ..
+            } => f
+                .debug_struct("PresharedKey")
+                .field("private_key", &"<redacted>")
+                .field("peer_public_key", peer_public_key)
+                .finish(),
+        }
+    }
 }
 
 impl PortableProfile {
@@ -138,22 +166,54 @@ impl PortableProfile {
 
 /// Creates the file with 0600 already set, so the secret is never briefly
 /// world-readable between `create` and `set_permissions`.
+///
+/// Always opens with `create_new`, which both refuses to follow an existing
+/// symlink at `path` and guarantees the mode we pass is the mode the file is
+/// born with — POSIX only honours `open()`'s mode argument on creation, so a
+/// plain `create(true)` would silently inherit a looser mode (or write
+/// through a symlink) if something already sat at `path`. `ServerProfile`'s
+/// `id` is stable across re-import, so a stale file at this exact path is a
+/// real, reachable case, not a hypothetical one: if `create_new` reports
+/// `AlreadyExists`, we remove whatever is there and retry once. Any other
+/// failure — including a second `AlreadyExists` — is propagated rather than
+/// falling back to a non-atomic create.
 fn write_secret_file(path: &Path, value: &str) -> Result<(), TunnelError> {
     use std::io::Write;
 
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path).map_err(|e| {
-        TunnelError::config(
-            format!("secret file {}", path.display()),
-            format!("cannot write: {e}"),
-        )
-    })?;
+    let open_fresh = || -> std::io::Result<std::fs::File> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(path)
+    };
+
+    let mut f = match open_fresh() {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path).map_err(|e| {
+                TunnelError::config(
+                    format!("secret file {}", path.display()),
+                    format!("cannot remove stale file before re-import: {e}"),
+                )
+            })?;
+            open_fresh().map_err(|e| {
+                TunnelError::config(
+                    format!("secret file {}", path.display()),
+                    format!("cannot write after removing stale file: {e}"),
+                )
+            })?
+        }
+        Err(e) => {
+            return Err(TunnelError::config(
+                format!("secret file {}", path.display()),
+                format!("cannot write: {e}"),
+            ));
+        }
+    };
     f.write_all(value.as_bytes())
         .map_err(|e| TunnelError::config(format!("secret file {}", path.display()), e.to_string()))
 }
@@ -192,7 +252,7 @@ mod tests {
     fn import_writes_secrets_to_disk_at_mode_600_and_returns_refs() {
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = tmpdir("import");
+        let dir = tmpdir("import_writes_secrets_to_disk_at_mode_600_and_returns_refs");
         let portable = PortableProfile {
             id: uuid::Uuid::nil(),
             name: "lab".into(),
@@ -237,7 +297,7 @@ mod tests {
 
     #[test]
     fn export_round_trips_back_to_the_same_secret() {
-        let dir = tmpdir("export");
+        let dir = tmpdir("export_round_trips_back_to_the_same_secret");
         let original = PortableProfile {
             id: uuid::Uuid::nil(),
             name: "lab".into(),
@@ -263,5 +323,171 @@ mod tests {
     #[test]
     fn the_export_warning_mentions_plaintext() {
         assert!(EXPORT_WARNING.to_lowercase().contains("plaintext"));
+    }
+
+    #[test]
+    fn reimporting_over_a_stale_file_yields_fresh_0600_content_not_the_old_mode() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        // `ServerProfile`/`PortableProfile` ids are stable across re-import,
+        // so a second import for the same id lands on the exact same
+        // destination path. Simulate that by pre-creating the destination
+        // (loosely permissioned, with stale content) before calling
+        // `import()`, proving the fix does not inherit the old mode or
+        // silently keep the old bytes.
+        let dir =
+            tmpdir("reimporting_over_a_stale_file_yields_fresh_0600_content_not_the_old_mode");
+        let id = uuid::Uuid::nil();
+        let dest = dir.join(format!("{id}.password"));
+        {
+            let mut f = std::fs::File::create(&dest).unwrap();
+            f.write_all(b"stale content from a previous export")
+                .unwrap();
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        let portable = PortableProfile {
+            id,
+            name: "lab".into(),
+            protocol: ProtocolKind::Ssh,
+            host: "198.51.100.7".into(),
+            port: 22,
+            auth: PortableAuth::Password {
+                password: "hunter2".into(),
+            },
+            dns: serde_json::from_str(r#"["1.1.1.1"]"#).unwrap(),
+            split_tunnel: SplitTunnelRule::AllTraffic,
+            kill_switch: false,
+        };
+
+        let profile = portable.import(&dir).unwrap();
+        let AuthMethod::Password { password } = profile.auth else {
+            panic!("wrong auth variant");
+        };
+        let SecretRef::File { path } = password else {
+            panic!("import must produce a file-backed SecretRef");
+        };
+        assert_eq!(path, dest, "must write to the deterministic id-based path");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "re-imported secret must be 0600, got {mode:o}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "hunter2",
+            "re-imported secret must replace the stale content"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn preshared_key_round_trips_through_import_and_export() {
+        let dir = tmpdir("preshared_key_round_trips_through_import_and_export");
+        let original = PortableProfile {
+            id: uuid::Uuid::nil(),
+            name: "lab".into(),
+            protocol: ProtocolKind::WireGuard,
+            host: "198.51.100.7".into(),
+            port: 51820,
+            auth: PortableAuth::PresharedKey {
+                private_key: "psk-material".into(),
+                peer_public_key: "peer-pubkey".into(),
+            },
+            dns: serde_json::from_str(r#"["1.1.1.1"]"#).unwrap(),
+            split_tunnel: SplitTunnelRule::AllTraffic,
+            kill_switch: false,
+        };
+
+        let imported = original.clone().import(&dir).unwrap();
+        match &imported.auth {
+            AuthMethod::PresharedKey {
+                private_key,
+                peer_public_key,
+            } => {
+                assert!(matches!(private_key, SecretRef::File { .. }));
+                // Public by definition — must stay a plain String, never a SecretRef.
+                assert_eq!(peer_public_key, "peer-pubkey");
+            }
+            other => panic!("wrong auth variant: {other:?}"),
+        }
+
+        let exported = PortableProfile::export(&imported, &FileSecretStore).unwrap();
+        assert_eq!(exported.auth, original.auth);
+        assert_eq!(exported.name, original.name);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn private_key_with_passphrase_round_trips_and_writes_two_distinct_files() {
+        let dir = tmpdir("private_key_with_passphrase_round_trips_and_writes_two_distinct_files");
+        let original = PortableProfile {
+            id: uuid::Uuid::nil(),
+            name: "lab".into(),
+            protocol: ProtocolKind::Ssh,
+            host: "198.51.100.7".into(),
+            port: 22,
+            auth: PortableAuth::PrivateKey {
+                // No trailing newline: `FileSecretStore::resolve` (secret.rs)
+                // deliberately trims trailing `\n` when reading a secret file
+                // back, for human-edited key files. That's orthogonal to what
+                // this test checks, so avoid tripping it here.
+                private_key: "-----BEGIN OPENSSH PRIVATE KEY-----\nabc".into(),
+                passphrase: Some("swordfish".into()),
+            },
+            dns: serde_json::from_str(r#"["1.1.1.1"]"#).unwrap(),
+            split_tunnel: SplitTunnelRule::AllTraffic,
+            kill_switch: false,
+        };
+
+        let imported = original.clone().import(&dir).unwrap();
+
+        let (key_ref, pass_ref) = match &imported.auth {
+            AuthMethod::PrivateKey {
+                private_key,
+                passphrase,
+            } => (
+                private_key.clone(),
+                passphrase.clone().expect("passphrase must survive import"),
+            ),
+            other => panic!("wrong auth variant: {other:?}"),
+        };
+        let SecretRef::File { path: key_path } = key_ref else {
+            panic!("import must produce a file-backed SecretRef for the key");
+        };
+        let SecretRef::File { path: pass_path } = pass_ref else {
+            panic!("import must produce a file-backed SecretRef for the passphrase");
+        };
+        assert_ne!(
+            key_path, pass_path,
+            "key and passphrase must be written to distinct files"
+        );
+
+        let exported = PortableProfile::export(&imported, &FileSecretStore).unwrap();
+        assert_eq!(exported.auth, original.auth);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn portable_auth_debug_never_prints_secret_material() {
+        let auth = PortableAuth::PrivateKey {
+            private_key: "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n".into(),
+            passphrase: Some("swordfish".into()),
+        };
+        let rendered = format!("{auth:?}");
+        assert!(!rendered.contains("BEGIN OPENSSH"), "leaked: {rendered}");
+        assert!(!rendered.contains("swordfish"), "leaked: {rendered}");
+        assert!(rendered.contains("<redacted>"));
+
+        let psk = PortableAuth::PresharedKey {
+            private_key: "psk-material".into(),
+            peer_public_key: "peer-pubkey".into(),
+        };
+        let rendered = format!("{psk:?}");
+        assert!(!rendered.contains("psk-material"), "leaked: {rendered}");
+        // Public by definition — fine, even expected, to show up in Debug.
+        assert!(rendered.contains("peer-pubkey"));
     }
 }
