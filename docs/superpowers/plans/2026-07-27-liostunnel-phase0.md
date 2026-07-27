@@ -4270,8 +4270,10 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p liostunnel-core stack_core`
+Run: `cargo test -p liostunnel-core smoltcp_stack::core`
 Expected: FAIL — `cannot find type StackCore in this scope`.
+
+(The module path is `smoltcp_stack::core`, not `stack_core` — a bare `stack_core` filter matches nothing and silently reports "0 passed" as if it were success.)
 
 - [ ] **Step 3: Implement**
 
@@ -4578,7 +4580,7 @@ Add `pub mod core;` to `crates/liostunnel-core/src/net/smoltcp_stack/mod.rs`, an
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p liostunnel-core stack_core -- --nocapture`
+Run: `cargo test -p liostunnel-core smoltcp_stack::core -- --nocapture`
 Expected: PASS — 9 passed.
 
 If `Socket::set_timeout` or `SocketSet::remove` differ, check `cargo doc -p smoltcp --open`; everything else in this task is pinned by the verified API reference.
