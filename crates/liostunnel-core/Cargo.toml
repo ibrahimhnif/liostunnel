@@ -16,6 +16,7 @@ russh.workspace = true
 tokio.workspace = true
 tun-rs = { workspace = true }
 smoltcp = { workspace = true }
+tokio-util.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "time"] }
