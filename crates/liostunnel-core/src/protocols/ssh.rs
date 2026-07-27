@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use russh::client::{self, AuthResult};
@@ -23,19 +23,24 @@ pub enum HostKeyPolicy {
     AcceptAny,
 }
 
+/// Conservative: OpenSSH's default limits are higher, but a burst of flows
+/// from the packet engine should queue rather than fail. Spec §8.
+const MAX_CONCURRENT_CHANNELS: usize = 64;
+
 pub struct SshTunnel {
     user: String,
     policy: HostKeyPolicy,
     handle: Option<client::Handle<ClientHandler>>,
     state: ConnectionState,
     counters: Arc<Counters>,
+    channel_limit: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Default)]
 struct Counters {
-    bytes_up: AtomicU64,
-    bytes_down: AtomicU64,
-    active_flows: AtomicU32,
+    bytes_up: Arc<AtomicU64>,
+    bytes_down: Arc<AtomicU64>,
+    active_flows: Arc<AtomicU64>,
     flows_failed: AtomicU64,
 }
 
@@ -47,6 +52,7 @@ impl SshTunnel {
             handle: None,
             state: ConnectionState::Disconnected,
             counters: Arc::new(Counters::default()),
+            channel_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CHANNELS)),
         }
     }
 }
@@ -236,11 +242,10 @@ impl Protocol for SshTunnel {
 
     async fn open_tcp_stream(
         &self,
-        _dest: SocketAddr,
+        dest: SocketAddr,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
-        Err(TunnelError::Unsupported(
-            "open_tcp_stream (arrives in Task 7)",
-        ))
+        self.open_tcp_stream_named(&dest.ip().to_string(), dest.port(), dest)
+            .await
     }
 
     async fn send_udp(&self, _dest: SocketAddr, _data: &[u8]) -> Result<(), TunnelError> {
@@ -269,10 +274,67 @@ impl Protocol for SshTunnel {
             state: self.state,
             bytes_up: self.counters.bytes_up.load(Ordering::Relaxed),
             bytes_down: self.counters.bytes_down.load(Ordering::Relaxed),
-            active_flows: self.counters.active_flows.load(Ordering::Relaxed),
+            // `ConnectionStats::active_flows` is a `u32` (Task 1's shape);
+            // `MAX_CONCURRENT_CHANNELS` bounds the real value far below
+            // `u32::MAX`, so this only ever saturates in a bug, never in
+            // normal operation.
+            active_flows: u32::try_from(self.counters.active_flows.load(Ordering::Relaxed))
+                .unwrap_or(u32::MAX),
             flows_failed: self.counters.flows_failed.load(Ordering::Relaxed),
             ..Default::default()
         }
+    }
+}
+
+impl SshTunnel {
+    /// `direct-tcpip` takes a *host string*, so a destination reached by name
+    /// (a DoH endpoint, or a compose alias in tests) can be requested directly
+    /// without resolving it locally. `origin` is reported to the server as the
+    /// originator and is otherwise unused.
+    pub async fn open_tcp_stream_named(
+        &self,
+        host: &str,
+        port: u16,
+        origin: SocketAddr,
+    ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        let handle = self
+            .handle
+            .as_ref()
+            .ok_or_else(|| TunnelError::Protocol("ssh session is not connected".into()))?;
+
+        // Bound concurrent channels so a burst of flows cannot exhaust the
+        // server's channel limit. Spec §8.
+        let permit = self
+            .channel_limit
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| TunnelError::Protocol("channel limiter closed".into()))?;
+
+        let channel = handle
+            .channel_open_direct_tcpip(
+                host.to_string(),
+                u32::from(port),
+                origin.ip().to_string(),
+                u32::from(origin.port()),
+            )
+            .await
+            .inspect_err(|_| {
+                self.counters.flows_failed.fetch_add(1, Ordering::Relaxed);
+            })
+            .map_err(|e| {
+                TunnelError::Protocol(format!("cannot open channel to {host}:{port}: {e}"))
+            })?;
+
+        let stream = crate::protocols::counting::CountingStream::new(
+            channel.into_stream(),
+            self.counters.bytes_up.clone(),
+            self.counters.bytes_down.clone(),
+            self.counters.active_flows.clone(),
+            Some(permit),
+        );
+
+        Ok(Box::new(stream))
     }
 }
 

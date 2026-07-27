@@ -1,3 +1,4 @@
+pub mod counting;
 pub mod ssh;
 
 use std::net::SocketAddr;

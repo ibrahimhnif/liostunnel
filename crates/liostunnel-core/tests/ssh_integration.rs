@@ -253,3 +253,87 @@ async fn a_wireguard_profile_is_rejected_as_unsupported() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// `Result::unwrap_err` requires `T: Debug`, but `Box<dyn TunnelStream>`
+/// deliberately does not implement `Debug` (Spec §11: payload-carrying types
+/// must never gain a `Debug` impl that could leak bytes). Extract the error
+/// by hand instead of via `unwrap_err()` so these tests don't require relaxing
+/// that guarantee just to make an assertion compile.
+fn expect_err<T>(r: Result<T, liostunnel_core::TunnelError>) -> liostunnel_core::TunnelError {
+    match r {
+        Ok(_) => panic!("expected an error"),
+        Err(e) => e,
+    }
+}
+
+/// The target is reachable only from inside the compose network, so a
+/// successful fetch proves the bytes really traversed the SSH channel.
+#[tokio::test]
+#[ignore = "requires docker fixture: make -C testing/docker up"]
+async fn opens_a_channel_and_proxies_http_to_an_internal_target() {
+    let dir = scratch("open-channel");
+    let mut t = SshTunnel::new("tunneluser".into(), HostKeyPolicy::AcceptAny);
+    t.connect(&profile(password_auth("open-channel")), &FileSecretStore)
+        .await
+        .unwrap();
+
+    // 172.x is the compose-internal address; resolve it by name through the
+    // tunnel host instead by using the alias the compose file assigns.
+    let dest: std::net::SocketAddr = "127.0.0.1:80".parse().unwrap();
+    let mut s = t
+        .open_tcp_stream_named("target.internal", 80, dest)
+        .await
+        .unwrap();
+
+    s.write_all(b"GET / HTTP/1.0\r\nHost: target.internal\r\n\r\n")
+        .await
+        .unwrap();
+    let mut body = String::new();
+    s.read_to_string(&mut body).await.unwrap();
+
+    assert!(
+        body.contains("tunnel-target-ok"),
+        "unexpected response: {body}"
+    );
+    assert!(t.stats().bytes_down > 0, "byte counters must move");
+    assert!(t.stats().bytes_up > 0);
+    t.disconnect().await.unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+#[ignore = "requires docker fixture: make -C testing/docker up"]
+async fn a_refused_destination_reports_a_protocol_error_without_killing_the_session() {
+    let dir = scratch("refused-dest");
+    let mut t = SshTunnel::new("tunneluser".into(), HostKeyPolicy::AcceptAny);
+    t.connect(&profile(password_auth("refused-dest")), &FileSecretStore)
+        .await
+        .unwrap();
+
+    // Nothing listens on this port inside the container.
+    let dest: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let err = expect_err(t.open_tcp_stream(dest).await);
+    assert!(
+        matches!(err, liostunnel_core::TunnelError::Protocol(_)),
+        "got {err:?}"
+    );
+
+    // Spec §11: a per-flow failure must not tear down the session.
+    assert_eq!(t.stats().state, ConnectionState::Connected);
+    assert_eq!(t.stats().flows_failed, 1);
+    t.disconnect().await.unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+#[ignore = "requires docker fixture: make -C testing/docker up"]
+async fn opening_a_stream_before_connecting_is_a_protocol_error() {
+    let t = SshTunnel::new("tunneluser".into(), HostKeyPolicy::AcceptAny);
+    let err = expect_err(t.open_tcp_stream("127.0.0.1:80".parse().unwrap()).await);
+    assert!(
+        matches!(err, liostunnel_core::TunnelError::Protocol(_)),
+        "got {err:?}"
+    );
+}
