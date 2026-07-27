@@ -891,6 +891,8 @@ Append to the `tests` module in `crates/liostunnel-core/src/config/profile.rs`:
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
 
+        // Unique per caller and cleaned up by the caller: cargo runs a binary's
+        // tests across threads, so a shared path would be a write race.
         let dir = std::env::temp_dir().join(format!("lios-pv-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("secret");
@@ -1038,14 +1040,14 @@ impl ServerProfile {
         let mut w = Vec::new();
         if self.kill_switch {
             w.push(
-                "kill_switch is set but is NOT enforced in this Phase 0 build; \
+                "kill_switch is set but is not enforced in this Phase 0 build; \
                  traffic will not be blocked if the tunnel drops"
                     .to_string(),
             );
         }
         if self.split_tunnel != SplitTunnelRule::AllTraffic {
             w.push(
-                "split_tunnel is set but is NOT enforced in this Phase 0 build; \
+                "split_tunnel is set but is not enforced in this Phase 0 build; \
                  all routed traffic will use the tunnel"
                     .to_string(),
             );
