@@ -17,8 +17,39 @@ use crate::net::{Datagram, StackConfig, TcpFlow};
 /// How much is moved between a smoltcp socket and its channel per step.
 const CHUNK: usize = 8 * 1024;
 
-/// How long a socket may sit half-open before the engine gives up on it.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an injected listener may take to complete its handshake.
+///
+/// This bounds two stalls by two different mechanisms, because smoltcp only
+/// covers one of them:
+/// * `SynReceived` — smoltcp's own socket timeout, which works here because the
+///   socket has a remote tuple and so is dispatched.
+/// * `Listen` — `sweep_stale_listeners`, because smoltcp cannot help: a
+///   listening socket has no remote tuple, so `poll_at` is `Ingress` for ever
+///   and the timer is never evaluated. smoltcp's own `test_listen_timeout`
+///   asserts exactly that.
+///
+/// It applies *only until promotion*. The handshake it bounds is answered
+/// locally, on the near side of a TUN device on this machine, so it costs no
+/// network round trip at all; 30 s matches Linux's SYN-ACK retry budget and is
+/// already enormously generous.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a flow that has stopped being `Established` may make no progress
+/// before it is aborted.
+///
+/// smoltcp has no FIN_WAIT_2 timer, so `CloseWait`, `FinWait1`, `FinWait2`,
+/// `Closing` and `LastAck` can all stall indefinitely. Measured from the later
+/// of "stopped being established" and "last moved a byte", so a long response
+/// that follows an application's half-close is never cut short. Matches Linux's
+/// `tcp_fin_timeout` default.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The most listeners that may be injected but not yet promoted at once.
+///
+/// Each costs two `tcp_buffer_bytes` buffers, so at the 64 KiB default this
+/// bounds half-open connections at about 32 MiB. An application opening more
+/// than this many at once is a connection storm or a port scan, not a browser.
+const MAX_PENDING_LISTENERS: usize = 256;
 
 /// The synchronous heart of the packet engine. Owns the smoltcp interface,
 /// every socket, and the queue-backed device.
@@ -40,6 +71,12 @@ pub struct StackCore {
     datagrams: Vec<Datagram>,
     cfg: StackConfig,
     udp_dropped: u64,
+    /// SYNs refused because `MAX_PENDING_LISTENERS` was already reached.
+    syn_dropped: u64,
+    /// Packets `inspect` could not classify at all.
+    malformed_dropped: u64,
+    /// Bytes still queued towards an application when its flow was retired.
+    bytes_discarded: u64,
     /// The clock the last `step` ran at. `ingest` has no clock of its own, so
     /// this is what an injected listener is timestamped with.
     last_step: Instant,
@@ -65,6 +102,23 @@ struct Flow {
     from_stream: mpsc::Receiver<Vec<u8>>,
     /// A chunk the socket's send buffer could not take in full.
     pending_out: Option<(Vec<u8>, usize)>,
+    /// When this flow last moved a byte in either direction.
+    last_activity: Instant,
+    /// When the socket was first seen outside `Established`. `None` while
+    /// healthy, so an established flow has no deadline at all.
+    winding_down_since: Option<Instant>,
+}
+
+impl Flow {
+    /// The instant this flow must be given up on, if it is winding down.
+    ///
+    /// Taken from the *later* of "left `Established`" and "last moved a byte":
+    /// an application that half-closes and then reads a large response keeps
+    /// refreshing the second, so a legitimate transfer is never cut short.
+    fn shutdown_deadline(&self) -> Option<Instant> {
+        let since = self.winding_down_since?;
+        Some(since.max(self.last_activity) + SHUTDOWN_TIMEOUT)
+    }
 }
 
 fn to_socket_addr(ep: IpEndpoint) -> Option<SocketAddr> {
@@ -82,13 +136,20 @@ impl StackCore {
         // Fixed so tests are deterministic; the wrapper in Task 14 randomises it.
         config.random_seed = 0x5eed_1105;
 
+        // `IpCidr::new` panics on a prefix wider than the address family allows,
+        // and `StackConfig` is a plain struct any caller can build by hand.
+        let prefix = cfg.netmask_prefix.min(32);
+        if prefix != cfg.netmask_prefix {
+            tracing::warn!(
+                requested = cfg.netmask_prefix,
+                "netmask prefix out of range for IPv4; clamping to /32"
+            );
+        }
+
         let mut iface = Interface::new(config, &mut device, Instant::from_micros(0));
         iface.update_ip_addrs(|addrs| {
             addrs
-                .push(IpCidr::new(
-                    IpAddress::Ipv4(cfg.address),
-                    cfg.netmask_prefix,
-                ))
+                .push(IpCidr::new(IpAddress::Ipv4(cfg.address), prefix))
                 .expect("interface address list has room for one entry");
         });
         // Accept packets addressed to anything, not just our own address —
@@ -106,6 +167,9 @@ impl StackCore {
             datagrams: Vec::new(),
             cfg,
             udp_dropped: 0,
+            syn_dropped: 0,
+            malformed_dropped: 0,
+            bytes_discarded: 0,
             last_step: Instant::from_micros(0),
         }
     }
@@ -115,6 +179,21 @@ impl StackCore {
     pub fn ingest(&mut self, packet: &[u8]) {
         match inspect(packet) {
             Inspected::TcpSyn { src, dst } => {
+                if self.nat.is_armed(&src, &dst) {
+                    // A retransmit: the listener for this 4-tuple already exists.
+                    self.device.push_rx(packet.to_vec());
+                    return;
+                }
+                if self.pending.len() >= MAX_PENDING_LISTENERS {
+                    // Dropped, not queued. Queuing it would reach smoltcp with no
+                    // matching socket, which answers RST — turning a transient
+                    // burst into a hard "connection refused". A dropped SYN is
+                    // retransmitted by the application's own stack, which is the
+                    // standard way for it to back off.
+                    self.syn_dropped += 1;
+                    tracing::warn!(%src, %dst, "pending listener cap reached; dropping SYN");
+                    return;
+                }
                 if self.nat.arm(src, dst) {
                     self.inject_listener(src, dst);
                 }
@@ -132,7 +211,11 @@ impl StackCore {
                     tracing::debug!(%dst, "dropping non-DNS UDP; SSH cannot forward it");
                 }
             }
-            Inspected::Ignored => {}
+            Inspected::Ignored => {
+                // Malformed, truncated, or a protocol Phase 0 does not carry.
+                // Counted rather than silently binned, same as non-DNS UDP.
+                self.malformed_dropped += 1;
+            }
         }
     }
 
@@ -153,9 +236,11 @@ impl StackCore {
             self.nat.disarm(&src, &dst);
             return;
         }
-        // A flow whose peer never completes the handshake should not hold a
-        // socket for ever.
-        socket.set_timeout(Some(IDLE_TIMEOUT));
+        // Bounds `SynReceived` only. Cleared the instant the flow is promoted:
+        // smoltcp's socket timeout is a plain idle timer, not a "give up if
+        // nothing useful is happening" timer, so leaving it armed on an
+        // established socket resets healthy but quiet connections.
+        socket.set_timeout(Some(HANDSHAKE_TIMEOUT));
 
         let handle = self.sockets.add(socket);
         self.pending.insert(
@@ -180,26 +265,34 @@ impl StackCore {
     /// drain only exist once `poll` has processed the receive queue.
     pub fn step(&mut self, now: Instant) {
         self.last_step = now;
-        self.pump_outbound();
+        // Aborts land before the poll so the same poll emits their RST.
+        self.sweep_stale_flows(now);
+        self.pump_outbound(now);
         self.iface.poll(now, &mut self.device, &mut self.sockets);
+        self.sweep_stale_listeners(now);
         self.promote_accepted(now);
-        self.pump_inbound();
+        self.pump_inbound(now);
         self.reap_closed();
     }
 
-    fn promote_accepted(&mut self, now: Instant) {
-        // A listener whose SYN smoltcp never matched — a delayed duplicate for
-        // a 4-tuple that is already established, say — sits in `Listen` for
-        // ever, and smoltcp's own socket timeout cannot rescue it: a listening
-        // socket has no remote tuple, so its `poll_at` is `Ingress` and the
-        // timer never runs. Left alone it pins its `NatTable` entry armed, and
-        // that 4-tuple can then never be retried.
+    /// Releases listeners that will never handshake.
+    ///
+    /// A listener whose SYN smoltcp never matched — a delayed duplicate for a
+    /// 4-tuple that is already established, or one returned to `Listen` by an
+    /// RST — sits there for ever. smoltcp cannot rescue it: a listening socket
+    /// has no remote tuple, so its `poll_at` is `Ingress` and the socket timeout
+    /// is never evaluated. Left alone it pins its `NatTable` entry armed and
+    /// that 4-tuple can never be retried.
+    ///
+    /// The predicate here must stay in step with `next_sweep_deadline`, or a
+    /// deadline can come due with nothing to do and spin the caller's loop.
+    fn sweep_stale_listeners(&mut self, now: Instant) {
         let stale: Vec<SocketHandle> = self
             .pending
             .iter()
             .filter(|(h, p)| {
                 self.sockets.get::<tcp::Socket>(**h).state() == tcp::State::Listen
-                    && now >= p.injected_at + IDLE_TIMEOUT
+                    && now >= p.injected_at + HANDSHAKE_TIMEOUT
             })
             .map(|(h, _)| *h)
             .collect();
@@ -210,7 +303,36 @@ impl StackCore {
             self.sockets.remove(handle);
             tracing::debug!(src = %p.src, dst = %p.dst, "listener expired before any handshake");
         }
+    }
 
+    /// Aborts flows that stopped being `Established` and then stopped making
+    /// progress. Nothing in smoltcp bounds `CloseWait` or `FinWait2`.
+    fn sweep_stale_flows(&mut self, now: Instant) {
+        let mut stale = Vec::new();
+        for (handle, flow) in self.flows.iter_mut() {
+            if self.sockets.get::<tcp::Socket>(*handle).state() == tcp::State::Established {
+                // Healthy: no deadline of any kind.
+                flow.winding_down_since = None;
+                continue;
+            }
+            flow.winding_down_since.get_or_insert(now);
+            if flow.shutdown_deadline().is_some_and(|at| now >= at) {
+                stale.push(*handle);
+            }
+        }
+
+        for handle in stale {
+            // `abort` moves the socket to `Closed` with an RST queued. The poll
+            // that follows emits it and `reap_closed` then retires the flow, so
+            // the application's own stack learns to let go too.
+            self.sockets.get_mut::<tcp::Socket>(handle).abort();
+            if let Some(f) = self.flows.get(&handle) {
+                tracing::debug!(src = %f.src, dst = %f.dst, "half-closed flow exceeded its shutdown deadline");
+            }
+        }
+    }
+
+    fn promote_accepted(&mut self, now: Instant) {
         let ready: Vec<SocketHandle> = self
             .pending
             .keys()
@@ -226,12 +348,21 @@ impl StackCore {
                 self.pending.remove(&handle).expect("key came from the map");
             self.nat.disarm(&src, &dst);
 
-            let socket = self.sockets.get::<tcp::Socket>(handle);
+            let socket = self.sockets.get_mut::<tcp::Socket>(handle);
             if !socket.is_active() {
                 // The listener timed out or was reset before establishing.
                 self.sockets.remove(handle);
                 continue;
             }
+
+            // The handshake deadline has done its job. smoltcp's socket timeout
+            // is a plain idle timer — its own `test_established_timeout` shows an
+            // established socket with an *empty* transmit buffer scheduling a
+            // `poll_at` for it — so leaving it armed would reset any connection
+            // whose application simply had nothing to say for a while. From here
+            // on smoltcp's retransmit logic governs, and `sweep_stale_flows`
+            // bounds the states smoltcp itself does not.
+            socket.set_timeout(None);
 
             // Prefer the addresses smoltcp actually negotiated.
             let real_src = socket
@@ -256,6 +387,8 @@ impl StackCore {
                     to_stream: Some(to_stream),
                     from_stream,
                     pending_out: None,
+                    last_activity: now,
+                    winding_down_since: None,
                 },
             );
             self.accepts.push(TcpFlow {
@@ -269,7 +402,7 @@ impl StackCore {
 
     /// Tunnel → application. Runs *before* `Interface::poll` so the same poll
     /// that ingests the receive queue also emits whatever this buffered.
-    fn pump_outbound(&mut self) {
+    fn pump_outbound(&mut self, now: Instant) {
         for (handle, flow) in self.flows.iter_mut() {
             let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
 
@@ -278,9 +411,10 @@ impl StackCore {
                 if socket.can_send() {
                     match socket.send_slice(&chunk[off..]) {
                         Ok(n) if off + n < chunk.len() => {
+                            flow.last_activity = now;
                             flow.pending_out = Some((chunk, off + n));
                         }
-                        Ok(_) => {}
+                        Ok(_) => flow.last_activity = now,
                         Err(_) => flow.pending_out = Some((chunk, off)),
                     }
                 } else {
@@ -292,13 +426,17 @@ impl StackCore {
             while flow.pending_out.is_none() && socket.can_send() {
                 match flow.from_stream.try_recv() {
                     Ok(chunk) => match socket.send_slice(&chunk) {
-                        Ok(n) if n < chunk.len() => flow.pending_out = Some((chunk, n)),
-                        Ok(_) => {}
+                        Ok(n) if n < chunk.len() => {
+                            flow.last_activity = now;
+                            flow.pending_out = Some((chunk, n));
+                        }
+                        Ok(_) => flow.last_activity = now,
                         Err(_) => break,
                     },
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        // The engine finished with this flow: send FIN.
+                        // The engine finished with this flow: send FIN. This runs
+                        // before the poll, so the FIN goes out in the same pass.
                         socket.close();
                         break;
                     }
@@ -309,7 +447,7 @@ impl StackCore {
 
     /// Application → tunnel. Runs *after* `Interface::poll`, which is what put
     /// the bytes into the socket's receive buffer in the first place.
-    fn pump_inbound(&mut self) {
+    fn pump_inbound(&mut self, now: Instant) {
         for (handle, flow) in self.flows.iter_mut() {
             let socket = self.sockets.get_mut::<tcp::Socket>(*handle);
 
@@ -324,17 +462,27 @@ impl StackCore {
             while socket.can_recv() {
                 match to_stream.try_reserve() {
                     Ok(permit) => {
-                        let mut buf = vec![0u8; CHUNK];
-                        match socket.recv_slice(&mut buf) {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                buf.truncate(n);
-                                permit.send(buf);
+                        // `recv` hands out the receive buffer directly, so this
+                        // allocates exactly the bytes there are rather than a
+                        // full CHUNK to move however few arrived.
+                        match socket.recv(|data| {
+                            let n = data.len().min(CHUNK);
+                            (n, data[..n].to_vec())
+                        }) {
+                            Ok(chunk) if chunk.is_empty() => break,
+                            Ok(chunk) => {
+                                flow.last_activity = now;
+                                permit.send(chunk);
                             }
+                            Err(_) => break,
                         }
                     }
                     Err(TrySendError::Full(())) => break,
                     Err(TrySendError::Closed(())) => {
+                        // Only reachable when the send buffer was full enough
+                        // that `pump_outbound` never got to see the matching
+                        // `Disconnected`; normally the close is already done
+                        // before the poll.
                         socket.close();
                         peer_gone = true;
                         break;
@@ -366,14 +514,28 @@ impl StackCore {
             .collect();
 
         for handle in dead {
-            // Dropping the Flow drops both channel ends, which the LocalStream
-            // sees as EOF on read and a broken pipe on write — a clean close
-            // for whichever side is still using it.
-            if let Some(f) = self.flows.remove(&handle) {
-                tracing::debug!(src = %f.src, dst = %f.dst, "flow closed");
-            }
-            self.sockets.remove(handle);
+            self.retire_flow(handle);
         }
+    }
+
+    /// The single place a `Flow` is dropped. Dropping it drops both channel
+    /// ends, which the `LocalStream` sees as EOF on read and a broken pipe on
+    /// write — a clean close for whichever side is still using it.
+    fn retire_flow(&mut self, handle: SocketHandle) {
+        if let Some(mut f) = self.flows.remove(&handle) {
+            // Anything still queued towards the application is about to vanish.
+            // Count it rather than lose it silently.
+            let mut lost = f.pending_out.as_ref().map_or(0, |(c, off)| c.len() - off);
+            while let Ok(chunk) = f.from_stream.try_recv() {
+                lost += chunk.len();
+            }
+            if lost > 0 {
+                self.bytes_discarded += lost as u64;
+                tracing::debug!(src = %f.src, dst = %f.dst, lost, "retiring flow with unsent bytes");
+            }
+            tracing::debug!(src = %f.src, dst = %f.dst, "flow closed");
+        }
+        self.sockets.remove(handle);
     }
 
     /// Step 3 of the loop.
@@ -383,8 +545,38 @@ impl StackCore {
 
     /// Step 5's timeout. `None` means "nothing is pending; sleep until a packet
     /// or a wakeup arrives".
+    ///
+    /// This is the value Task 14's loop sleeps on, so it must account for our
+    /// own sweeps as well as smoltcp's timers. smoltcp answers `Ingress` — which
+    /// collapses to `None` — for every listening socket, so a `SocketSet` full of
+    /// listeners would otherwise never wake the loop and the sweeps in
+    /// `sweep_stale_listeners`/`sweep_stale_flows` would never run.
     pub fn poll_delay(&mut self, now: Instant) -> Option<Duration> {
-        self.iface.poll_delay(now, &self.sockets)
+        let smoltcp = self.iface.poll_delay(now, &self.sockets);
+        let sweep = self.next_sweep_deadline().map(|at| {
+            // `Instant - Instant` takes the absolute value in smoltcp, so an
+            // overdue deadline has to be handled explicitly.
+            if at > now { at - now } else { Duration::ZERO }
+        });
+
+        match (smoltcp, sweep) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, None) => a,
+            (None, b) => b,
+        }
+    }
+
+    /// When the next sweep has work to do. Must agree with the predicates in
+    /// `sweep_stale_listeners` and `sweep_stale_flows`: a deadline that comes due
+    /// without the matching sweep removing anything would spin the caller's loop.
+    fn next_sweep_deadline(&self) -> Option<Instant> {
+        let listeners = self
+            .pending
+            .iter()
+            .filter(|(h, _)| self.sockets.get::<tcp::Socket>(**h).state() == tcp::State::Listen)
+            .map(|(_, p)| p.injected_at + HANDSHAKE_TIMEOUT);
+        let winding_down = self.flows.values().filter_map(Flow::shutdown_deadline);
+        listeners.chain(winding_down).min()
     }
 
     pub fn take_accepts(&mut self) -> Vec<TcpFlow> {
@@ -399,8 +591,32 @@ impl StackCore {
         self.udp_dropped
     }
 
+    /// SYNs refused because too many listeners were already awaiting a
+    /// handshake. A non-zero value means an application is opening connections
+    /// faster than they complete.
+    pub fn syn_dropped(&self) -> u64 {
+        self.syn_dropped
+    }
+
+    /// Packets `inspect` could not classify.
+    pub fn malformed_dropped(&self) -> u64 {
+        self.malformed_dropped
+    }
+
+    /// Bytes that were queued towards an application but never delivered
+    /// because its flow was retired first.
+    pub fn bytes_discarded(&self) -> u64 {
+        self.bytes_discarded
+    }
+
     pub fn active_flows(&self) -> usize {
         self.flows.len()
+    }
+
+    /// Listeners injected but not yet promoted, bounded by
+    /// `MAX_PENDING_LISTENERS`.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
     }
 
     pub fn armed_len(&self) -> usize {
@@ -566,6 +782,220 @@ mod tests {
             })
             .count();
         assert_eq!(synacks, 2, "each distinct flow needs its own listener");
+    }
+
+    /// Returns every RST the stack has emitted since the last drain.
+    fn rsts(core: &mut StackCore) -> usize {
+        core.drain_tx()
+            .iter()
+            .filter(|raw| {
+                Ipv4Packet::new_checked(&raw[..])
+                    .ok()
+                    .and_then(|ip| TcpPacket::new_checked(ip.payload()).ok().map(|t| t.rst()))
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
+    fn secs(n: u64) -> Instant {
+        Instant::from_micros((n * 1_000_000) as i64)
+    }
+
+    #[tokio::test]
+    async fn an_idle_established_connection_is_never_reset() {
+        // The regression test for the handshake deadline leaking into
+        // `Established`. smoltcp's socket timeout is a plain idle timer: its own
+        // `test_established_timeout` shows `poll_at == PollAt::Time(..)` for an
+        // established socket with an *empty* transmit buffer. Left armed after
+        // promotion it unilaterally RSTs any quiet SSH session, HTTP keep-alive,
+        // WebSocket or database connection.
+        let mut core = StackCore::new(StackConfig::default());
+        let mut clock = Clock(0);
+        let (_flow, _, _) = handshake(&mut core, &mut clock, APP, WEB, 1000);
+        assert_eq!(core.active_flows(), 1);
+        core.drain_tx();
+
+        // Five minutes of an application with nothing to say.
+        for at in [5, 31, 60, 120, 300] {
+            core.step(secs(at));
+            assert_eq!(
+                core.active_flows(),
+                1,
+                "an idle established flow must survive {at}s"
+            );
+        }
+        assert_eq!(
+            rsts(&mut core),
+            0,
+            "the stack must never reset a healthy flow"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_half_closed_flow_whose_peer_never_finishes_is_reaped() {
+        // Once the handshake deadline no longer governs established sockets,
+        // nothing in smoltcp bounds `CloseWait`/`FinWait2`/`LastAck` — it has no
+        // FIN_WAIT_2 timer of its own. Without our own sweep a stuck half-close
+        // leaks a socket, its buffers and a channel pair for ever.
+        let mut core = StackCore::new(StackConfig::default());
+        let mut clock = Clock(0);
+        let (flow, cseq, sseq) = handshake(&mut core, &mut clock, APP, WEB, 1000);
+
+        core.ingest(&build_tcp(APP, WEB, TcpFlags::fin_ack(), cseq, sseq, &[]));
+        core.step(clock.tick());
+        // The tunnel side finishes too, so the stack sends its own FIN — but the
+        // application never acknowledges it.
+        drop(flow);
+        core.step(clock.tick());
+        assert_eq!(core.active_flows(), 1, "still legitimately winding down");
+
+        core.step(secs(600));
+        assert_eq!(core.active_flows(), 0, "a stuck half-close must not leak");
+    }
+
+    #[test]
+    fn poll_delay_is_bounded_while_a_listener_sweep_is_pending() {
+        // Task 14 sleeps on `poll_delay`. A `SocketSet` holding only listeners
+        // makes smoltcp answer `None` ("sleep until a packet arrives"), so
+        // nothing would ever wake the loop to run the sweep.
+        let mut core = StackCore::new(StackConfig::default());
+        core.ingest(&build_tcp(APP, WEB, TcpFlags::syn(), 1000, 0, &[]));
+        let now = Instant::from_micros(0);
+
+        assert_eq!(
+            core.iface.poll_delay(now, &core.sockets),
+            None,
+            "smoltcp alone would sleep for ever on a listening socket"
+        );
+        assert_eq!(
+            core.poll_delay(now),
+            Some(HANDSHAKE_TIMEOUT),
+            "a pending sweep must bound the sleep"
+        );
+    }
+
+    #[test]
+    fn a_poll_delay_driven_loop_converges_rather_than_spinning() {
+        // Feeding sweep deadlines into `poll_delay` is only safe while every
+        // deadline that comes due actually removes something. If one did not,
+        // Task 14's loop would sit at a zero delay for ever. Drive the real
+        // loop shape and prove it settles.
+        let mut core = StackCore::new(StackConfig::default());
+        core.ingest(&build_tcp(APP, WEB, TcpFlags::syn(), 1000, 0, &[]));
+        let rst = TcpFlags {
+            rst: true,
+            ..Default::default()
+        };
+        core.ingest(&build_tcp(APP, WEB, rst, 1001, 0, &[]));
+
+        let mut now = Instant::from_micros(0);
+        let mut steps = 0;
+        loop {
+            core.step(now);
+            core.drain_tx();
+            steps += 1;
+            assert!(steps < 1000, "the loop is spinning rather than converging");
+            match core.poll_delay(now) {
+                Some(delay) => now += delay,
+                None => break,
+            }
+        }
+
+        assert_eq!(core.armed_len(), 0, "the sweep must have run");
+        assert_eq!(core.pending_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_aborted_connection_attempt_releases_its_four_tuple() {
+        // smoltcp returns a listen-derived socket to `Listen` on RST rather than
+        // to `Closed` (src/socket/tcp.rs:1826, `self.tuple = None;
+        // self.set_state(State::Listen)`). Promotion therefore never sees it, and
+        // with no remote tuple its `poll_at` is `Ingress`, so the socket timeout
+        // never fires either. Only the listener sweep can release the 4-tuple.
+        let mut core = StackCore::new(StackConfig::default());
+        core.ingest(&build_tcp(APP, WEB, TcpFlags::syn(), 1000, 0, &[]));
+        core.step(secs(0));
+
+        let rst = TcpFlags {
+            rst: true,
+            ..Default::default()
+        };
+        core.ingest(&build_tcp(APP, WEB, rst, 1001, 0, &[]));
+        core.step(secs(1));
+        assert_eq!(
+            core.armed_len(),
+            1,
+            "an RST puts the socket back in Listen, still armed"
+        );
+
+        core.step(secs(120));
+        assert_eq!(core.armed_len(), 0, "the listener sweep releases it");
+        assert_eq!(core.pending_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_swept_four_tuple_can_complete_a_fresh_handshake() {
+        // Releasing the NAT entry is only half the point; the 4-tuple has to
+        // actually work again afterwards.
+        let mut core = StackCore::new(StackConfig::default());
+        core.ingest(&build_tcp(APP, WEB, TcpFlags::syn(), 1000, 0, &[]));
+        core.step(secs(1));
+        assert_eq!(core.armed_len(), 1);
+
+        // No ACK ever arrives; the handshake deadline expires.
+        core.step(secs(120));
+        assert_eq!(
+            core.armed_len(),
+            0,
+            "an abandoned handshake releases its 4-tuple"
+        );
+        assert_eq!(core.pending_len(), 0);
+        core.drain_tx();
+
+        let mut clock = Clock(200_000_000);
+        let (flow, _, _) = handshake(&mut core, &mut clock, APP, WEB, 5000);
+        assert_eq!(flow.dst, sa(WEB), "the same 4-tuple must be usable again");
+        assert_eq!(core.active_flows(), 1);
+    }
+
+    #[test]
+    fn a_syn_flood_cannot_exhaust_memory() {
+        // 1000 SYNs from distinct source ports before a single `step`. Without a
+        // cap that is 1000 sockets' worth of buffers, ~131 MB at the defaults.
+        let mut core = StackCore::new(StackConfig::default());
+        for port in 0..1000u16 {
+            core.ingest(&build_tcp(
+                (APP.0, 10_000 + port),
+                WEB,
+                TcpFlags::syn(),
+                1000,
+                0,
+                &[],
+            ));
+        }
+
+        assert_eq!(core.pending_len(), MAX_PENDING_LISTENERS);
+        assert_eq!(core.armed_len(), MAX_PENDING_LISTENERS);
+        assert_eq!(
+            core.syn_dropped(),
+            1000 - MAX_PENDING_LISTENERS as u64,
+            "SYNs past the cap must be dropped and counted"
+        );
+    }
+
+    #[test]
+    fn a_listener_that_cannot_be_created_is_disarmed_at_once() {
+        // smoltcp cannot listen on port 0, so this exercises the failure branch
+        // in `inject_listener`.
+        let mut core = StackCore::new(StackConfig::default());
+        core.ingest(&build_tcp(APP, (WEB.0, 0), TcpFlags::syn(), 1000, 0, &[]));
+
+        assert_eq!(
+            core.armed_len(),
+            0,
+            "a listener that cannot exist must not stay armed"
+        );
+        assert_eq!(core.pending_len(), 0);
     }
 
     #[test]
