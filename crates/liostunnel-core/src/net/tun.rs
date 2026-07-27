@@ -31,9 +31,21 @@ pub fn strip_af_prefix(framed: &[u8]) -> Result<&[u8], TunnelError> {
 /// Reads and writes **bare IP packets**. Implementations hide any platform framing.
 pub trait PacketIo: Send {
     /// Returns 0 when nothing is currently available.
+    ///
+    /// Implementations must not block: the driving loop calls this until it
+    /// answers 0 and then sleeps on [`PacketIo::pollable_fd`], so a blocking
+    /// read here would park the loop somewhere it cannot be woken.
     fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize, TunnelError>;
     fn write_packet(&mut self, packet: &[u8]) -> Result<(), TunnelError>;
     fn mtu(&self) -> usize;
+
+    /// The descriptor to wait on, when the implementation has one.
+    /// `None` means the caller must fall back to a timed poll — only the
+    /// in-memory test double does this.
+    #[cfg(unix)]
+    fn pollable_fd(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -136,6 +148,15 @@ impl TunDevice {
             .build_sync()
             .map_err(|e| TunnelError::Tun(format!("cannot create TUN interface: {e}")))?;
 
+        // tun-rs opens the device blocking. The driving loop reads until the
+        // device says 0 and only then sleeps on the descriptor, so a blocking
+        // read would park it inside `recv` — deaf to the shutdown flag, to the
+        // wakeup, and to every smoltcp timer. It is also what makes the
+        // `WouldBlock` arm in `read_packet` reachable at all.
+        inner.set_nonblocking(true).map_err(|e| {
+            TunnelError::Tun(format!("cannot set the TUN device non-blocking: {e}"))
+        })?;
+
         Ok(Self {
             inner,
             mtu: cfg.mtu as usize,
@@ -197,6 +218,12 @@ impl PacketIo for TunDevice {
 
     fn mtu(&self) -> usize {
         self.mtu
+    }
+
+    #[cfg(unix)]
+    fn pollable_fd(&self) -> Option<std::os::fd::RawFd> {
+        use std::os::fd::AsRawFd;
+        Some(self.as_raw_fd())
     }
 }
 

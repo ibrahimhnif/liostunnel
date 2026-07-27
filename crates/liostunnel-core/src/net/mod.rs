@@ -53,15 +53,65 @@ impl Default for StackConfig {
     }
 }
 
+/// Wakes the synchronous stack loop from asynchronous code.
+///
+/// `StackCore::poll_delay` spells out why this has to exist and why the stack
+/// cannot own it: the loop blocks on a descriptor and a timer, and neither of
+/// those notices a tokio channel gaining an item, freeing a slot, or losing its
+/// last sender. Anything on the async side that changes what the loop would do
+/// next has to say so, and this is how.
+///
+/// The default is a no-op, for the synchronous tests that drive
+/// `StackCore::step` by hand and have no loop to wake.
 #[derive(Clone, Default)]
-pub struct ShutdownHandle(Arc<AtomicBool>);
+pub struct Wakeup(Option<Arc<dyn Fn() + Send + Sync>>);
+
+impl Wakeup {
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(wake)))
+    }
+
+    /// Cheap enough to call per write: the only implementation in the tree
+    /// collapses repeats into a single write on the notification descriptor.
+    pub fn wake(&self) {
+        if let Some(f) = &self.0 {
+            f();
+        }
+    }
+}
+
+impl std::fmt::Debug for Wakeup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Wakeup").field(&self.0.is_some()).finish()
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ShutdownHandle {
+    flag: Arc<AtomicBool>,
+    /// So a shutdown is acted on at once rather than whenever the loop next
+    /// happens to surface. Without it the only bound is the loop's idle
+    /// ceiling, which is a backstop, not a mechanism.
+    wake: Wakeup,
+}
 
 impl ShutdownHandle {
-    pub fn shutdown(&self) {
-        self.0.store(true, Ordering::Relaxed);
+    pub fn with_wakeup(wake: Wakeup) -> Self {
+        Self {
+            flag: Arc::default(),
+            wake,
+        }
     }
+
+    pub fn shutdown(&self) {
+        // Release/Acquire rather than Relaxed: the loop must see everything
+        // that happened before the caller decided to stop, not just the flag.
+        self.flag.store(true, Ordering::Release);
+        self.wake.wake();
+    }
+
     pub fn is_shutdown(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.flag.load(Ordering::Acquire)
     }
 }
 

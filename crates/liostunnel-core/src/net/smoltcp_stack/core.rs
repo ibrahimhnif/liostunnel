@@ -12,7 +12,7 @@ use crate::net::local_stream::{StreamPeer, local_stream_pair};
 use crate::net::nat_table::NatTable;
 use crate::net::smoltcp_stack::device::QueuedDevice;
 use crate::net::smoltcp_stack::inspect::{Inspected, inspect};
-use crate::net::{Datagram, StackConfig, TcpFlow};
+use crate::net::{Datagram, StackConfig, TcpFlow, Wakeup};
 
 /// How much is moved between a smoltcp socket and its channel per step.
 const CHUNK: usize = 8 * 1024;
@@ -93,6 +93,9 @@ pub struct StackCore {
     /// The clock the last `step` ran at. `ingest` has no clock of its own, so
     /// this is what an injected listener is timestamped with.
     last_step: Instant,
+    /// Handed to every `LocalStream` this stack creates, so the driving loop
+    /// hears about the things `poll_delay` cannot report. See its contract.
+    wake: Wakeup,
 }
 
 struct Pending {
@@ -186,13 +189,23 @@ fn to_socket_addr(ep: IpEndpoint) -> Option<SocketAddr> {
     }
 }
 
+/// The seed `StackCore::new` uses. Fixed, so tests are deterministic; the
+/// driving loop calls [`StackCore::with_seed`] with a random one instead, which
+/// is what keeps initial sequence numbers unguessable in production.
+pub const TEST_SEED: u64 = 0x5eed_1105;
+
 impl StackCore {
     pub fn new(cfg: StackConfig) -> Self {
+        Self::with_seed(cfg, TEST_SEED)
+    }
+
+    /// As [`StackCore::new`], with the seed smoltcp derives initial sequence
+    /// numbers from supplied by the caller.
+    pub fn with_seed(cfg: StackConfig, seed: u64) -> Self {
         let mut device = QueuedDevice::new(cfg.mtu);
 
         let mut config = Config::new(HardwareAddress::Ip);
-        // Fixed so tests are deterministic; the wrapper in Task 14 randomises it.
-        config.random_seed = 0x5eed_1105;
+        config.random_seed = seed;
 
         // `IpCidr::new` panics on a prefix wider than the address family allows,
         // and `StackConfig` is a plain struct any caller can build by hand.
@@ -229,7 +242,25 @@ impl StackCore {
             malformed_dropped: 0,
             bytes_discarded: 0,
             last_step: Instant::from_micros(0),
+            wake: Wakeup::default(),
         }
+    }
+
+    /// Installs the handle every `LocalStream` from here on will use to wake the
+    /// driving loop.
+    ///
+    /// Left unset, it is a no-op — which is right for the synchronous tests in
+    /// this file, which call `step` by hand and have no loop to wake, and wrong
+    /// for anything with a loop. `SmoltcpStack::start` sets it before the first
+    /// `step`, so every flow it ever promotes carries one.
+    pub fn set_wakeup(&mut self, wake: Wakeup) {
+        self.wake = wake;
+    }
+
+    /// Queues a datagram for delivery to the device. Reply synthesis lands in
+    /// Task 18; until then the datagram is counted and discarded.
+    pub fn inject_datagram(&mut self, _dg: Datagram) {
+        self.udp_dropped += 1;
     }
 
     /// Step 1 of the loop: classify a packet, arm a listener if it opens a new
@@ -484,7 +515,7 @@ impl StackCore {
                 .and_then(to_socket_addr)
                 .unwrap_or(dst);
 
-            let (stream, peer) = local_stream_pair(self.cfg.channel_depth);
+            let (stream, peer) = local_stream_pair(self.cfg.channel_depth, self.wake.clone());
             let StreamPeer {
                 to_stream,
                 from_stream,
