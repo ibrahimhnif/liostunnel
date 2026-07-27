@@ -1,0 +1,13 @@
+services:
+  sshd:
+    build: ./sshd
+    ports: ["127.0.0.1:22022:22"]
+    networks: [lios]
+  target:
+    image: nginx:alpine
+    volumes: ["./target-html:/usr/share/nginx/html:ro"]
+    networks:
+      lios:
+        aliases: [target.internal]
+networks:
+  lios:

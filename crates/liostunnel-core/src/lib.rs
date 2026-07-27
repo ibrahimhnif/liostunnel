@@ -2,5 +2,7 @@
 
 pub mod config;
 pub mod error;
+pub mod protocols;
+pub mod stats;
 
 pub use error::TunnelError;
