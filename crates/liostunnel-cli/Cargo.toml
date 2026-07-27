@@ -1,0 +1,16 @@
+[package]
+name = "liostunnel-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "liostunnel"
+path = "src/main.rs"
+
+[dependencies]
+liostunnel-core = { path = "../liostunnel-core" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

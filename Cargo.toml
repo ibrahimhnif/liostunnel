@@ -1,0 +1,31 @@
+[workspace]
+members = ["crates/liostunnel-core", "crates/liostunnel-cli"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.93"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+smoltcp = { version = "0.13.1", default-features = false, features = [
+    "std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp",
+] }
+russh = "0.62.4"
+tun-rs = "2.8.8"
+polling = "3.11.0"
+ipnet = { version = "2.12.0", features = ["serde"] }
+tokio = { version = "1.53", features = [
+    "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "process",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+
+[profile.release]
+strip = true
+lto = "thin"
