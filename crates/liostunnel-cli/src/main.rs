@@ -54,6 +54,7 @@ async fn run(cli: Cli) -> Result<(), liostunnel_core::TunnelError> {
         Command::Import { profile } => {
             let p = profile_io::load(&profile, &secret_dir)?;
             p.validate(&FileSecretStore)?;
+            emit_warnings(&p);
             let out = home.join(format!("{}.json", p.id));
             std::fs::create_dir_all(&home).map_err(liostunnel_core::TunnelError::from)?;
             std::fs::write(&out, serde_json::to_string_pretty(&p).unwrap())

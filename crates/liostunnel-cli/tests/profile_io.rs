@@ -60,3 +60,31 @@ fn load_reports_a_useful_error_for_malformed_json() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn load_never_echoes_a_misplaced_secret_looking_value_in_its_error() {
+    // `port` expects a u16 in both `ServerProfile` and `PortableProfile`, so a
+    // string value there fails both parse attempts. serde_json's own
+    // `invalid_type` message echoes the offending value verbatim when it's a
+    // scalar (unlike a map/object) -- a user who fat-fingers a secret string
+    // into the wrong field must not have it echoed back to their terminal in
+    // the resulting error.
+    let dir = tmp("misplaced-secret");
+    let path = dir.join("p.json");
+    std::fs::write(
+        &path,
+        r#"{"id":"00000000-0000-0000-0000-000000000000","name":"lab",
+            "protocol":"ssh","host":"198.51.100.7","port":"hunter2",
+            "auth":{"type":"password","password":"unrelated"},
+            "dns":["1.1.1.1"],"split_tunnel":{"type":"all_traffic"},
+            "kill_switch":false}"#,
+    )
+    .unwrap();
+
+    let e = liostunnel_cli::profile_io::load(&path, &dir.join("secrets")).unwrap_err();
+    assert!(
+        !e.to_string().contains("hunter2"),
+        "secret-looking value leaked into error text: {e}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
