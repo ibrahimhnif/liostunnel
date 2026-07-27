@@ -94,6 +94,12 @@ impl client::Handler for ClientHandler {
                 // algorithm we haven't recorded yet would land here too, and
                 // is exactly as dangerous as a same-algorithm mismatch). We
                 // must tell those apart ourselves before trusting anything.
+                let known_hosts_exists = known_hosts.try_exists().map_err(|e| {
+                    TunnelError::HostKey(format!(
+                        "cannot check whether {} exists: {e}",
+                        known_hosts.display()
+                    ))
+                })?;
                 let existing =
                     known_host_keys_path(&self.host, self.port, known_hosts).map_err(|e| {
                         TunnelError::HostKey(format!("cannot read {}: {e}", known_hosts.display()))
@@ -102,9 +108,10 @@ impl client::Handler for ClientHandler {
                 match check_known_hosts_path(&self.host, self.port, key, known_hosts) {
                     // Known and matching.
                     Ok(true) => Ok(true),
-                    // No recorded entry whatsoever for this host: genuine
-                    // first contact. Trust on first use, then record it.
-                    Ok(false) if existing.is_empty() => {
+                    // No recorded entry whatsoever for this host, and the
+                    // file itself doesn't even exist yet: genuine first
+                    // contact. Trust on first use, then record it.
+                    Ok(false) if !known_hosts_exists && existing.is_empty() => {
                         tracing::warn!(
                             host = %self.host, port = self.port,
                             fingerprint = %key.fingerprint(Default::default()),
@@ -115,6 +122,22 @@ impl client::Handler for ClientHandler {
                         )?;
                         Ok(true)
                     }
+                    // The file exists, but we found no usable entry for this
+                    // host in it. `known_host_keys_path` swallows *every*
+                    // `File::open` failure (not just "missing") into
+                    // `Ok(vec![])` (russh-0.62.4 src/keys/known_hosts.rs:70-74),
+                    // so an existing-but-unreadable file (e.g. mode 0222)
+                    // would otherwise look identical to "no entry for this
+                    // host." We cannot tell those apart from here, so a file
+                    // that exists and comes back empty fails closed instead
+                    // of risking being treated as first contact.
+                    Ok(false) if existing.is_empty() => Err(TunnelError::HostKey(format!(
+                        "{} exists but no host key for {}:{} could be read from it; \
+                         refusing to treat this as first contact",
+                        known_hosts.display(),
+                        self.host,
+                        self.port
+                    ))),
                     // Entries exist for this host, but none uses the
                     // presented key's algorithm. Never auto-accept, never
                     // learn — this is the "attacker offers an algorithm we
@@ -182,6 +205,11 @@ impl Protocol for SshTunnel {
                 Ok(())
             }
             Err(e) => {
+                // No reconnect caller exists yet in Phase 0, but a failed
+                // `connect` on an already-`Connected` tunnel must not leave a
+                // stale, still-authenticated session (with keepalives still
+                // running) behind a `Failed` state.
+                self.handle = None;
                 self.state = ConnectionState::Failed;
                 Err(e)
             }
@@ -311,12 +339,20 @@ impl SshTunnel {
 
 #[cfg(test)]
 mod tests {
-    //! Unit-level coverage for `check_server_key` — no Docker, no socket, runs
-    //! in every default `cargo test`. `ssh_integration.rs` covers the same
-    //! policy end-to-end against a real server, but that suite is `#[ignore]`d
-    //! and easy to skip; this suite is the one that always runs.
-    use std::process::Command;
-
+    //! Unit-level coverage for `check_server_key` — no Docker, no socket, no
+    //! subprocess, runs in every default `cargo test`. `ssh_integration.rs`
+    //! covers the same policy end-to-end against a real server, but that
+    //! suite is `#[ignore]`d and easy to skip; this suite is the one that
+    //! always runs.
+    //!
+    //! `check_server_key` only ever needs `PublicKey` values, and public keys
+    //! are not secret, so these use real, valid, checked-in key blobs rather
+    //! than shelling out to `ssh-keygen` at test time: a subprocess made the
+    //! *default* `cargo test` depend on openssh-client being on `PATH` (it
+    //! previously wasn't — only the `#[ignore]`d suite needed external
+    //! tooling), and `Command::status()` inherits stdout/stderr, so every
+    //! default run interleaved "Generating public/private key pair" banners
+    //! and ASCII randomart into otherwise-pristine test output.
     use russh::client::Handler as _;
 
     use super::*;
@@ -327,21 +363,22 @@ mod tests {
         d
     }
 
-    /// Generates a real key pair via `ssh-keygen` under `dir` and returns the
-    /// parsed public key. Real keys, not hardcoded base64 blobs: a fabricated
-    /// blob that merely *parses* differently (as the original integration
-    /// test's blob did) exercises a decode-error path, not the
-    /// same-algorithm/different-algorithm branches this suite must cover.
-    fn gen_key(dir: &std::path::Path, name: &str, keygen_type_args: &[&str]) -> PublicKey {
-        let path = dir.join(name);
-        let status = Command::new("ssh-keygen")
-            .args(keygen_type_args)
-            .args(["-N", "", "-C", "lios-test", "-f"])
-            .arg(&path)
-            .status()
-            .expect("ssh-keygen must be on PATH to run this test");
-        assert!(status.success(), "ssh-keygen failed generating {name}");
-        russh::keys::load_public_key(path.with_extension("pub")).unwrap()
+    /// A real, valid ed25519 public key. Source: russh 0.62.4's own
+    /// `src/keys/mod.rs` `test_fingerprint` fixture — already proven valid by
+    /// that crate's own test suite.
+    const ED25519_KEY_A: &str =
+        "AAAAC3NzaC1lZDI1NTE5AAAAILagOJFgwaMNhBWQINinKOXmqS4Gh5NgxgriXwdOoINJ";
+    /// A second, distinct real ed25519 public key. Source: russh 0.62.4's
+    /// `src/keys/mod.rs` module-level doc example.
+    const ED25519_KEY_B: &str =
+        "AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+    /// A real ECDSA (NIST P-256) public key — a different algorithm from the
+    /// two above. Source: russh 0.62.4's `src/keys/mod.rs`
+    /// `test_parse_p256_public_key` fixture.
+    const ECDSA_P256_KEY: &str = "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBMxBTpMIGvo7CnordO7wP0QQRqpBwUjOLl4eMhfucfE1sjTYyK5wmTl1UqoSDS1PtRVTBdl+0+9pquFb46U7fwg=";
+
+    fn key(base64: &str) -> PublicKey {
+        russh::keys::parse_public_key_base64(base64).unwrap()
     }
 
     fn handler(host: &str, port: u16, known_hosts: PathBuf) -> ClientHandler {
@@ -356,10 +393,10 @@ mod tests {
     async fn an_unknown_host_is_trusted_on_first_use_and_recorded() {
         let dir = scratch("unknown");
         let known = dir.join("known_hosts");
-        let key = gen_key(&dir, "host_key", &["-t", "ed25519"]);
+        let k = key(ED25519_KEY_A);
 
         let mut h = handler("example.test", 2222, known.clone());
-        let accepted = h.check_server_key(&key).await.unwrap();
+        let accepted = h.check_server_key(&k).await.unwrap();
         assert!(accepted);
 
         let recorded = std::fs::read_to_string(&known).unwrap();
@@ -374,15 +411,15 @@ mod tests {
     async fn a_learned_key_is_re_validated_and_accepted_on_a_second_call() {
         let dir = scratch("relearn");
         let known = dir.join("known_hosts");
-        let key = gen_key(&dir, "host_key", &["-t", "ed25519"]);
+        let k = key(ED25519_KEY_A);
 
         let mut h = handler("example.test", 2222, known);
         assert!(
-            h.check_server_key(&key).await.unwrap(),
+            h.check_server_key(&k).await.unwrap(),
             "first call should learn it"
         );
         assert!(
-            h.check_server_key(&key).await.unwrap(),
+            h.check_server_key(&k).await.unwrap(),
             "second call should hit the known-and-matching path, not re-learn"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -392,11 +429,11 @@ mod tests {
     async fn a_recorded_key_that_still_matches_is_accepted() {
         let dir = scratch("matching");
         let known = dir.join("known_hosts");
-        let key = gen_key(&dir, "host_key", &["-t", "ed25519"]);
-        learn_known_hosts_path("example.test", 2222, &key, &known).unwrap();
+        let k = key(ED25519_KEY_A);
+        learn_known_hosts_path("example.test", 2222, &k, &known).unwrap();
 
         let mut h = handler("example.test", 2222, known);
-        assert!(h.check_server_key(&key).await.unwrap());
+        assert!(h.check_server_key(&k).await.unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -404,8 +441,8 @@ mod tests {
     async fn a_same_algorithm_key_change_is_rejected_and_never_learned() {
         let dir = scratch("keychanged");
         let known = dir.join("known_hosts");
-        let original = gen_key(&dir, "original", &["-t", "ed25519"]);
-        let attacker = gen_key(&dir, "attacker", &["-t", "ed25519"]);
+        let original = key(ED25519_KEY_A);
+        let attacker = key(ED25519_KEY_B);
         learn_known_hosts_path("example.test", 2222, &original, &known).unwrap();
         let before = std::fs::read_to_string(&known).unwrap();
 
@@ -430,8 +467,8 @@ mod tests {
     async fn a_different_algorithm_key_for_a_known_host_is_rejected_and_never_learned() {
         let dir = scratch("diffalgo");
         let known = dir.join("known_hosts");
-        let recorded = gen_key(&dir, "recorded", &["-t", "ed25519"]);
-        let attacker = gen_key(&dir, "attacker-rsa", &["-t", "rsa", "-b", "2048"]);
+        let recorded = key(ED25519_KEY_A);
+        let attacker = key(ECDSA_P256_KEY);
         learn_known_hosts_path("example.test", 2222, &recorded, &known).unwrap();
         let before = std::fs::read_to_string(&known).unwrap();
 
@@ -439,7 +476,7 @@ mod tests {
         let err = h.check_server_key(&attacker).await.unwrap_err();
         assert!(
             matches!(err, TunnelError::HostKey(_)),
-            "a host with a recorded ed25519 key must reject an unrecorded rsa key, got {err:?}"
+            "a host with a recorded ed25519 key must reject an unrecorded ecdsa key, got {err:?}"
         );
 
         let after = std::fs::read_to_string(&known).unwrap();
@@ -450,16 +487,35 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Minor-2 regression: `known_host_keys_path` swallows *every*
+    /// `File::open` failure into `Ok(vec![])`, not just "file missing," so an
+    /// existing file that happens to have no entry for this host must not be
+    /// silently treated as first contact.
+    #[tokio::test]
+    async fn an_existing_known_hosts_file_with_no_entry_for_the_host_is_never_first_contact() {
+        let dir = scratch("existing-no-entry");
+        let known = dir.join("known_hosts");
+        std::fs::write(&known, b"# entries for other hosts would go here\n").unwrap();
+
+        let mut h = handler("example.test", 2222, known.clone());
+        let err = h.check_server_key(&key(ED25519_KEY_A)).await.unwrap_err();
+        assert!(matches!(err, TunnelError::HostKey(_)), "got {err:?}");
+
+        let after = std::fs::read_to_string(&known).unwrap();
+        assert_eq!(
+            after, "# entries for other hosts would go here\n",
+            "nothing must be learned when the file already existed but couldn't prove absence"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn accept_any_still_accepts_a_never_before_seen_key() {
-        let key_dir = scratch("acceptany-key");
-        let key = gen_key(&key_dir, "host_key", &["-t", "ed25519"]);
         let mut h = ClientHandler {
             host: "example.test".into(),
             port: 22,
             policy: HostKeyPolicy::AcceptAny,
         };
-        assert!(h.check_server_key(&key).await.unwrap());
-        std::fs::remove_dir_all(&key_dir).ok();
+        assert!(h.check_server_key(&key(ED25519_KEY_B)).await.unwrap());
     }
 }

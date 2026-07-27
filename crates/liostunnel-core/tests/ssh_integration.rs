@@ -83,6 +83,8 @@ fn gen_public_key(
         .args(keygen_type_args)
         .args(["-N", "", "-C", "lios-test", "-f"])
         .arg(&path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .expect("ssh-keygen must be on PATH to run this test");
     assert!(status.success(), "ssh-keygen failed generating {name}");
