@@ -1,5 +1,8 @@
 pub mod local_stream;
+pub mod nat_table;
 pub mod smoltcp_stack;
+#[cfg(test)]
+pub(crate) mod testutil;
 pub mod tun;
 
 use std::net::{Ipv4Addr, SocketAddr};
