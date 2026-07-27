@@ -2491,10 +2491,18 @@ pub fn load(path: &Path, secret_dir: &Path) -> Result<ServerProfile, TunnelError
 
     match serde_json::from_str::<PortableProfile>(&raw) {
         Ok(p) => p.import(secret_dir),
-        Err(e) => Err(TunnelError::config(
-            path.display().to_string(),
-            format!("not a valid profile in either format: {e}"),
-        )),
+        Err(e) => {
+            // The raw serde error is not shown to the user: PortableProfile's
+            // scalar fields (port, kill_switch, protocol) make serde's
+            // invalid_type/unknown_variant messages echo the offending value
+            // verbatim, and a secret misplaced into one of those fields would
+            // leak into this error text.
+            tracing::debug!(path = %path.display(), error = %e, "profile parse failed");
+            Err(TunnelError::config(
+                path.display().to_string(),
+                "not a valid profile in either format",
+            ))
+        }
     }
 }
 
@@ -2675,6 +2683,7 @@ async fn run(cli: Cli) -> Result<(), liostunnel_core::TunnelError> {
         Command::Import { profile } => {
             let p = profile_io::load(&profile, &secret_dir)?;
             p.validate(&FileSecretStore)?;
+            emit_warnings(&p);
             let out = home.join(format!("{}.json", p.id));
             std::fs::create_dir_all(&home).map_err(liostunnel_core::TunnelError::from)?;
             std::fs::write(&out, serde_json::to_string_pretty(&p).unwrap())
