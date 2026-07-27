@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod error;
+pub mod net;
 pub mod protocols;
 pub mod stats;
 
