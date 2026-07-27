@@ -4,6 +4,7 @@ use std::sync::Arc;
 use liostunnel_core::TunnelError;
 use liostunnel_core::config::profile::ServerProfile;
 use liostunnel_core::config::secret::FileSecretStore;
+use liostunnel_core::dns::{Resolver, UnimplementedResolver};
 use liostunnel_core::engine::Engine;
 use liostunnel_core::net::smoltcp_stack::poll::SmoltcpStack;
 use liostunnel_core::net::tun::{TunConfig, TunDevice};
@@ -155,7 +156,12 @@ pub async fn run(
     )?;
 
     // 5. Run until interrupted.
-    let engine = Engine::new(protocol, handles);
+    // TODO(Task 19/20): select the real resolver from `profile.dns` (DNS-over-TCP
+    // or DoH) once those backends exist. Until then every DNS query fails and
+    // drops silently on the wire -- the client's own resolver retries, which is
+    // strictly better than this CLI fabricating an answer.
+    let resolver: Arc<dyn Resolver> = Arc::new(UnimplementedResolver);
+    let engine = Engine::new(protocol, resolver, handles);
     let shutdown = engine.shutdown_handle();
     let stats = engine.stats_handle();
     let engine_task = tokio::spawn(engine.run());

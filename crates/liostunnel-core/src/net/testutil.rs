@@ -3,9 +3,9 @@
 //! Built with smoltcp's own setters rather than hand-written bytes, so
 //! checksums are always correct and the tests exercise real parsing.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 
-use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Packet, TcpPacket, TcpSeqNumber, UdpPacket};
+use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Packet, TcpPacket, TcpSeqNumber};
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct TcpFlags {
@@ -91,19 +91,6 @@ pub fn build_tcp(
 }
 
 pub fn build_udp(src: (Ipv4Addr, u16), dst: (Ipv4Addr, u16), payload: &[u8]) -> Vec<u8> {
-    let udp_len = 8 + payload.len();
-    let mut buf = ipv4_frame(src.0, dst.0, IpProtocol::Udp, udp_len);
-    {
-        let mut udp = UdpPacket::new_unchecked(&mut buf[20..]);
-        udp.set_src_port(src.1);
-        udp.set_dst_port(dst.1);
-        udp.set_len(udp_len as u16);
-        udp.payload_mut().copy_from_slice(payload);
-        udp.fill_checksum(&IpAddress::Ipv4(src.0), &IpAddress::Ipv4(dst.0));
-    }
-    {
-        let mut ip = Ipv4Packet::new_unchecked(&mut buf[..]);
-        ip.fill_checksum();
-    }
-    buf
+    crate::dns::build_udp_packet(SocketAddr::from(src), SocketAddr::from(dst), payload)
+        .expect("test addresses are IPv4")
 }

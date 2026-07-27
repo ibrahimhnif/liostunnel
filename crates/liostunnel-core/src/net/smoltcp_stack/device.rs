@@ -33,6 +33,13 @@ impl QueuedDevice {
         self.tx.drain(..).collect()
     }
 
+    /// Queues a fully-formed packet for the device, bypassing smoltcp
+    /// entirely. Used for synthesised DNS replies, which never touch a
+    /// smoltcp socket. Spec §7.5.
+    pub fn push_tx(&mut self, packet: Vec<u8>) {
+        self.tx.push_back(packet);
+    }
+
     pub fn rx_len(&self) -> usize {
         self.rx.len()
     }
@@ -127,6 +134,16 @@ mod tests {
 
         assert_eq!(d.drain_tx(), vec![vec![9, 9, 9, 9]]);
         assert!(d.drain_tx().is_empty(), "draining must consume");
+    }
+
+    #[test]
+    fn a_pushed_packet_reaches_drain_tx_ahead_of_smoltcps_own_transmits() {
+        let mut d = QueuedDevice::new(1500);
+        d.push_tx(vec![1, 2, 3]);
+        let tx = d.transmit(Instant::from_micros(0)).unwrap();
+        tx.consume(2, |buf| buf.copy_from_slice(&[9, 9]));
+
+        assert_eq!(d.drain_tx(), vec![vec![1, 2, 3], vec![9, 9]]);
     }
 
     #[test]

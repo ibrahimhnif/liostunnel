@@ -257,10 +257,21 @@ impl StackCore {
         self.wake = wake;
     }
 
-    /// Queues a datagram for delivery to the device. Reply synthesis lands in
-    /// Task 18; until then the datagram is counted and discarded.
-    pub fn inject_datagram(&mut self, _dg: Datagram) {
-        self.udp_dropped += 1;
+    /// Delivers a datagram to the device by synthesising a raw UDP/IP packet
+    /// and queuing it, bypassing smoltcp's socket layer entirely — the same
+    /// way `ingest` never hands a UDP:53 packet to a socket on the way in.
+    ///
+    /// `dg.src`/`dg.dst` are already oriented device-ward: `src` is whoever
+    /// is answering (the resolver), `dst` is the application that asked.
+    /// Spec §7.5.
+    pub fn inject_datagram(&mut self, dg: Datagram) {
+        match crate::dns::build_udp_packet(dg.src, dg.dst, &dg.payload) {
+            Ok(packet) => self.device.push_tx(packet),
+            Err(e) => {
+                self.udp_dropped += 1;
+                tracing::debug!(%e, "cannot synthesise datagram for the device");
+            }
+        }
     }
 
     /// Step 1 of the loop: classify a packet, arm a listener if it opens a new
@@ -1637,5 +1648,41 @@ mod tests {
         core.step(Instant::from_micros(0));
         assert_eq!(core.active_flows(), 0);
         assert_eq!(core.udp_dropped(), 0);
+    }
+
+    #[test]
+    fn an_injected_datagram_is_written_towards_the_device() {
+        let mut core = StackCore::new(StackConfig::default());
+        let dns = (Ipv4Addr::new(1, 1, 1, 1), 53);
+
+        core.ingest(&build_udp(APP, dns, b"\xAB\xCDquery"));
+        let dgs = core.take_datagrams();
+        assert_eq!(dgs.len(), 1);
+
+        // The engine answers: src/dst are swapped relative to the query.
+        core.inject_datagram(Datagram {
+            src: sa(dns),
+            dst: sa(APP),
+            payload: b"\xAB\xCDanswer".to_vec(),
+        });
+
+        let tx = core.drain_tx();
+        assert_eq!(tx.len(), 1, "the reply must reach the device");
+        let ip = Ipv4Packet::new_checked(&tx[0][..]).unwrap();
+        assert!(ip.verify_checksum());
+        assert_eq!(core.udp_dropped(), 0, "a DNS reply is not a drop");
+    }
+
+    #[test]
+    fn an_unsolicited_reply_is_still_delivered_but_a_malformed_one_is_counted() {
+        let mut core = StackCore::new(StackConfig::default());
+        // Address families that cannot produce a packet.
+        core.inject_datagram(Datagram {
+            src: "[2001:db8::1]:53".parse().unwrap(),
+            dst: sa(APP),
+            payload: b"x".to_vec(),
+        });
+        assert!(core.drain_tx().is_empty());
+        assert_eq!(core.udp_dropped(), 1);
     }
 }

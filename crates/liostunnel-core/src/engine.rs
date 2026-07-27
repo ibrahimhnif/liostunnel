@@ -16,8 +16,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use tokio::sync::mpsc;
+
+use crate::dns::Resolver;
 use crate::error::TunnelError;
-use crate::net::{ShutdownHandle, StackHandles, TcpFlow};
+use crate::net::{Datagram, ShutdownHandle, StackHandles, TcpFlow};
 use crate::protocols::Protocol;
 use crate::stats::{ConnectionState, ConnectionStats};
 
@@ -47,14 +50,20 @@ impl StatsHandle {
 /// Ties the packet stack to the active protocol. Spec §7.6.
 pub struct Engine {
     protocol: Arc<dyn Protocol>,
+    resolver: Arc<dyn Resolver>,
     handles: StackHandles,
     counters: Arc<EngineCounters>,
 }
 
 impl Engine {
-    pub fn new(protocol: Arc<dyn Protocol>, handles: StackHandles) -> Self {
+    pub fn new(
+        protocol: Arc<dyn Protocol>,
+        resolver: Arc<dyn Resolver>,
+        handles: StackHandles,
+    ) -> Self {
         Self {
             protocol,
+            resolver,
             handles,
             counters: Arc::new(EngineCounters::default()),
         }
@@ -68,21 +77,39 @@ impl Engine {
         self.handles.shutdown.clone()
     }
 
-    /// Drives the engine until the packet stack closes `tcp_accept` — which
-    /// happens when the stack thread exits, including in reaction to a
-    /// `ShutdownHandle::shutdown()` call on the handle shared with it.
+    /// Drives the engine until the packet stack closes both `tcp_accept` and
+    /// `udp_inbound` — which happens when the stack thread exits, including
+    /// in reaction to a `ShutdownHandle::shutdown()` call on the handle
+    /// shared with it.
     ///
-    /// Written as a `select!` over a single branch, rather than a plain
-    /// `while let Some(flow) = ... .recv().await` loop, so that Task 18's
-    /// `udp_inbound` arm (DNS resolution) slots in beside this one instead of
-    /// forcing this loop to be restructured.
+    /// Each channel is tracked with its own "still open" flag and disabled
+    /// (via `select!`'s `if` precondition) the moment it reports closed,
+    /// rather than the whole loop breaking on the first channel to close.
+    /// That distinction matters: `tokio::select!` polls whichever ready
+    /// branches exist and picks among them arbitrarily, so on the shutdown
+    /// path — where the stack thread drops both channels' senders in the same
+    /// instant — it is entirely possible for `udp_inbound` to report closed
+    /// on a poll where `tcp_accept` still has flows buffered and unread.
+    /// Breaking the loop unconditionally on either arm's `None` would discard
+    /// those flows silently. Tracking each channel independently means a
+    /// closed one simply stops being polled, and the loop only ends once
+    /// *both* are closed and drained — never losing a flow or a query queued
+    /// ahead of the other channel's shutdown.
     pub async fn run(mut self) -> Result<(), TunnelError> {
-        loop {
+        let mut tcp_open = true;
+        let mut udp_open = true;
+        while tcp_open || udp_open {
             tokio::select! {
-                flow = self.handles.tcp_accept.recv() => {
+                flow = self.handles.tcp_accept.recv(), if tcp_open => {
                     match flow {
                         Some(flow) => self.spawn_flow(flow),
-                        None => break,
+                        None => tcp_open = false,
+                    }
+                }
+                dg = self.handles.udp_inbound.recv(), if udp_open => {
+                    match dg {
+                        Some(dg) => self.spawn_dns_query(dg),
+                        None => udp_open = false,
                     }
                 }
             }
@@ -102,6 +129,49 @@ impl Engine {
         let protocol = self.protocol.clone();
         let counters = self.counters.clone();
         tokio::spawn(async move { proxy_one(flow, protocol, counters).await });
+    }
+
+    /// Spawns one DNS query's resolution. As with `spawn_flow`, the datagram
+    /// is owned outright by the spawned future; nothing outside it retains
+    /// the query payload.
+    fn spawn_dns_query(&self, dg: Datagram) {
+        let resolver = self.resolver.clone();
+        let out = self.handles.udp_outbound.clone();
+        let counters = self.counters.clone();
+        tokio::spawn(async move { resolve_one(dg, resolver, out, counters).await });
+    }
+}
+
+/// One DNS query, carried through the tunnel by `resolver`.
+///
+/// A failed query drops silently on the wire rather than synthesising a
+/// bogus reply: the client's own resolver retries on a timeout, and
+/// answering wrongly is worse than not answering at all. Spec §11.
+///
+/// Never logs the query or the answer — only the outcome. A DNS query names
+/// exactly what a user is browsing, and is as sensitive as the traffic
+/// itself.
+async fn resolve_one(
+    dg: Datagram,
+    resolver: Arc<dyn Resolver>,
+    out: mpsc::Sender<Datagram>,
+    counters: Arc<EngineCounters>,
+) {
+    counters.dns_queries.fetch_add(1, Ordering::Relaxed);
+    match resolver.query(&dg.payload).await {
+        Ok(answer) => {
+            // The reply comes *from* the resolver's address, back to the
+            // application that asked: src/dst swap relative to the query.
+            let reply = Datagram {
+                src: dg.dst,
+                dst: dg.src,
+                payload: answer,
+            };
+            if out.send(reply).await.is_err() {
+                tracing::debug!("stack closed before the DNS reply could be delivered");
+            }
+        }
+        Err(e) => tracing::debug!(%e, "DNS query failed; the client will retry"),
     }
 }
 
@@ -157,6 +227,7 @@ async fn proxy_one(flow: TcpFlow, protocol: Arc<dyn Protocol>, counters: Arc<Eng
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns::UnimplementedResolver;
     use crate::net::Wakeup;
     use crate::net::local_stream::local_stream_pair;
     use crate::protocols::TunnelStream;
@@ -230,6 +301,7 @@ mod tests {
 
         let engine = Engine::new(
             proto.clone(),
+            Arc::new(UnimplementedResolver),
             StackHandles {
                 tcp_accept,
                 udp_inbound,
@@ -272,6 +344,7 @@ mod tests {
 
         let engine = Engine::new(
             proto.clone(),
+            Arc::new(UnimplementedResolver),
             StackHandles {
                 tcp_accept,
                 udp_inbound,
@@ -326,6 +399,7 @@ mod tests {
 
         let engine = Engine::new(
             proto,
+            Arc::new(UnimplementedResolver),
             StackHandles {
                 tcp_accept,
                 udp_inbound,
@@ -405,6 +479,186 @@ mod tests {
         assert!(
             observed_close.is_ok(),
             "aborting the flow's task must still drop its LocalStream"
+        );
+    }
+
+    /// Answers with a fixed payload, or fails if none was configured —
+    /// standing in for a real Task 19/20 backend. Records nothing about the
+    /// query beyond raw bytes a test itself chose to send.
+    struct MockResolver {
+        answer: Mutex<Option<Vec<u8>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Resolver for MockResolver {
+        async fn query(&self, _query: &[u8]) -> Result<Vec<u8>, TunnelError> {
+            match self.answer.lock().unwrap().clone() {
+                Some(a) => Ok(a),
+                None => Err(TunnelError::Dns("mock: no answer configured".into())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_successful_dns_query_reaches_udp_outbound_with_swapped_endpoints() {
+        let resolver = Arc::new(MockResolver {
+            answer: Mutex::new(Some(b"\xAB\xCDanswer".to_vec())),
+        });
+        let (tcp_tx, tcp_accept) = tokio::sync::mpsc::channel(4);
+        let (udp_in_tx, udp_inbound) = tokio::sync::mpsc::channel(4);
+        let (udp_outbound, mut udp_out_rx) = tokio::sync::mpsc::channel(4);
+
+        let engine = Engine::new(
+            mock(false),
+            resolver,
+            StackHandles {
+                tcp_accept,
+                udp_inbound,
+                udp_outbound,
+                shutdown: inert_shutdown(),
+            },
+        );
+        let stats = engine.stats_handle();
+        let handle = tokio::spawn(engine.run());
+
+        let query_src: SocketAddr = "10.90.0.2:51234".parse().unwrap();
+        let query_dst: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        udp_in_tx
+            .send(Datagram {
+                src: query_src,
+                dst: query_dst,
+                payload: b"\xAB\xCDquery".to_vec(),
+            })
+            .await
+            .unwrap();
+
+        let reply = tokio::time::timeout(Duration::from_secs(2), udp_out_rx.recv())
+            .await
+            .expect("a reply must be produced")
+            .expect("the channel must stay open");
+
+        assert_eq!(
+            reply.src, query_dst,
+            "the reply must come from the resolver's own address"
+        );
+        assert_eq!(
+            reply.dst, query_src,
+            "the reply must go back to the querying application"
+        );
+        assert_eq!(reply.payload, b"\xAB\xCDanswer".to_vec());
+        assert_eq!(stats.load().dns_queries, 1);
+
+        drop(udp_in_tx);
+        drop(tcp_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_dns_query_drops_silently_without_reaching_udp_outbound() {
+        // Spec: a failed resolution must drop on the wire, not synthesise a
+        // bogus reply — the client's own resolver retries, and answering
+        // wrongly is worse than not answering.
+        let resolver = Arc::new(MockResolver {
+            answer: Mutex::new(None),
+        });
+        let (tcp_tx, tcp_accept) = tokio::sync::mpsc::channel(4);
+        let (udp_in_tx, udp_inbound) = tokio::sync::mpsc::channel(4);
+        let (udp_outbound, mut udp_out_rx) = tokio::sync::mpsc::channel(4);
+
+        let engine = Engine::new(
+            mock(false),
+            resolver,
+            StackHandles {
+                tcp_accept,
+                udp_inbound,
+                udp_outbound,
+                shutdown: inert_shutdown(),
+            },
+        );
+        let stats = engine.stats_handle();
+        let handle = tokio::spawn(engine.run());
+
+        udp_in_tx
+            .send(Datagram {
+                src: "10.90.0.2:51234".parse().unwrap(),
+                dst: "1.1.1.1:53".parse().unwrap(),
+                payload: b"\xAB\xCDquery".to_vec(),
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            udp_out_rx.try_recv().is_err(),
+            "a failed query must never produce an outbound datagram"
+        );
+        assert_eq!(stats.load().dns_queries, 1, "the attempt is still counted");
+
+        drop(udp_in_tx);
+        drop(tcp_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// Regression test for the shutdown race in `run`'s `select!` loop. The
+    /// stack thread drops `tcp_tx` and `udp_in_tx` at the same instant, so a
+    /// loop that unconditionally breaks when *either* arm reports closed can
+    /// end while the other channel still has buffered, unprocessed items.
+    ///
+    /// Dropping `udp_in_tx` with nothing ever sent on it, then pre-loading
+    /// many flows onto `tcp_accept` before the engine ever starts, forces
+    /// that exact race deterministically: on the very first `select!` poll,
+    /// the udp arm is immediately ready with `None` while the tcp arm is
+    /// immediately ready with `Some`, and `tokio::select!` picks among
+    /// simultaneously-ready branches arbitrarily. A `None => break` on the
+    /// udp arm would end the loop right there with every flow lost; a
+    /// correct loop must keep draining `tcp_accept` until it, too, is
+    /// genuinely exhausted.
+    #[tokio::test]
+    async fn a_closed_udp_inbound_does_not_starve_buffered_tcp_flows() {
+        const N: usize = 30;
+        let proto = mock(false);
+        let (tcp_tx, tcp_accept) = tokio::sync::mpsc::channel(N + 1);
+        let (udp_in_tx, udp_inbound) = tokio::sync::mpsc::channel(4);
+        let (udp_outbound, _udp_out_rx) = tokio::sync::mpsc::channel(4);
+        drop(udp_in_tx);
+
+        let mut peers = Vec::with_capacity(N);
+        for i in 0..N {
+            let (stream, peer) = local_stream_pair(8, Wakeup::default());
+            peers.push(peer);
+            tcp_tx
+                .send(TcpFlow {
+                    src: "10.90.0.2:51234".parse().unwrap(),
+                    dst: format!("93.184.216.34:{}", 10_000 + i).parse().unwrap(),
+                    stream,
+                })
+                .await
+                .unwrap();
+        }
+        drop(tcp_tx);
+
+        let engine = Engine::new(
+            proto.clone(),
+            Arc::new(UnimplementedResolver),
+            StackHandles {
+                tcp_accept,
+                udp_inbound,
+                udp_outbound,
+                shutdown: inert_shutdown(),
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(2), engine.run())
+            .await
+            .expect("the engine must drain both closed channels and exit, not hang")
+            .unwrap();
+
+        // The spawned per-flow tasks race the assertion below; give them a
+        // beat to reach `open_tcp_stream`.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            proto.opened.lock().unwrap().len(),
+            N,
+            "every flow buffered ahead of udp_inbound's close must still be processed"
         );
     }
 }
