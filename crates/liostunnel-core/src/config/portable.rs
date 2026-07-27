@@ -430,9 +430,24 @@ mod tests {
             port: 22,
             auth: PortableAuth::PrivateKey {
                 // No trailing newline: `FileSecretStore::resolve` (secret.rs)
-                // deliberately trims trailing `\n` when reading a secret file
-                // back, for human-edited key files. That's orthogonal to what
-                // this test checks, so avoid tripping it here.
+                // deliberately trims a trailing newline when reading a secret
+                // file back, for human-edited key files. That's orthogonal to
+                // what this test checks (distinct paths for key vs.
+                // passphrase, and passphrase survival), so avoid tripping it
+                // here.
+                //
+                // NB (see fix-secret-newline-report.md): restoring a trailing
+                // `\n` here does NOT make the round trip hold, even after
+                // secret.rs's trim-at-most-one fix. `import` writes the key
+                // verbatim; `export` reads it back through
+                // `FileSecretStore::resolve`, which strips exactly one
+                // trailing line ending when present. A key ending in exactly
+                // one `\n` therefore always loses it on export, identically
+                // under both the old ("trim all trailing `\n`") and new
+                // ("trim at most one") behaviour, since both strip the same
+                // single trailing character here. That asymmetry is between
+                // `import` (raw write) and `export` (normalizing read) and is
+                // out of scope for this fix.
                 private_key: "-----BEGIN OPENSSH PRIVATE KEY-----\nabc".into(),
                 passphrase: Some("swordfish".into()),
             },

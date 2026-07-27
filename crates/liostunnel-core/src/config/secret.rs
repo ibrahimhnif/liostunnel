@@ -65,13 +65,31 @@ impl SecretStore for FileSecretStore {
                         format!("cannot read: {e}"),
                     )
                 })?;
-                Ok(Redacted::new(body.trim_end_matches('\n').to_string()))
+                Ok(Redacted::new(
+                    strip_one_trailing_line_ending(&body).to_string(),
+                ))
             }
             SecretRef::Env { var } => std::env::var(var)
                 .map(Redacted::new)
                 .map_err(|_| TunnelError::config(format!("env `{var}`"), "not set")),
         }
     }
+}
+
+/// Strips at most one trailing line ending (`\r\n` or `\n`) — never more.
+///
+/// We strip exactly one because a human editing a secret in a text editor,
+/// e.g. `echo hunter2 > pw`, ends up with a trailing `hunter2\n` and means
+/// `hunter2`. But we strip *no more than* one because SSH/WireGuard private
+/// keys conventionally end with exactly one newline after their final PEM
+/// line, and everything beyond the first trailing line ending is real
+/// content, not editor residue. Blindly trimming every trailing `\n` (the
+/// previous behaviour) silently corrupted such keys on every read, and on
+/// CRLF files left a stray `\r` glued to the end of the secret.
+fn strip_one_trailing_line_ending(body: &str) -> &str {
+    body.strip_suffix("\r\n")
+        .or_else(|| body.strip_suffix('\n'))
+        .unwrap_or(body)
 }
 
 /// Spec §9.2: secret files must be 0600 or stricter.
@@ -204,5 +222,87 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("LIOS_DEFINITELY_UNSET"));
+    }
+
+    fn write_secret(dir: &std::path::Path, name: &str, content: &[u8]) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, content).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        p
+    }
+
+    #[test]
+    fn file_store_strips_a_single_trailing_lf() {
+        let dir = std::env::temp_dir().join(format!("lios-sec-lf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = write_secret(&dir, "pw", b"hunter2\n");
+
+        let store = FileSecretStore;
+        let got = store.resolve(&SecretRef::File { path: p }).unwrap();
+        assert_eq!(got.expose(), "hunter2");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_store_strips_a_single_trailing_crlf() {
+        let dir = std::env::temp_dir().join(format!("lios-sec-crlf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = write_secret(&dir, "pw", b"hunter2\r\n");
+
+        let store = FileSecretStore;
+        let got = store.resolve(&SecretRef::File { path: p }).unwrap();
+        assert_eq!(
+            got.expose(),
+            "hunter2",
+            "both the LF and the stray CR must be gone"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_store_strips_only_the_last_of_two_trailing_newlines() {
+        let dir = std::env::temp_dir().join(format!("lios-sec-doublenl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = write_secret(&dir, "pw", b"hunter2\n\n");
+
+        let store = FileSecretStore;
+        let got = store.resolve(&SecretRef::File { path: p }).unwrap();
+        assert_eq!(
+            got.expose(),
+            "hunter2\n",
+            "only one trailing newline may be stripped"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_store_leaves_a_secret_with_no_trailing_newline_unchanged() {
+        let dir = std::env::temp_dir().join(format!("lios-sec-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = write_secret(&dir, "pw", b"hunter2");
+
+        let store = FileSecretStore;
+        let got = store.resolve(&SecretRef::File { path: p }).unwrap();
+        assert_eq!(got.expose(), "hunter2");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_store_preserves_interior_newlines_in_a_multiline_key() {
+        let dir = std::env::temp_dir().join(format!("lios-sec-pem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pem =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\ndef\n-----END OPENSSH PRIVATE KEY-----\n";
+        let p = write_secret(&dir, "id_ed25519", pem.as_bytes());
+
+        let store = FileSecretStore;
+        let got = store.resolve(&SecretRef::File { path: p }).unwrap();
+        assert_eq!(
+            got.expose(),
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\ndef\n-----END OPENSSH PRIVATE KEY-----",
+            "interior newlines must survive; only the final trailing one is stripped"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
