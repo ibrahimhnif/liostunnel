@@ -16,7 +16,7 @@ tun-rs = "2.8.8"
 polling = "3.11.0"
 ipnet = { version = "2.12.0", features = ["serde"] }
 tokio = { version = "1.53", features = [
-    "rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal", "process",
+    "rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal", "process",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,6 +25,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
 
 [profile.release]
 strip = true
