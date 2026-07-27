@@ -146,16 +146,32 @@ pub async fn run(
         .ok_or_else(|| TunnelError::Route(format!("no address for {}", profile.host)))?
         .ip();
 
-    let mut guard = RouteGuard::apply(
-        manager,
-        RoutePlan {
-            interface,
-            mode: opts.route_mode,
-            server_ip,
-            original_gateway: gateway,
-            dns_servers: profile.dns.servers.clone(),
-        },
-    )?;
+    let plan = RoutePlan {
+        interface,
+        mode: opts.route_mode,
+        server_ip,
+        original_gateway: gateway,
+        dns_servers: profile.dns.servers.clone(),
+    };
+
+    // Third cleanup path: a state file that survives `kill -9`, which neither
+    // `RouteGuard`'s `Drop` nor a signal handler can. Recover anything a
+    // previous crashed run left behind *before* installing anything new.
+    let state_path = crate::profile_io::home().join("applied_routes.json");
+    liostunnel_core::route::state::recover_if_stale(&state_path)?;
+
+    // Record before applying: a crash between these two lines leaves a state
+    // file describing routes that were never installed, and reverting those
+    // is harmless. The reverse order would lose them entirely -- do not
+    // "optimize" this by moving the save after `RouteGuard::apply`.
+    liostunnel_core::route::state::AppliedState {
+        interface: plan.interface.clone(),
+        revert: manager.revert_commands(&plan)?,
+        pid: std::process::id(),
+    }
+    .save(&state_path)?;
+
+    let mut guard = RouteGuard::apply(manager, plan)?;
 
     // 5. Run until interrupted.
     // Select the real resolver backend from `profile.dns.mode`: DNS-over-TCP
@@ -186,7 +202,7 @@ pub async fn run(
 
     println!("connected — press Ctrl-C to stop");
     // Deliberately not `tokio::signal::ctrl_c().await?;` here. An early `?`
-    // on that line would return before the three cleanup lines below ever
+    // on that line would return before the four cleanup lines below ever
     // run; `guard`'s `Drop` would still revert the routes on that path, but
     // nothing would tell the stack thread to stop -- `ShutdownHandle::shutdown`
     // is a plain method call, not something any `Drop` impl reaches for on
@@ -195,11 +211,26 @@ pub async fn run(
     // success or error alike -- exactly what `StackCore::poll_delay`'s
     // contract (point 2) requires: the tunnel side must signal on every exit
     // path, not just the happy one.
-    let ctrl_c = tokio::signal::ctrl_c().await;
+    //
+    // The second cleanup path: covers a graceful stop request (Ctrl-C or
+    // `kill -TERM`), as opposed to `RouteGuard`'s `Drop` (path one, covers
+    // normal return and unwinding panics) and the state file (path three,
+    // survives `kill -9`, which delivers no signal at all).
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(TunnelError::Transport)?;
+
+    let ctrl_c = tokio::select! {
+        r = tokio::signal::ctrl_c() => r,
+        _ = sigterm.recv() => Ok(()),
+    };
     println!("\nshutting down");
 
     shutdown.shutdown();
     guard.revert_now();
+    // A clean shutdown reverted the routes above, so the state file describing
+    // them would be stale as soon as this process exits; clear it now so the
+    // next start does not mistake a normal exit for a crash to recover from.
+    liostunnel_core::route::state::AppliedState::clear(&state_path);
     engine_task.abort();
 
     let s = stats.load();

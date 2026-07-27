@@ -50,7 +50,34 @@ impl RouteManager for MacOsRoutes {
                     }
                 }
             }
-            RouteMode::Default => return Err(TunnelError::Unsupported("default route mode")),
+            RouteMode::Default => {
+                // The server pin comes first: install it after 0.0.0.0/1 and the
+                // SSH connection can be cut before its own escape route exists.
+                cmds.push(RouteCommand::new(
+                    "route",
+                    &[
+                        "-n",
+                        "add",
+                        "-host",
+                        &plan.server_ip.to_string(),
+                        &plan.original_gateway.to_string(),
+                    ],
+                ));
+                // Two /1 routes beat 0.0.0.0/0 by being more specific, so the
+                // real default route is never deleted and restoring is exact.
+                for half in ["0.0.0.0/1", "128.0.0.0/1"] {
+                    cmds.push(RouteCommand::new(
+                        "route",
+                        &["-n", "add", "-net", half, "-interface", &plan.interface],
+                    ));
+                }
+                let mut args = vec!["-setdnsservers".to_string(), "Wi-Fi".to_string()];
+                args.extend(plan.dns_servers.iter().map(|d| d.to_string()));
+                cmds.push(RouteCommand {
+                    program: "networksetup".into(),
+                    args,
+                });
+            }
         }
         Ok(cmds)
     }
@@ -89,7 +116,28 @@ impl RouteManager for MacOsRoutes {
                     }
                 }
             }
-            RouteMode::Default => return Err(TunnelError::Unsupported("default route mode")),
+            RouteMode::Default => {
+                for half in ["0.0.0.0/1", "128.0.0.0/1"] {
+                    cmds.push(RouteCommand::new(
+                        "route",
+                        &["-n", "delete", "-net", half, "-interface", &plan.interface],
+                    ));
+                }
+                cmds.push(RouteCommand::new(
+                    "route",
+                    &[
+                        "-n",
+                        "delete",
+                        "-host",
+                        &plan.server_ip.to_string(),
+                        &plan.original_gateway.to_string(),
+                    ],
+                ));
+                cmds.push(RouteCommand::new(
+                    "networksetup",
+                    &["-setdnsservers", "Wi-Fi", "Empty"],
+                ));
+            }
         }
         Ok(cmds)
     }

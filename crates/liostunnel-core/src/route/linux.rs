@@ -50,7 +50,28 @@ impl RouteManager for LinuxRoutes {
                     }
                 }
             }
-            RouteMode::Default => return Err(TunnelError::Unsupported("default route mode")),
+            RouteMode::Default => {
+                // The server pin comes first: install it after 0.0.0.0/1 and the
+                // SSH connection can be cut before its own escape route exists.
+                cmds.push(RouteCommand::new(
+                    "ip",
+                    &[
+                        "route",
+                        "add",
+                        &format!("{}/32", plan.server_ip),
+                        "via",
+                        &plan.original_gateway.to_string(),
+                    ],
+                ));
+                // Two /1 routes beat 0.0.0.0/0 by being more specific, so the
+                // real default route is never deleted and restoring is exact.
+                for half in ["0.0.0.0/1", "128.0.0.0/1"] {
+                    cmds.push(RouteCommand::new(
+                        "ip",
+                        &["route", "add", half, "dev", &plan.interface],
+                    ));
+                }
+            }
         }
         Ok(cmds)
     }
@@ -81,7 +102,18 @@ impl RouteManager for LinuxRoutes {
                     }
                 }
             }
-            RouteMode::Default => return Err(TunnelError::Unsupported("default route mode")),
+            RouteMode::Default => {
+                for half in ["0.0.0.0/1", "128.0.0.0/1"] {
+                    cmds.push(RouteCommand::new(
+                        "ip",
+                        &["route", "del", half, "dev", &plan.interface],
+                    ));
+                }
+                cmds.push(RouteCommand::new(
+                    "ip",
+                    &["route", "del", &format!("{}/32", plan.server_ip)],
+                ));
+            }
         }
         Ok(cmds)
     }

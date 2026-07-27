@@ -1,5 +1,6 @@
 pub mod linux;
 pub mod macos;
+pub mod state;
 
 use std::net::IpAddr;
 
@@ -30,7 +31,7 @@ pub struct RoutePlan {
     pub dns_servers: Vec<IpAddr>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RouteCommand {
     pub program: String,
     pub args: Vec<String>,
@@ -329,4 +330,150 @@ mod tests {
             }
         }
     }
+
+    fn default_plan() -> RoutePlan {
+        plan(RouteMode::Default)
+    }
+
+    #[test]
+    fn default_mode_beats_the_default_route_without_deleting_it() {
+        for (name, cmds) in [
+            (
+                "macos",
+                macos::MacOsRoutes.apply_commands(&default_plan()).unwrap(),
+            ),
+            (
+                "linux",
+                linux::LinuxRoutes.apply_commands(&default_plan()).unwrap(),
+            ),
+        ] {
+            let r = rendered(&cmds);
+            assert!(r.iter().any(|c| c.contains("0.0.0.0/1")), "{name}: {r:?}");
+            assert!(r.iter().any(|c| c.contains("128.0.0.0/1")), "{name}: {r:?}");
+            assert!(
+                !r.iter()
+                    .any(|c| c.contains("delete default") || c.contains("del default")),
+                "{name} must not remove the real default route: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_mode_pins_the_server_via_the_original_gateway() {
+        // Without this the tunnel's own transport routes through itself and
+        // the connection deadlocks. Spec §10.
+        for (name, cmds) in [
+            (
+                "macos",
+                macos::MacOsRoutes.apply_commands(&default_plan()).unwrap(),
+            ),
+            (
+                "linux",
+                linux::LinuxRoutes.apply_commands(&default_plan()).unwrap(),
+            ),
+        ] {
+            let r = rendered(&cmds);
+            assert!(
+                r.iter()
+                    .any(|c| c.contains("198.51.100.7") && c.contains("192.168.1.1")),
+                "{name} must pin the server route via the original gateway: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_mode_overrides_dns() {
+        let r = rendered(&macos::MacOsRoutes.apply_commands(&default_plan()).unwrap());
+        assert!(r.iter().any(|c| c.starts_with("networksetup")), "{r:?}");
+    }
+
+    #[test]
+    fn the_server_pin_is_installed_before_the_default_beating_routes() {
+        // Ordering matters: install 0/1 first and the SSH connection can drop
+        // before its own pin exists.
+        let cmds = rendered(&linux::LinuxRoutes.apply_commands(&default_plan()).unwrap());
+        let pin = cmds
+            .iter()
+            .position(|c| c.contains("198.51.100.7"))
+            .unwrap();
+        let half = cmds.iter().position(|c| c.contains("0.0.0.0/1")).unwrap();
+        assert!(pin < half, "server pin must come first: {cmds:?}");
+    }
+
+    #[test]
+    fn macos_also_installs_the_server_pin_before_the_default_beating_routes() {
+        // The brief's ordering test only exercises Linux; the same property
+        // (deadlock avoidance, spec §10) is just as load-bearing on macOS, so
+        // it needs the same regression coverage on that platform too.
+        let cmds = rendered(&macos::MacOsRoutes.apply_commands(&default_plan()).unwrap());
+        let pin = cmds
+            .iter()
+            .position(|c| c.contains("198.51.100.7"))
+            .unwrap();
+        let half = cmds.iter().position(|c| c.contains("0.0.0.0/1")).unwrap();
+        assert!(pin < half, "server pin must come first: {cmds:?}");
+    }
+
+    #[test]
+    fn default_modes_routing_commands_are_symmetric_between_apply_and_revert() {
+        // Unlike `test` mode, `Default` mode's revert order is not a literal
+        // reverse of its apply order (the pin is installed first but deleted
+        // last), so this compares destinations as a set rather than zipping
+        // apply/revert positionally or comparing full argument lists.
+        //
+        // Full argument-list comparison (as `reverting_undoes_exactly_what_was_applied`
+        // does for `test` mode) is deliberately *not* used here: macOS's
+        // `route delete -host <dest> <gateway>` requires the gateway
+        // positionally even to delete, while Linux's `ip route del <dest>`
+        // does not need (or take) a `via` clause to identify the same
+        // route -- both are correct, idiomatic uses of their platform's own
+        // command, not an inconsistency to paper over. Comparing destinations
+        // only means this test asserts the property that actually matters --
+        // every network/host we add is removed, nothing extra is removed --
+        // without assuming a syntax both platforms don't share.
+        fn destination(cmd: &RouteCommand) -> Option<String> {
+            if cmd.program == "networksetup" {
+                return None;
+            }
+            cmd.args
+                .iter()
+                .find(|tok| tok.contains('/') || tok.parse::<IpAddr>().is_ok())
+                .cloned()
+        }
+
+        for (name, mgr) in [
+            (
+                "macos",
+                Box::new(macos::MacOsRoutes) as Box<dyn RouteManager>,
+            ),
+            ("linux", Box::new(linux::LinuxRoutes)),
+        ] {
+            let p = default_plan();
+            let applied = mgr.apply_commands(&p).unwrap();
+            let reverted = mgr.revert_commands(&p).unwrap();
+
+            let mut applied_dests: Vec<_> = applied.iter().filter_map(destination).collect();
+            let mut reverted_dests: Vec<_> = reverted.iter().filter_map(destination).collect();
+            applied_dests.sort();
+            reverted_dests.sort();
+            assert_eq!(
+                applied_dests, reverted_dests,
+                "{name}: every destination Default mode applies must have exactly one \
+                 matching revert, and vice versa: applied={applied:?} reverted={reverted:?}"
+            );
+        }
+    }
+
+    // Not asserted above: the macOS DNS override's revert
+    // (`networksetup -setdnsservers Wi-Fi Empty`) does not restore whatever
+    // manual DNS servers the operator had configured before `connect` ran --
+    // it clears back to "automatic" (DHCP-assigned) instead. For an operator
+    // on the common case (no manual DNS override already in place) this is a
+    // no-op difference. For one who *did* have a manual override, reverting
+    // does not restore it exactly, unlike every routing command in this
+    // module. Capturing and restoring the pre-existing DNS configuration
+    // would need `apply_commands` to read current system state, which would
+    // break the "construction stays pure, no fs/process access" contract
+    // Task 16 established -- so this is left as a known Phase 0 limitation
+    // rather than "fixed" here.
 }

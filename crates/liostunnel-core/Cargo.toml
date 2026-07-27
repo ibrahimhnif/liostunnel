@@ -19,6 +19,7 @@ smoltcp = { workspace = true }
 tokio-util.workspace = true
 polling.workspace = true
 ipnet.workspace = true
+libc.workspace = true
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
