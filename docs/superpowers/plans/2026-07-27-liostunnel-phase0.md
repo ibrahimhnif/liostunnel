@@ -745,6 +745,10 @@ pub struct ServerProfile {
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolKind {
     Ssh,
+    // `rename_all = "snake_case"` would render this `"wire_guard"` — serde
+    // inserts an underscore at every internal capital. The wire format the
+    // PRD specifies is `"wireguard"`, so this one variant overrides it.
+    #[serde(rename = "wireguard")]
     WireGuard,
     Shadowsocks,
 }
