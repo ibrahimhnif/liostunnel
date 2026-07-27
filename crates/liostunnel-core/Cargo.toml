@@ -18,6 +18,7 @@ tun-rs = { workspace = true }
 smoltcp = { workspace = true }
 tokio-util.workspace = true
 polling.workspace = true
+ipnet.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "time"] }

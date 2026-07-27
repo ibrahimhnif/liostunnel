@@ -5,6 +5,7 @@ pub mod engine;
 pub mod error;
 pub mod net;
 pub mod protocols;
+pub mod route;
 pub mod stats;
 
 pub use error::TunnelError;
