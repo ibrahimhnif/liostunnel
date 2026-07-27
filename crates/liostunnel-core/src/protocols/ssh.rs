@@ -94,24 +94,59 @@ impl client::Handler for ClientHandler {
                 // algorithm we haven't recorded yet would land here too, and
                 // is exactly as dangerous as a same-algorithm mismatch). We
                 // must tell those apart ourselves before trusting anything.
-                let known_hosts_exists = known_hosts.try_exists().map_err(|e| {
-                    TunnelError::HostKey(format!(
-                        "cannot check whether {} exists: {e}",
-                        known_hosts.display()
-                    ))
-                })?;
                 let existing =
                     known_host_keys_path(&self.host, self.port, known_hosts).map_err(|e| {
                         TunnelError::HostKey(format!("cannot read {}: {e}", known_hosts.display()))
                     })?;
 
+                // `known_host_keys_path` swallows *every* `File::open` error
+                // (not just "missing") into `Ok(vec![])`
+                // (russh-0.62.4 src/keys/known_hosts.rs:70-74), so an empty
+                // `existing` is ambiguous: it means "no entry for this host"
+                // whether the file doesn't exist yet, exists and is readable
+                // but has nothing for this host, or exists and can't be read
+                // at all (EACCES, EIO, a dangling symlink...). Only the last
+                // of those is unsafe to treat as first contact — and telling
+                // it apart from the first two means actually attempting to
+                // open the file ourselves, not just checking whether the
+                // path exists: a multi-profile app routinely has a
+                // `known_hosts` that already exists (with entries for other
+                // hosts) by the time it TOFUs a brand-new host, and that must
+                // keep working.
+                let unreadable_known_hosts = match std::fs::File::open(known_hosts) {
+                    // Opened fine (and immediately dropped — we're only
+                    // probing readability, not parsing): an empty `existing`
+                    // is trustworthy.
+                    Ok(_) => None,
+                    // Doesn't exist yet: also trustworthy — genuine first
+                    // contact, nothing to fail to read.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    // Exists but couldn't be opened for some other reason:
+                    // we cannot verify it has no entry for this host.
+                    Err(e) => Some(e),
+                };
+
                 match check_known_hosts_path(&self.host, self.port, key, known_hosts) {
                     // Known and matching.
                     Ok(true) => Ok(true),
-                    // No recorded entry whatsoever for this host, and the
-                    // file itself doesn't even exist yet: genuine first
-                    // contact. Trust on first use, then record it.
-                    Ok(false) if !known_hosts_exists && existing.is_empty() => {
+                    // Entries exist for this host, but none uses the
+                    // presented key's algorithm. Never auto-accept, never
+                    // learn — this is the "attacker offers an algorithm we
+                    // haven't recorded yet" case, not a first contact.
+                    Ok(false) if !existing.is_empty() => Err(TunnelError::HostKey(format!(
+                        "host key for {}:{} uses an algorithm not recorded in {} \
+                         ({} entries already recorded for this host); refusing to \
+                         trust it automatically",
+                        self.host,
+                        self.port,
+                        known_hosts.display(),
+                        existing.len()
+                    ))),
+                    // No recorded entry for this host, and we can trust that:
+                    // genuine first contact. Trust on first use, then record
+                    // it — this leaves any other hosts already recorded in
+                    // the same file untouched.
+                    Ok(false) if unreadable_known_hosts.is_none() => {
                         tracing::warn!(
                             host = %self.host, port = self.port,
                             fingerprint = %key.fingerprint(Default::default()),
@@ -122,34 +157,17 @@ impl client::Handler for ClientHandler {
                         )?;
                         Ok(true)
                     }
-                    // The file exists, but we found no usable entry for this
-                    // host in it. `known_host_keys_path` swallows *every*
-                    // `File::open` failure (not just "missing") into
-                    // `Ok(vec![])` (russh-0.62.4 src/keys/known_hosts.rs:70-74),
-                    // so an existing-but-unreadable file (e.g. mode 0222)
-                    // would otherwise look identical to "no entry for this
-                    // host." We cannot tell those apart from here, so a file
-                    // that exists and comes back empty fails closed instead
-                    // of risking being treated as first contact.
-                    Ok(false) if existing.is_empty() => Err(TunnelError::HostKey(format!(
-                        "{} exists but no host key for {}:{} could be read from it; \
-                         refusing to treat this as first contact",
-                        known_hosts.display(),
-                        self.host,
-                        self.port
-                    ))),
-                    // Entries exist for this host, but none uses the
-                    // presented key's algorithm. Never auto-accept, never
-                    // learn — this is the "attacker offers an algorithm we
-                    // haven't recorded yet" case, not a first contact.
+                    // The file exists but couldn't be opened for reading, so
+                    // an empty entry list here cannot be trusted as "no entry
+                    // for this host." Fail closed rather than risk treating
+                    // an unreadable file as first contact.
                     Ok(false) => Err(TunnelError::HostKey(format!(
-                        "host key for {}:{} uses an algorithm not recorded in {} \
-                         ({} entries already recorded for this host); refusing to \
-                         trust it automatically",
+                        "cannot verify {} has no entry for {}:{}: {}; refusing to \
+                         treat this as first contact",
+                        known_hosts.display(),
                         self.host,
                         self.port,
-                        known_hosts.display(),
-                        existing.len()
+                        unreadable_known_hosts.expect("guarded by is_none() above"),
                     ))),
                     // Known, but a same-algorithm key differs — the classic
                     // MITM case. Never auto-accept.
@@ -487,24 +505,70 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Minor-2 regression: `known_host_keys_path` swallows *every*
-    /// `File::open` failure into `Ok(vec![])`, not just "file missing," so an
-    /// existing file that happens to have no entry for this host must not be
-    /// silently treated as first contact.
+    /// The multi-profile regression test: this app's whole premise is saved
+    /// profiles for multiple servers, so a `known_hosts` that already has a
+    /// real, readable entry for host A must not block TOFU for a brand-new
+    /// host B — that would make trust-on-first-use work for exactly one host
+    /// ever. Asserting A's entry survives byte-identically is what
+    /// distinguishes "learned B correctly" from "rewrote the file."
     #[tokio::test]
-    async fn an_existing_known_hosts_file_with_no_entry_for_the_host_is_never_first_contact() {
-        let dir = scratch("existing-no-entry");
+    async fn a_known_hosts_file_with_an_entry_for_another_host_still_tofus_a_new_host() {
+        let dir = scratch("multi-host");
         let known = dir.join("known_hosts");
-        std::fs::write(&known, b"# entries for other hosts would go here\n").unwrap();
+        let host_a_key = key(ED25519_KEY_A);
+        learn_known_hosts_path("host-a.test", 22, &host_a_key, &known).unwrap();
+        let before = std::fs::read_to_string(&known).unwrap();
+
+        let host_b_key = key(ED25519_KEY_B);
+        let mut h = handler("host-b.test", 2222, known.clone());
+        let accepted = h.check_server_key(&host_b_key).await.unwrap();
+        assert!(
+            accepted,
+            "a new host in an established file must still TOFU"
+        );
+
+        let after = std::fs::read_to_string(&known).unwrap();
+        assert!(
+            after.starts_with(&before),
+            "host A's entry must survive byte-identically, not just be present: \
+             before={before:?} after={after:?}"
+        );
+        assert!(
+            after.contains("2222"),
+            "host B's entry must have been appended: {after}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Minor-2 regression: `known_host_keys_path` swallows *every*
+    /// `File::open` failure into `Ok(vec![])`, not just "file missing," so a
+    /// `known_hosts` that exists but genuinely cannot be opened for reading
+    /// must not be treated as first contact.
+    ///
+    /// Made unopenable with a self-referential symlink (`ELOOP`) rather than
+    /// a permission bit (e.g. chmod 000): root — and some sandboxes — simply
+    /// ignore permission bits, which would make this test's outcome depend on
+    /// which user runs it. A filesystem-loop error is a structural condition,
+    /// not a permission check, so it fails to open the same way regardless of
+    /// privilege level.
+    #[tokio::test]
+    async fn an_unreadable_known_hosts_file_is_never_treated_as_first_contact() {
+        let dir = scratch("unreadable");
+        let known = dir.join("known_hosts");
+        std::os::unix::fs::symlink("known_hosts", &known).unwrap();
 
         let mut h = handler("example.test", 2222, known.clone());
         let err = h.check_server_key(&key(ED25519_KEY_A)).await.unwrap_err();
         assert!(matches!(err, TunnelError::HostKey(_)), "got {err:?}");
-
-        let after = std::fs::read_to_string(&known).unwrap();
-        assert_eq!(
-            after, "# entries for other hosts would go here\n",
-            "nothing must be learned when the file already existed but couldn't prove absence"
+        // `learn_known_hosts_path` also opens with `.read(true)`, so it would
+        // incidentally fail on this same broken symlink even without the
+        // readability check — asserting on the message (not just the error
+        // variant) proves the *check* rejected it, not a downstream write
+        // failure it happened to share a root cause with.
+        assert!(
+            err.to_string()
+                .contains("refusing to treat this as first contact"),
+            "expected the readability check's own message, got: {err}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
