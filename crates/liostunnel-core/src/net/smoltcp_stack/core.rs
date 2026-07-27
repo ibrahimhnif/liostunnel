@@ -34,14 +34,21 @@ const CHUNK: usize = 8 * 1024;
 /// already enormously generous.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long a flow that has stopped being `Established` may make no progress
-/// before it is aborted.
+/// How long a flow whose *local* side has finished may wait on its peer.
 ///
-/// smoltcp has no FIN_WAIT_2 timer, so `CloseWait`, `FinWait1`, `FinWait2`,
-/// `Closing` and `LastAck` can all stall indefinitely. Measured from the later
-/// of "stopped being established" and "last moved a byte", so a long response
-/// that follows an application's half-close is never cut short. Matches Linux's
-/// `tcp_fin_timeout` default.
+/// smoltcp has no FIN_WAIT_2 timer, so `FinWait1`, `FinWait2`, `Closing` and
+/// `LastAck` would otherwise stall indefinitely. Matches Linux's
+/// `tcp_fin_timeout`, which governs exactly those states.
+///
+/// Deliberately **not** applied to `CloseWait`. There the local application owns
+/// the close, and here that application is our own tunnel task — still alive,
+/// still holding the channel, quite possibly still waiting on a slow origin.
+/// Linux places no timer on CLOSE_WAIT for the same reason. What bounds a
+/// `CloseWait` flow is the tunnel side actually going away, which
+/// `pump_outbound` detects unconditionally, not a clock.
+///
+/// Measured from the later of "entered the state" and "last moved a byte", so a
+/// peer that is still draining data is never cut off mid-transfer.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The most listeners that may be injected but not yet promoted at once.
@@ -104,21 +111,39 @@ struct Flow {
     pending_out: Option<(Vec<u8>, usize)>,
     /// When this flow last moved a byte in either direction.
     last_activity: Instant,
-    /// When the socket was first seen outside `Established`. `None` while
-    /// healthy, so an established flow has no deadline at all.
+    /// When the flow was first *observed* to be waiting on its peer with
+    /// nothing more the local side can do. `None` while it is healthy or while
+    /// the close is still ours to make.
+    ///
+    /// Stamped by `observe_flow_states`, which runs after `Interface::poll` —
+    /// the poll is where a socket's state actually changes, so stamping any
+    /// earlier records the state the socket was in *before* this step's work and
+    /// leaves the deadline invisible to the `poll_delay` computed at the end of
+    /// it.
     winding_down_since: Option<Instant>,
 }
 
 impl Flow {
     /// The instant this flow must be given up on, if it is winding down.
     ///
-    /// Taken from the *later* of "left `Established`" and "last moved a byte":
-    /// an application that half-closes and then reads a large response keeps
-    /// refreshing the second, so a legitimate transfer is never cut short.
+    /// Taken from the *later* of "entered the state" and "last moved a byte":
+    /// a peer that is still draining data keeps refreshing the second, so a
+    /// legitimate transfer is never cut short.
     fn shutdown_deadline(&self) -> Option<Instant> {
         let since = self.winding_down_since?;
         Some(since.max(self.last_activity) + SHUTDOWN_TIMEOUT)
     }
+}
+
+/// States in which the *local* side has finished and only the peer can make
+/// progress. A FIN_WAIT_2-style deadline belongs here and nowhere else.
+///
+/// `CloseWait` is deliberately absent: there the close is still ours to make.
+fn awaits_peer(state: tcp::State) -> bool {
+    matches!(
+        state,
+        tcp::State::FinWait1 | tcp::State::FinWait2 | tcp::State::Closing | tcp::State::LastAck
+    )
 }
 
 fn to_socket_addr(ep: IpEndpoint) -> Option<SocketAddr> {
@@ -265,13 +290,21 @@ impl StackCore {
     /// drain only exist once `poll` has processed the receive queue.
     pub fn step(&mut self, now: Instant) {
         self.last_step = now;
-        // Aborts land before the poll so the same poll emits their RST.
-        self.sweep_stale_flows(now);
+        // Acts on deadlines stamped by the previous step's observation pass, and
+        // runs before the poll so the RST it queues is actually emitted.
+        self.abort_expired_flows(now);
         self.pump_outbound(now);
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.sweep_stale_listeners(now);
         self.promote_accepted(now);
         self.pump_inbound(now);
+        // Stamping runs *after* every mutator in this step — the poll above and
+        // both pumps can all change a socket's state — so a deadline created
+        // during this step is live for the `poll_delay` computed at the end of
+        // it. Observing state any earlier records what the socket looked like
+        // before the step did its work, and a loop sleeping on `poll_delay`
+        // parks with the flow still open.
+        self.observe_flow_states(now);
         self.reap_closed();
     }
 
@@ -305,21 +338,42 @@ impl StackCore {
         }
     }
 
-    /// Aborts flows that stopped being `Established` and then stopped making
-    /// progress. Nothing in smoltcp bounds `CloseWait` or `FinWait2`.
-    fn sweep_stale_flows(&mut self, now: Instant) {
-        let mut stale = Vec::new();
+    /// Records, for each flow, whether it is now waiting on its peer with
+    /// nothing more the local side can do — and therefore whether a shutdown
+    /// deadline applies.
+    ///
+    /// Must run after every mutator in `step`; see the comment there. Splitting
+    /// this from `abort_expired_flows` is the whole point: observation has to
+    /// happen where the state changes, action has to happen where the resulting
+    /// packet can still be emitted, and those are different places.
+    fn observe_flow_states(&mut self, now: Instant) {
         for (handle, flow) in self.flows.iter_mut() {
-            if self.sockets.get::<tcp::Socket>(*handle).state() == tcp::State::Established {
-                // Healthy: no deadline of any kind.
+            let state = self.sockets.get::<tcp::Socket>(*handle).state();
+
+            // The tunnel side is gone, yet the socket is somehow still
+            // established — `pump_outbound` could not close it because it is
+            // still holding bytes it has not managed to hand over. Nothing else
+            // would ever reclaim this flow, so start the clock.
+            let orphaned = flow.from_stream.is_closed() && state == tcp::State::Established;
+
+            if awaits_peer(state) || orphaned {
+                flow.winding_down_since.get_or_insert(now);
+            } else {
+                // `Established` (healthy) or `CloseWait` (the close is still
+                // ours to make, and our own task is alive to make it).
                 flow.winding_down_since = None;
-                continue;
-            }
-            flow.winding_down_since.get_or_insert(now);
-            if flow.shutdown_deadline().is_some_and(|at| now >= at) {
-                stale.push(*handle);
             }
         }
+    }
+
+    /// Aborts flows that have sat past their shutdown deadline.
+    fn abort_expired_flows(&mut self, now: Instant) {
+        let stale: Vec<SocketHandle> = self
+            .flows
+            .iter()
+            .filter(|(_, f)| f.shutdown_deadline().is_some_and(|at| now >= at))
+            .map(|(h, _)| *h)
+            .collect();
 
         for handle in stale {
             // `abort` moves the socket to `Closed` with an RST queued. The poll
@@ -327,7 +381,7 @@ impl StackCore {
             // the application's own stack learns to let go too.
             self.sockets.get_mut::<tcp::Socket>(handle).abort();
             if let Some(f) = self.flows.get(&handle) {
-                tracing::debug!(src = %f.src, dst = %f.dst, "half-closed flow exceeded its shutdown deadline");
+                tracing::debug!(src = %f.src, dst = %f.dst, "flow exceeded its shutdown deadline");
             }
         }
     }
@@ -359,9 +413,15 @@ impl StackCore {
             // is a plain idle timer — its own `test_established_timeout` shows an
             // established socket with an *empty* transmit buffer scheduling a
             // `poll_at` for it — so leaving it armed would reset any connection
-            // whose application simply had nothing to say for a while. From here
-            // on smoltcp's retransmit logic governs, and `sweep_stale_flows`
-            // bounds the states smoltcp itself does not.
+            // whose application simply had nothing to say for a while.
+            //
+            // Nothing replaces it on `Established`, and that is deliberate — but
+            // note it is *not* backstopped by smoltcp either: its retransmit
+            // timer never gives up, having no retry cap, with the RTO merely
+            // clamping at 60 s and repeating for ever. What reclaims a genuinely
+            // dead flow is `pump_outbound` noticing the tunnel side has gone,
+            // which then puts the socket into a state `abort_expired_flows`
+            // does bound.
             socket.set_timeout(None);
 
             // Prefer the addresses smoltcp actually negotiated.
@@ -440,6 +500,27 @@ impl StackCore {
                         socket.close();
                         break;
                     }
+                }
+            }
+
+            // (c) unconditional disconnection check. Both loops above are gated
+            // on `can_send`, and `pump_inbound`'s equivalent is gated on
+            // `can_recv`. With the transmit buffer full and nothing arriving —
+            // a peer that has stopped acknowledging, say — neither body ever
+            // runs, so the tunnel side going away would go unnoticed for ever.
+            // With no idle timeout on `Established`, that flow would be
+            // immortal: buffers, a channel pair, and perpetual retransmits.
+            //
+            // `is_closed` reports that every sender is gone without consuming
+            // anything, so it is safe to look before deciding to drain.
+            if flow.from_stream.is_closed() && flow.pending_out.is_none() {
+                match flow.from_stream.try_recv() {
+                    // Still buffered bytes worth trying to hand over. Park one
+                    // chunk where branch (a) will retry it.
+                    Ok(chunk) => flow.pending_out = Some((chunk, 0)),
+                    // Closed and drained: everything the tunnel had to say has
+                    // been said.
+                    Err(_) => socket.close(),
                 }
             }
         }
@@ -872,6 +953,191 @@ mod tests {
             Some(HANDSHAKE_TIMEOUT),
             "a pending sweep must bound the sleep"
         );
+    }
+
+    #[tokio::test]
+    async fn a_flow_that_starts_closing_bounds_the_very_next_sleep() {
+        // The stamping-lag regression. `pump_outbound` notices the tunnel side
+        // has gone and closes the socket part-way through this `step`, so the
+        // deadline that close creates has to be live by the time `poll_delay` is
+        // computed at the end of the *same* step. Stamping state before the
+        // close instead leaves a `poll_delay`-driven loop with nothing to sleep
+        // on, and it parks for ever with the flow still open.
+        let mut core = StackCore::new(StackConfig::default());
+        let mut clock = Clock(0);
+        let (flow, _, _) = handshake(&mut core, &mut clock, APP, WEB, 1000);
+        drop(flow);
+
+        let now = clock.tick();
+        core.step(now);
+
+        // Asserted on our own deadline rather than only on `poll_delay`:
+        // smoltcp still has a FIN-retransmit timer running here, which would
+        // mask a missing sweep deadline and let this pass for the wrong reason.
+        assert!(
+            core.next_sweep_deadline().is_some(),
+            "the shutdown deadline must be live by the end of the step that created it"
+        );
+        let delay = core.poll_delay(now);
+        assert!(delay.is_some());
+        assert!(delay.unwrap() <= SHUTDOWN_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_slow_response_after_a_half_close_is_not_reset() {
+        // `CloseWait` means the *local* side owns the close, and here the local
+        // side is our own tunnel task, still alive and still holding the
+        // channel. Linux puts no timer on CLOSE_WAIT for exactly that reason.
+        // An origin that takes 90 s for the first byte is slow, not broken.
+        let mut core = StackCore::new(StackConfig::default());
+        let mut clock = Clock(0);
+        let (mut flow, cseq, sseq) = handshake(&mut core, &mut clock, APP, WEB, 1000);
+
+        core.ingest(&build_tcp(
+            APP,
+            WEB,
+            TcpFlags::fin_ack(),
+            cseq,
+            sseq,
+            b"GET / HTTP/1.0\r\n",
+        ));
+        core.step(clock.tick());
+        core.drain_tx();
+
+        for at in [30, 59, 61, 90] {
+            core.step(secs(at));
+            assert_eq!(
+                core.active_flows(),
+                1,
+                "a half-closed flow awaiting a slow response must survive {at}s"
+            );
+        }
+        assert_eq!(rsts(&mut core), 0, "a slow response must not be reset");
+
+        // And the response still gets delivered.
+        flow.stream.write_all(b"HTTP/1.0 200 OK\r\n").await.unwrap();
+        tokio::task::yield_now().await;
+        core.step(secs(91));
+
+        let (_, _, _, _, _, payload) =
+            last_tcp(&mut core).expect("the late response must still be delivered");
+        assert_eq!(payload, b"HTTP/1.0 200 OK\r\n".to_vec());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_stream_is_noticed_even_when_the_socket_cannot_send() {
+        // `pump_outbound`'s `try_recv` sits inside `while ... && can_send()`, and
+        // `pump_inbound`'s `try_reserve` inside `while can_recv()`. With the
+        // transmit buffer full and nothing arriving, neither body ever runs, so
+        // without an unconditional check the stack would not even *begin* to
+        // close — it would sit in `Established` until something else gave up.
+        let cfg = StackConfig {
+            tcp_buffer_bytes: 4096,
+            ..StackConfig::default()
+        };
+        let mut core = StackCore::new(cfg);
+        let mut clock = Clock(0);
+        let (mut flow, _, _) = handshake(&mut core, &mut clock, APP, WEB, 1000);
+
+        // Exactly fills the transmit buffer and leaves the channel empty.
+        // Nothing is ever acknowledged, so `can_send()` stays false from here.
+        flow.stream.write_all(&[0u8; 4096]).await.unwrap();
+        tokio::task::yield_now().await;
+        core.step(clock.tick());
+        core.drain_tx();
+
+        let handle = *core.flows.keys().next().expect("the flow must still exist");
+        assert!(
+            !core.sockets.get::<tcp::Socket>(handle).can_send(),
+            "precondition: the transmit buffer must be full"
+        );
+
+        drop(flow);
+        core.step(clock.tick());
+
+        assert_ne!(
+            core.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::Established,
+            "the stack must start closing as soon as the tunnel side is gone, \
+             not wait out a deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dropped_stream_with_a_full_transmit_buffer_is_still_reclaimed() {
+        // Both places that would notice the tunnel side vanishing sit inside
+        // loops gated on `can_send`/`can_recv`. With the transmit buffer full
+        // and nothing arriving, neither body ever runs — and with no idle
+        // timeout on `Established`, nothing else would ever reclaim the flow.
+        let cfg = StackConfig {
+            tcp_buffer_bytes: 4096,
+            ..StackConfig::default()
+        };
+        let mut core = StackCore::new(cfg);
+        let mut clock = Clock(0);
+        let (mut flow, _, _) = handshake(&mut core, &mut clock, APP, WEB, 1000);
+
+        // Nothing is ever acknowledged, so the transmit buffer fills and stays
+        // full: `can_send()` is false from here on.
+        for _ in 0..8 {
+            let _ = flow.stream.write_all(&[0u8; 2048]).await;
+            tokio::task::yield_now().await;
+            core.step(clock.tick());
+            core.drain_tx();
+        }
+        drop(flow);
+
+        // Drive the real loop shape, not direct `step` calls: proving the sweep
+        // works is not the same as proving the loop ever reaches it.
+        let start = clock.tick();
+        let mut now = start;
+        let mut steps = 0;
+        loop {
+            core.step(now);
+            core.drain_tx();
+            steps += 1;
+            assert!(steps < 200, "the flow was never reclaimed");
+            if core.active_flows() == 0 {
+                break;
+            }
+            // While the flow is still alive the loop must always have something
+            // bounded to sleep on, or it parks and never reaches the reclaim.
+            let delay = core
+                .poll_delay(now)
+                .expect("a flow with no tunnel side left must bound the sleep");
+            now += delay;
+        }
+        assert!(
+            now <= start + SHUTDOWN_TIMEOUT + SHUTDOWN_TIMEOUT,
+            "reclamation must be bounded, took {}s",
+            (now - start).secs()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_poll_delay_driven_loop_converges_with_a_closing_flow() {
+        // The sibling of the listener convergence test below, covering the half
+        // of `next_sweep_deadline` that actually had the stamping bug.
+        let mut core = StackCore::new(StackConfig::default());
+        let mut clock = Clock(0);
+        let (flow, _, _) = handshake(&mut core, &mut clock, APP, WEB, 1000);
+        // The stack sends its FIN; the application never acknowledges it.
+        drop(flow);
+
+        let mut now = clock.tick();
+        let mut steps = 0;
+        loop {
+            core.step(now);
+            core.drain_tx();
+            steps += 1;
+            assert!(steps < 1000, "the loop is spinning rather than converging");
+            match core.poll_delay(now) {
+                Some(delay) => now += delay,
+                None => break,
+            }
+        }
+
+        assert_eq!(core.active_flows(), 0, "the flow must have been reclaimed");
     }
 
     #[test]
