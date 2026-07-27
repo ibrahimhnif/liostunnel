@@ -308,26 +308,35 @@ mod tests {
 
     use crate::config::secret::{FileSecretStore, SecretStore};
 
-    fn valid_profile() -> ServerProfile {
-        ServerProfile {
-            id: uuid::Uuid::nil(),
-            name: "lab".into(),
-            protocol: ProtocolKind::Ssh,
-            host: "198.51.100.7".into(),
-            port: 22,
-            auth: AuthMethod::Password {
-                password: SecretRef::File {
-                    path: secret_file("valid", "pw"),
+    /// Builds a profile backed by a fresh 0600 secret file under a directory
+    /// unique to `tag`, and hands the directory back so the caller can remove
+    /// it — same local-dir-then-`remove_dir_all` convention the temp-file
+    /// tests in `secret.rs` already use. Callers must pass a tag unique to
+    /// their test (the test's own name is simplest) so parallel test threads
+    /// never share a path.
+    fn valid_profile(tag: &str) -> (ServerProfile, std::path::PathBuf) {
+        let path = secret_file(tag, "pw");
+        let dir = path.parent().unwrap().to_path_buf();
+        (
+            ServerProfile {
+                id: uuid::Uuid::nil(),
+                name: "lab".into(),
+                protocol: ProtocolKind::Ssh,
+                host: "198.51.100.7".into(),
+                port: 22,
+                auth: AuthMethod::Password {
+                    password: SecretRef::File { path },
                 },
+                dns: DnsConfig {
+                    mode: DnsMode::Tcp,
+                    servers: vec![ip(1, 1, 1, 1)],
+                    https: None,
+                },
+                split_tunnel: SplitTunnelRule::AllTraffic,
+                kill_switch: false,
             },
-            dns: DnsConfig {
-                mode: DnsMode::Tcp,
-                servers: vec![ip(1, 1, 1, 1)],
-                https: None,
-            },
-            split_tunnel: SplitTunnelRule::AllTraffic,
-            kill_switch: false,
-        }
+            dir,
+        )
     }
 
     /// A real 0600 file rather than an env var. `std::env::set_var` is `unsafe`
@@ -358,45 +367,52 @@ mod tests {
 
     #[test]
     fn a_valid_profile_passes() {
-        valid_profile().validate(&store()).unwrap();
+        let (p, dir) = valid_profile("a_valid_profile_passes");
+        p.validate(&store()).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn empty_host_is_rejected() {
-        let mut p = valid_profile();
+        let (mut p, dir) = valid_profile("empty_host_is_rejected");
         p.host = String::new();
         let e = p.validate(&store()).unwrap_err().to_string();
         assert!(e.contains("host"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn port_zero_is_rejected() {
-        let mut p = valid_profile();
+        let (mut p, dir) = valid_profile("port_zero_is_rejected");
         p.port = 0;
         let e = p.validate(&store()).unwrap_err().to_string();
         assert!(e.contains("port"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn empty_dns_servers_are_rejected() {
-        let mut p = valid_profile();
+        let (mut p, dir) = valid_profile("empty_dns_servers_are_rejected");
         p.dns.servers.clear();
         let e = p.validate(&store()).unwrap_err().to_string();
         assert!(e.contains("dns.servers"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn https_mode_without_a_doh_block_is_rejected() {
-        let mut p = valid_profile();
+        let (mut p, dir) = valid_profile("https_mode_without_a_doh_block_is_rejected");
         p.dns.mode = DnsMode::Https;
         p.dns.https = None;
         let e = p.validate(&store()).unwrap_err().to_string();
         assert!(e.contains("dns.https"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn an_unresolvable_secret_is_rejected_at_validation_not_at_connect() {
-        let mut p = valid_profile();
+        let (mut p, dir) =
+            valid_profile("an_unresolvable_secret_is_rejected_at_validation_not_at_connect");
         p.auth = AuthMethod::Password {
             password: SecretRef::File {
                 path: "/nonexistent/lios/secret".into(),
@@ -404,11 +420,12 @@ mod tests {
         };
         let e = p.validate(&store()).unwrap_err().to_string();
         assert!(e.contains("/nonexistent/lios/secret"), "{e}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn kill_switch_produces_an_unenforced_warning() {
-        let mut p = valid_profile();
+        let (mut p, dir) = valid_profile("kill_switch_produces_an_unenforced_warning");
         p.kill_switch = true;
         let w = p.warnings();
         assert!(
@@ -416,19 +433,23 @@ mod tests {
                 .any(|m| m.contains("kill_switch") && m.contains("not enforced")),
             "spec §9.3 requires a loud warning, got {w:?}"
         );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn non_default_split_tunnel_produces_an_unenforced_warning() {
-        let mut p = valid_profile();
+        let (mut p, dir) = valid_profile("non_default_split_tunnel_produces_an_unenforced_warning");
         p.split_tunnel = SplitTunnelRule::ExcludeApps {
             apps: vec!["a".into()],
         };
         assert!(p.warnings().iter().any(|m| m.contains("split_tunnel")));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn a_clean_profile_warns_about_nothing() {
-        assert!(valid_profile().warnings().is_empty());
+        let (p, dir) = valid_profile("a_clean_profile_warns_about_nothing");
+        assert!(p.warnings().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
