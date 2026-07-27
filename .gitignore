@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local profiles and secrets — never commit these
+*.liostunnel.json
+/testing/local/
+known_hosts
+
+.DS_Store
