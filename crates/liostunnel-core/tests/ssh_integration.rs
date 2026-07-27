@@ -55,18 +55,45 @@ fn secret_file(tag: &str, body: &str) -> PathBuf {
     path
 }
 
-fn password_auth() -> AuthMethod {
+/// `tag` must be unique to the calling test: `secret_file` truncates and
+/// rewrites its target on every call, and these are `#[tokio::test]`s that
+/// cargo may run concurrently on separate threads within one binary. A tag
+/// shared between tests used to mean one test could truncate the password
+/// file while a sibling was mid-`resolve()`, handing it an empty password.
+fn password_auth(tag: &str) -> AuthMethod {
     AuthMethod::Password {
         password: SecretRef::File {
-            path: secret_file("pw", "tunnelpass"),
+            path: secret_file(tag, "tunnelpass"),
         },
     }
+}
+
+/// Generates a real key pair via `ssh-keygen` under `dir` and returns the
+/// parsed public key. Real keys, not a hardcoded base64 blob: a fabricated
+/// blob that merely fails to *parse* exercises a decode-error path, not the
+/// same-algorithm/different-algorithm `known_hosts` branches these mismatch
+/// tests are actually about.
+fn gen_public_key(
+    dir: &std::path::Path,
+    name: &str,
+    keygen_type_args: &[&str],
+) -> russh::keys::ssh_key::PublicKey {
+    let path = dir.join(name);
+    let status = std::process::Command::new("ssh-keygen")
+        .args(keygen_type_args)
+        .args(["-N", "", "-C", "lios-test", "-f"])
+        .arg(&path)
+        .status()
+        .expect("ssh-keygen must be on PATH to run this test");
+    assert!(status.success(), "ssh-keygen failed generating {name}");
+    russh::keys::load_public_key(path.with_extension("pub")).unwrap()
 }
 
 #[tokio::test]
 #[ignore = "requires docker fixture: make -C testing/docker up"]
 async fn connects_with_a_password_and_learns_the_host_key_on_first_use() {
-    let known = scratch("tofu").join("known_hosts");
+    let dir = scratch("tofu");
+    let known = dir.join("known_hosts");
     let mut t = SshTunnel::new(
         "tunneluser".into(),
         HostKeyPolicy::Verify {
@@ -74,7 +101,7 @@ async fn connects_with_a_password_and_learns_the_host_key_on_first_use() {
         },
     );
 
-    t.connect(&profile(password_auth()), &FileSecretStore)
+    t.connect(&profile(password_auth("tofu")), &FileSecretStore)
         .await
         .unwrap();
     assert_eq!(t.stats().state, ConnectionState::Connected);
@@ -85,44 +112,94 @@ async fn connects_with_a_password_and_learns_the_host_key_on_first_use() {
         "known_hosts should record the port: {learned}"
     );
     t.disconnect().await.unwrap();
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 #[ignore = "requires docker fixture: make -C testing/docker up"]
-async fn rejects_a_host_key_that_does_not_match_known_hosts() {
-    let known = scratch("mismatch").join("known_hosts");
-    // A syntactically valid entry for the right host carrying the wrong key.
-    std::fs::create_dir_all(known.parent().unwrap()).unwrap();
-    std::fs::write(
-        &known,
-        "[127.0.0.1]:22022 ssh-ed25519 \
-         AAAAC3NzaC1lZDI1NTE5AAAAIEbGVzc29uc2xlYXJuZWRhcmVoYXJkd29u\n",
-    )
-    .unwrap();
+async fn rejects_a_same_algorithm_host_key_that_does_not_match_known_hosts() {
+    let dir = scratch("mismatch-same-algo");
+    let known = dir.join("known_hosts");
+    // A real, valid ed25519 key — just not the fixture server's — recorded
+    // for the fixture's host:port. The server's real key is also ed25519, so
+    // this exercises `check_known_hosts_path`'s `Err(KeyChanged)` path.
+    let wrong_key = gen_public_key(&dir, "wrong-ed25519", &["-t", "ed25519"]);
+    russh::keys::known_hosts::learn_known_hosts_path("127.0.0.1", 22022, &wrong_key, &known)
+        .unwrap();
 
     let mut t = SshTunnel::new(
         "tunneluser".into(),
         HostKeyPolicy::Verify { known_hosts: known },
     );
     let err = t
-        .connect(&profile(password_auth()), &FileSecretStore)
+        .connect(
+            &profile(password_auth("mismatch-same-algo")),
+            &FileSecretStore,
+        )
         .await
         .unwrap_err();
     assert!(
         matches!(err, liostunnel_core::TunnelError::HostKey(_)),
         "expected HostKey rejection, got {err:?}"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Critical regression coverage: `check_known_hosts_path` returns `Ok(false)`
+/// both for a genuinely new host *and* for a known host presenting a key of
+/// an algorithm that was never recorded — the fixture server's real key is
+/// ed25519, so recording an RSA key here and then connecting for real
+/// reproduces exactly the scenario an on-path attacker gets if they simply
+/// offer an algorithm the client hasn't seen yet. This must fail-closed, not
+/// be treated as first contact.
+#[tokio::test]
+#[ignore = "requires docker fixture: make -C testing/docker up"]
+async fn rejects_a_different_algorithm_host_key_for_a_known_host() {
+    let dir = scratch("mismatch-diff-algo");
+    let known = dir.join("known_hosts");
+    let wrong_key = gen_public_key(&dir, "wrong-rsa", &["-t", "rsa", "-b", "2048"]);
+    russh::keys::known_hosts::learn_known_hosts_path("127.0.0.1", 22022, &wrong_key, &known)
+        .unwrap();
+    let before = std::fs::read_to_string(&known).unwrap();
+
+    let mut t = SshTunnel::new(
+        "tunneluser".into(),
+        HostKeyPolicy::Verify {
+            known_hosts: known.clone(),
+        },
+    );
+    let err = t
+        .connect(
+            &profile(password_auth("mismatch-diff-algo")),
+            &FileSecretStore,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, liostunnel_core::TunnelError::HostKey(_)),
+        "a host with a recorded rsa key must reject the server's real (different) \
+         ed25519 key rather than trusting it as a new host, got {err:?}"
+    );
+
+    let after = std::fs::read_to_string(&known).unwrap();
+    assert_eq!(
+        before, after,
+        "the server's real key must never be learned after a rejection"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 #[ignore = "requires docker fixture: make -C testing/docker up"]
 async fn accept_any_policy_bypasses_verification() {
+    let dir = scratch("acceptany");
     let mut t = SshTunnel::new("tunneluser".into(), HostKeyPolicy::AcceptAny);
-    t.connect(&profile(password_auth()), &FileSecretStore)
+    t.connect(&profile(password_auth("acceptany")), &FileSecretStore)
         .await
         .unwrap();
     assert_eq!(t.stats().state, ConnectionState::Connected);
     t.disconnect().await.unwrap();
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
@@ -143,10 +220,10 @@ async fn connects_with_a_private_key() {
 #[tokio::test]
 #[ignore = "requires docker fixture: make -C testing/docker up"]
 async fn a_wrong_password_produces_an_auth_error() {
+    let path = secret_file("badpw", "not-the-password");
+    let dir = path.parent().unwrap().to_path_buf();
     let auth = AuthMethod::Password {
-        password: SecretRef::File {
-            path: secret_file("badpw", "not-the-password"),
-        },
+        password: SecretRef::File { path },
     };
     let mut t = SshTunnel::new("tunneluser".into(), HostKeyPolicy::AcceptAny);
     let err = t
@@ -157,12 +234,14 @@ async fn a_wrong_password_produces_an_auth_error() {
         matches!(err, liostunnel_core::TunnelError::Auth(_)),
         "got {err:?}"
     );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 #[ignore = "requires docker fixture: make -C testing/docker up"]
 async fn a_wireguard_profile_is_rejected_as_unsupported() {
-    let mut p = profile(password_auth());
+    let dir = scratch("wireguard");
+    let mut p = profile(password_auth("wireguard"));
     p.protocol = ProtocolKind::WireGuard;
     let mut t = SshTunnel::new("tunneluser".into(), HostKeyPolicy::AcceptAny);
     let err = t.connect(&p, &FileSecretStore).await.unwrap_err();
@@ -170,4 +249,5 @@ async fn a_wireguard_profile_is_rejected_as_unsupported() {
         matches!(err, liostunnel_core::TunnelError::Unsupported(_)),
         "got {err:?}"
     );
+    std::fs::remove_dir_all(&dir).ok();
 }
