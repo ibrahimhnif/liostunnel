@@ -40,12 +40,18 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// `LastAck` would otherwise stall indefinitely. Matches Linux's
 /// `tcp_fin_timeout`, which governs exactly those states.
 ///
-/// Deliberately **not** applied to `CloseWait`. There the local application owns
-/// the close, and here that application is our own tunnel task — still alive,
-/// still holding the channel, quite possibly still waiting on a slow origin.
-/// Linux places no timer on CLOSE_WAIT for the same reason. What bounds a
-/// `CloseWait` flow is the tunnel side actually going away, which
-/// `pump_outbound` detects unconditionally, not a clock.
+/// Deliberately **not** applied to `CloseWait` on its own account. There the
+/// local application owns the close, and here that application is our own tunnel
+/// task — still alive, still holding the channel, quite possibly still waiting
+/// on a slow origin. Linux places no timer on CLOSE_WAIT for the same reason.
+///
+/// What bounds a `CloseWait` flow is the tunnel side going away, observed in
+/// `observe_flow_states` as `from_stream.is_closed() && socket.may_send()`.
+/// `pump_outbound`'s own disconnection check is **not** sufficient on its own,
+/// and saying otherwise here is what hid a permanent leak for a whole review
+/// cycle: that check is held back while a chunk is parked in `pending_out`, so
+/// a half-closed flow with undeliverable bytes and no tunnel side left reached
+/// none of the three mechanisms. The orphan clock above is what covers it.
 ///
 /// Measured from the later of "entered the state" and "last moved a byte", so a
 /// peer that is still draining data is never cut off mid-transfer.
@@ -138,12 +144,30 @@ impl Flow {
 /// States in which the *local* side has finished and only the peer can make
 /// progress. A FIN_WAIT_2-style deadline belongs here and nowhere else.
 ///
-/// `CloseWait` is deliberately absent: there the close is still ours to make.
+/// Written as an exhaustive `match` rather than a `matches!` so that a new
+/// smoltcp state forces a decision here instead of silently defaulting to "no
+/// deadline" — a hand-maintained list of states quietly developing a hole is
+/// precisely how the `CloseWait` leak happened.
 fn awaits_peer(state: tcp::State) -> bool {
-    matches!(
-        state,
-        tcp::State::FinWait1 | tcp::State::FinWait2 | tcp::State::Closing | tcp::State::LastAck
-    )
+    match state {
+        // Our FIN is sent; only the peer can move things along.
+        tcp::State::FinWait1 | tcp::State::FinWait2 | tcp::State::Closing | tcp::State::LastAck => {
+            true
+        }
+        // The close is still ours to make. Bounded by the tunnel side going
+        // away (the orphan clock in `observe_flow_states`), never by a timer.
+        tcp::State::CloseWait => false,
+        // Healthy.
+        tcp::State::Established => false,
+        // smoltcp runs its own 2MSL timer here and reaches `Closed` unaided.
+        tcp::State::TimeWait => false,
+        // `reap_closed` takes this one.
+        tcp::State::Closed => false,
+        // Not states a promoted flow is ever in: a socket only becomes a `Flow`
+        // once it has left `Listen`/`SynReceived`, and this stack never dials
+        // out, so `SynSent` is unreachable.
+        tcp::State::Listen | tcp::State::SynSent | tcp::State::SynReceived => false,
+    }
 }
 
 fn to_socket_addr(ep: IpEndpoint) -> Option<SocketAddr> {
@@ -348,19 +372,27 @@ impl StackCore {
     /// packet can still be emitted, and those are different places.
     fn observe_flow_states(&mut self, now: Instant) {
         for (handle, flow) in self.flows.iter_mut() {
-            let state = self.sockets.get::<tcp::Socket>(*handle).state();
+            let socket = self.sockets.get::<tcp::Socket>(*handle);
+            let state = socket.state();
 
-            // The tunnel side is gone, yet the socket is somehow still
-            // established — `pump_outbound` could not close it because it is
-            // still holding bytes it has not managed to hand over. Nothing else
-            // would ever reclaim this flow, so start the clock.
-            let orphaned = flow.from_stream.is_closed() && state == tcp::State::Established;
+            // The tunnel side is gone, yet the socket can still transmit — so
+            // nothing is ever going to arrive that would close it, and
+            // `pump_outbound`'s own check is deliberately held back while it is
+            // still holding bytes worth delivering. Start the clock.
+            //
+            // Gated on `may_send()` rather than a hand-written state list.
+            // `may_send()` is exactly `Established | CloseWait` (smoltcp
+            // src/socket/tcp.rs:1162), which is precisely the complement of
+            // `awaits_peer` among the states a live flow can occupy. Deriving it
+            // from smoltcp keeps the two writers of `winding_down_since`
+            // provably exhaustive instead of restating a list that can drift —
+            // and drift is what left `CloseWait` with no deadline at all.
+            let orphaned = flow.from_stream.is_closed() && socket.may_send();
 
             if awaits_peer(state) || orphaned {
                 flow.winding_down_since.get_or_insert(now);
             } else {
-                // `Established` (healthy) or `CloseWait` (the close is still
-                // ours to make, and our own task is alive to make it).
+                // Healthy, or a state smoltcp resolves on its own.
                 flow.winding_down_since = None;
             }
         }
@@ -610,6 +642,9 @@ impl StackCore {
             while let Ok(chunk) = f.from_stream.try_recv() {
                 lost += chunk.len();
             }
+            // Plus whatever smoltcp accepted but never got acknowledged; on an
+            // abort that goes out as an RST rather than as data.
+            lost += self.sockets.get::<tcp::Socket>(handle).send_queue();
             if lost > 0 {
                 self.bytes_discarded += lost as u64;
                 tracing::debug!(src = %f.src, dst = %f.dst, lost, "retiring flow with unsent bytes");
@@ -955,22 +990,54 @@ mod tests {
         );
     }
 
+    /// Every flow's stamp must agree with the socket state as it stands at the
+    /// *end* of a step. `observe_flow_states` runs after every mutator precisely
+    /// so this holds; observing any earlier records a state the step has since
+    /// moved on from, and the stamp goes stale in one direction or the other.
+    fn assert_stamps_match_state(core: &StackCore) {
+        for (handle, flow) in core.flows.iter() {
+            let socket = core.sockets.get::<tcp::Socket>(*handle);
+            let needs =
+                awaits_peer(socket.state()) || (flow.from_stream.is_closed() && socket.may_send());
+            assert_eq!(
+                needs,
+                flow.winding_down_since.is_some(),
+                "stamp disagrees with the final state {:?} of {:?}",
+                socket.state(),
+                handle
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_flow_that_starts_closing_bounds_the_very_next_sleep() {
-        // The stamping-lag regression. `pump_outbound` notices the tunnel side
-        // has gone and closes the socket part-way through this `step`, so the
-        // deadline that close creates has to be live by the time `poll_delay` is
-        // computed at the end of the *same* step. Stamping state before the
-        // close instead leaves a `poll_delay`-driven loop with nothing to sleep
-        // on, and it parks for ever with the flow still open.
+        // The socket goes `CloseWait` -> `LastAck` part-way through the last
+        // step here, when `pump_outbound` notices the tunnel side has gone, and
+        // the deadline that creates must be live by the time `poll_delay` is
+        // computed at the end of that same step.
+        //
+        // NOTE: this asserts the *outcome*, not the ordering. Measured by A/B,
+        // it still passes with observation moved back before the poll, because
+        // the orphan clock (`is_closed() && may_send()`) covers `CloseWait` too
+        // and so stamps at either position. The test that actually discriminates
+        // the ordering is `a_stamp_is_never_left_stale_by_a_transition_inside_the_poll`.
         let mut core = StackCore::new(StackConfig::default());
         let mut clock = Clock(0);
-        let (flow, _, _) = handshake(&mut core, &mut clock, APP, WEB, 1000);
+        let (flow, cseq, sseq) = handshake(&mut core, &mut clock, APP, WEB, 1000);
+
+        core.ingest(&build_tcp(APP, WEB, TcpFlags::fin_ack(), cseq, sseq, &[]));
+        core.step(clock.tick());
         drop(flow);
 
         let now = clock.tick();
         core.step(now);
 
+        let handle = *core.flows.keys().next().expect("the flow must still exist");
+        assert_eq!(
+            core.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::LastAck,
+            "precondition: the close must have happened during that step"
+        );
         // Asserted on our own deadline rather than only on `poll_delay`:
         // smoltcp still has a FIN-retransmit timer running here, which would
         // mask a missing sweep deadline and let this pass for the wrong reason.
@@ -978,9 +1045,56 @@ mod tests {
             core.next_sweep_deadline().is_some(),
             "the shutdown deadline must be live by the end of the step that created it"
         );
+        assert_stamps_match_state(&core);
+
         let delay = core.poll_delay(now);
         assert!(delay.is_some());
         assert!(delay.unwrap() <= SHUTDOWN_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_stamp_is_never_left_stale_by_a_transition_inside_the_poll() {
+        // This is the ordering regression test. `FinWait2` -> `TimeWait` happens
+        // entirely inside `iface.poll`, and it flips a flow from "needs a
+        // deadline" to "smoltcp resolves this unaided" — so it is one of the few
+        // transitions the orphan clock does *not* also cover, which is exactly
+        // what makes it discriminating.
+        //
+        // A/B measured: fails with observation moved back to the start of the
+        // step (the placement this whole class of bug came from), passes with it
+        // in the shipped position. It does *not* catch observation placed
+        // between the poll and `pump_inbound`; nothing can, because the only
+        // state change `pump_inbound` makes is a `close()` that requires the
+        // `LocalStream` to be gone, which the orphan clock has already stamped.
+        // That part of the ordering is defensive, not load-bearing.
+        let mut core = StackCore::new(StackConfig::default());
+        let mut clock = Clock(0);
+        let (flow, cseq, sseq) = handshake(&mut core, &mut clock, APP, WEB, 1000);
+
+        // We close first, so the socket is in FinWait1.
+        drop(flow);
+        core.step(clock.tick());
+        let handle = *core.flows.keys().next().expect("the flow must still exist");
+
+        // The application acknowledges our FIN and sends its own, taking the
+        // socket FinWait1 -> FinWait2 -> TimeWait inside a single poll.
+        core.ingest(&build_tcp(APP, WEB, TcpFlags::ack(), cseq, sseq + 1, &[]));
+        core.ingest(&build_tcp(
+            APP,
+            WEB,
+            TcpFlags::fin_ack(),
+            cseq,
+            sseq + 1,
+            &[],
+        ));
+        core.step(clock.tick());
+
+        assert_eq!(
+            core.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::TimeWait,
+            "precondition: the poll must have reached TimeWait"
+        );
+        assert_stamps_match_state(&core);
     }
 
     #[tokio::test]
@@ -1004,6 +1118,31 @@ mod tests {
         core.step(clock.tick());
         core.drain_tx();
 
+        // The Task 14 obligation, pinned. Let the stack settle first — after
+        // `pump_inbound` frees receive buffer, smoltcp still owes a window
+        // update, so it asks to be run again immediately.
+        let mut now = clock.tick();
+        let mut settle = 0;
+        while core.poll_delay(now) == Some(Duration::ZERO) {
+            core.step(now);
+            core.drain_tx();
+            settle += 1;
+            assert!(settle < 16, "the stack never went quiescent");
+            now = clock.tick();
+        }
+
+        // Once quiescent, a `CloseWait` flow waiting on a slow origin has
+        // nothing for smoltcp to schedule and — correctly — no sweep deadline of
+        // its own, so the loop has nothing whatever to sleep on and parks. That
+        // is the right design, but it means the tunnel task MUST notify the loop
+        // on every exit path, including error and cancellation paths, or this
+        // flow is never progressed and never reclaimed.
+        assert_eq!(
+            core.poll_delay(now),
+            None,
+            "a half-closed flow awaiting a slow origin gives the loop nothing to wake on"
+        );
+
         for at in [30, 59, 61, 90] {
             core.step(secs(at));
             assert_eq!(
@@ -1022,6 +1161,82 @@ mod tests {
         let (_, _, _, _, _, payload) =
             last_tcp(&mut core).expect("the late response must still be delivered");
         assert_eq!(payload, b"HTTP/1.0 200 OK\r\n".to_vec());
+    }
+
+    #[tokio::test]
+    async fn a_half_closed_flow_with_parked_bytes_is_reclaimed_when_the_tunnel_goes() {
+        // The leak this pass exists to fix, and a regression against an earlier
+        // pass: taking `CloseWait` off the shutdown clock left it covered by
+        // nothing at all. `awaits_peer` excludes it by design; the orphan clock
+        // used to require `Established`; and `pump_outbound`'s disconnection
+        // check is held back while a chunk is parked in `pending_out`. A
+        // half-closed flow with undeliverable bytes and no tunnel side left
+        // reached none of the three and lived for ever.
+        let cfg = StackConfig {
+            tcp_buffer_bytes: 4096,
+            ..StackConfig::default()
+        };
+        let mut core = StackCore::new(cfg);
+        let mut clock = Clock(0);
+        let (mut flow, cseq, sseq) = handshake(&mut core, &mut clock, APP, WEB, 1000);
+
+        // The application half-closes...
+        core.ingest(&build_tcp(APP, WEB, TcpFlags::fin_ack(), cseq, sseq, &[]));
+        core.step(clock.tick());
+
+        // ...the tunnel writes more than the transmit buffer can take, and
+        // nothing is ever acknowledged, so a chunk ends up parked...
+        for _ in 0..8 {
+            let _ = flow.stream.write_all(&[0u8; 2048]).await;
+            tokio::task::yield_now().await;
+            core.step(clock.tick());
+            core.drain_tx();
+        }
+
+        let handle = *core.flows.keys().next().expect("the flow must still exist");
+        assert_eq!(
+            core.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::CloseWait,
+            "precondition: the socket must be half-closed"
+        );
+
+        // ...and then the tunnel task goes away. Branch (c) parks one chunk in
+        // `pending_out` on the next step and is gated off from then on, which is
+        // exactly the hole: `CloseWait` reaches no other mechanism.
+        drop(flow);
+        core.step(clock.tick());
+        core.drain_tx();
+        assert_eq!(
+            core.sockets.get::<tcp::Socket>(handle).state(),
+            tcp::State::CloseWait,
+            "precondition: still half-closed, branch (c) cannot close it"
+        );
+        assert!(
+            core.flows[&handle].pending_out.is_some(),
+            "precondition: a chunk must be parked, which is what gates branch (c)"
+        );
+
+        let start = clock.tick();
+        let mut now = start;
+        let mut steps = 0;
+        loop {
+            core.step(now);
+            core.drain_tx();
+            steps += 1;
+            assert!(steps < 200, "the half-closed flow was never reclaimed");
+            if core.active_flows() == 0 {
+                break;
+            }
+            let delay = core
+                .poll_delay(now)
+                .expect("a half-closed flow with no tunnel side must bound the sleep");
+            now += delay;
+        }
+        assert!(
+            now <= start + SHUTDOWN_TIMEOUT + SHUTDOWN_TIMEOUT,
+            "reclamation must be bounded, took {}s",
+            (now - start).secs()
+        );
     }
 
     #[tokio::test]
