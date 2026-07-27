@@ -18,6 +18,32 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Plain DNS carried over a TCP channel through the tunnel, framed per RFC 7766
 /// with a two-byte big-endian length prefix. The zero-dependency default that
 /// makes DNS work at all when the protocol cannot forward UDP. Decision D3.
+///
+/// ## What this type bounds, and what it doesn't
+///
+/// `query_one`'s doc comment below covers the *per-query* guarantee: one
+/// call here allocates at most one 65,535-byte answer buffer (RFC 1035's own
+/// ceiling) and is bounded in time by `timeout`, no matter how the far end
+/// misbehaves. That guarantee is real, but it is per query, not per system:
+/// nothing in `TcpResolver`, in the `Resolver` trait, or in the `Protocol`
+/// trait's contract limits how many queries run *concurrently*.
+/// `engine.rs`'s `spawn_dns_query` hands every inbound UDP:53 datagram its
+/// own `tokio::spawn` with no semaphore of its own, so nothing here caps
+/// aggregate memory across many simultaneous in-flight queries.
+///
+/// What actually bounds that today, in the deployed system, is a property of
+/// the *`Protocol` implementation* in use, not of this module:
+/// `SshTunnel::open_tcp_stream` is gated by `MAX_CONCURRENT_CHANNELS` (64,
+/// `protocols/ssh.rs`), shared with ordinary proxied TCP flows, which caps
+/// worst-case simultaneous answer buffers at roughly 64 * 65,535 bytes
+/// (~4.2 MB). That is `SshTunnel`'s own choice, not something the
+/// `Resolver`/`Protocol` trait contracts require -- a future `Protocol` impl
+/// that does not throttle concurrent `open_tcp_stream` calls the same way
+/// would not inherit that ceiling for free, and neither `TcpResolver` nor
+/// `engine.rs`'s dispatch loop would catch that on its own. Fixing that
+/// properly (a concurrency limit at the dispatch layer, independent of
+/// whatever the `Protocol` impl happens to do) belongs to `engine.rs`, not
+/// here.
 pub struct TcpResolver {
     protocol: Arc<dyn Protocol>,
     servers: Vec<IpAddr>,
@@ -44,6 +70,9 @@ impl TcpResolver {
     /// never an unbounded read. The overall wall-clock bound against a
     /// resolver that claims a length and then sends nothing at all is the
     /// caller's `tokio::time::timeout`, not this function.
+    ///
+    /// This is a per-call guarantee only -- see `TcpResolver`'s own doc for
+    /// what (and what doesn't) bound how many of these run at once.
     async fn query_one(&self, server: IpAddr, query: &[u8]) -> Result<Vec<u8>, TunnelError> {
         let dest = SocketAddr::new(server, DNS_PORT);
         let mut stream = self.protocol.open_tcp_stream(dest).await?;
@@ -134,6 +163,15 @@ mod tests {
         asked: Mutex<Vec<SocketAddr>>,
         answer: Vec<u8>,
         refuse: bool,
+        /// The exact two bytes of the query's length prefix this protocol
+        /// observed on the wire. `Arc`-wrapped (unlike `asked`, which is
+        /// mutated synchronously before the spawn below) because capturing
+        /// it requires actually reading from the far end, which only
+        /// happens inside the spawned task -- this is the shared handle
+        /// that lets the test observe it afterward. A framing regression
+        /// (wrong byte order, an off-by-one in the length) shows up here as
+        /// a direct mismatch rather than a hang or a confusing parse error.
+        observed_len_prefix: Arc<Mutex<Option<[u8; 2]>>>,
     }
 
     #[async_trait]
@@ -156,11 +194,13 @@ mod tests {
             }
             let (near, mut far) = tokio::io::duplex(4096);
             let answer = self.answer.clone();
+            let observed_len_prefix = self.observed_len_prefix.clone();
             tokio::spawn(async move {
                 let mut len = [0u8; 2];
                 if far.read_exact(&mut len).await.is_err() {
                     return;
                 }
+                *observed_len_prefix.lock().unwrap() = Some(len);
                 let mut q = vec![0u8; u16::from_be_bytes(len) as usize];
                 if far.read_exact(&mut q).await.is_err() {
                     return;
@@ -187,6 +227,7 @@ mod tests {
             asked: Mutex::new(Vec::new()),
             answer: answer.to_vec(),
             refuse,
+            observed_len_prefix: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -237,6 +278,31 @@ mod tests {
         let p = proto(b"x", false);
         let r = TcpResolver::new(p, vec![]);
         assert!(r.query(b"\xAB\xCDq").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_outbound_length_prefix_is_the_exact_big_endian_query_length() {
+        // A direct byte-level check on the frame itself: without this, an
+        // off-by-one in the outbound prefix would surface only as the mock
+        // reading a garbled or short query and failing in some other,
+        // harder-to-diagnose way -- not as a clear assertion on the bytes
+        // that were actually sent.
+        let p = proto(b"\xAB\xCDans", false);
+        let r = TcpResolver::new(p.clone(), vec!["1.1.1.1".parse().unwrap()]);
+        let query = b"\xAB\xCDquery-of-a-specific-length";
+
+        r.query(query).await.unwrap();
+
+        let observed = p
+            .observed_len_prefix
+            .lock()
+            .unwrap()
+            .expect("the far end must have received a two-byte length prefix");
+        assert_eq!(
+            observed,
+            (query.len() as u16).to_be_bytes(),
+            "the outbound prefix must be the query's own length, big-endian"
+        );
     }
 
     // --- Hostile far-end coverage --------------------------------------
@@ -356,6 +422,25 @@ mod tests {
             .query(b"\xAB\xCDq")
             .await
             .expect_err("a close mid length-prefix must be a clean error");
+        assert!(matches!(err, TunnelError::Dns(_)));
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_accepts_the_query_and_sends_nothing_at_all_is_a_clean_error() {
+        // Distinct from the "claims a length and never delivers it" case
+        // below: here the far end never sends even the first byte of the
+        // length prefix -- it accepts the query and closes immediately, the
+        // literal "sends nothing" case rather than "claims something and
+        // stalls."
+        let p = Arc::new(HostileDnsProtocol {
+            reply: vec![],
+            hold_open: false,
+        });
+        let r = TcpResolver::new(p, vec!["1.1.1.1".parse().unwrap()]);
+        let err = r
+            .query(b"\xAB\xCDq")
+            .await
+            .expect_err("a connection that sends nothing at all must be a clean error");
         assert!(matches!(err, TunnelError::Dns(_)));
     }
 
