@@ -60,17 +60,24 @@ impl AsyncRead for LocalStream {
             return Poll::Ready(Ok(()));
         }
 
-        match self.inbound.poll_recv(cx) {
-            Poll::Pending => Poll::Pending,
-            // Channel closed and drained: the application half is gone.
-            Poll::Ready(None) => Poll::Ready(Ok(())),
-            Poll::Ready(Some(chunk)) => {
-                let n = chunk.len().min(buf.remaining());
-                buf.put_slice(&chunk[..n]);
-                if n < chunk.len() {
-                    self.partial = Some((chunk, n));
+        loop {
+            match self.inbound.poll_recv(cx) {
+                Poll::Pending => return Poll::Pending,
+                // Channel closed and drained: the application half is gone.
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                // An empty chunk carries no data. Returning `Ready(Ok(()))`
+                // here would be indistinguishable from the `None` case above
+                // (both are a zero-progress `Ok`), so a reader would treat it
+                // as EOF and stop consuming. Skip it and keep polling instead.
+                Poll::Ready(Some(chunk)) if chunk.is_empty() => continue,
+                Poll::Ready(Some(chunk)) => {
+                    let n = chunk.len().min(buf.remaining());
+                    buf.put_slice(&chunk[..n]);
+                    if n < chunk.len() {
+                        self.partial = Some((chunk, n));
+                    }
+                    return Poll::Ready(Ok(()));
                 }
-                Poll::Ready(Ok(()))
             }
         }
     }
@@ -169,6 +176,20 @@ mod tests {
             peer.from_stream.recv().await,
             None,
             "closed channel must report None"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_chunk_is_not_mistaken_for_eof() {
+        let (mut stream, peer) = local_stream_pair(4);
+        peer.to_stream.try_send(Vec::new()).unwrap();
+        peer.to_stream.try_send(b"real".to_vec()).unwrap();
+
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(
+            &buf, b"real",
+            "the empty chunk must not terminate the stream"
         );
     }
 
