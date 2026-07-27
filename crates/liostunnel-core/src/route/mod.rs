@@ -61,6 +61,28 @@ impl RouteCommand {
     }
 }
 
+/// Rejects a full-default prefix (`0.0.0.0/0` or `::/0`) in `test` mode.
+/// `test` mode's entire reason for existing is that it cannot lock the
+/// operator out of their own machine (Decision D6); a `/0` prefix is a literal
+/// default route wearing a CIDR list's clothes, so it is refused outright.
+/// Only the exact zero-length prefix is rejected, not merely a "wide" one —
+/// an operator may have a legitimate reason to test against a `/1` or `/4`,
+/// and second-guessing that would be a stricter policy than the safety
+/// property requires. A check on the input value only: no process spawn, no
+/// filesystem access, no env read, so it stays inside the pure construction
+/// path.
+fn reject_full_default_prefixes(cidrs: &[IpNet]) -> Result<(), TunnelError> {
+    if let Some(cidr) = cidrs.iter().find(|c| c.prefix_len() == 0) {
+        return Err(TunnelError::config(
+            "route.test.cidrs",
+            format!(
+                "`{cidr}` is a full-default prefix (/0); test mode only routes explicit, bounded prefixes"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Command construction is pure so it can be unit-tested without privileges;
 /// only [`RouteCommand::run`] needs root. Spec §10.
 pub trait RouteManager: Send + Sync {
@@ -208,6 +230,56 @@ mod tests {
     }
 
     #[test]
+    fn test_mode_rejects_a_full_default_prefix() {
+        for full_default in ["0.0.0.0/0", "::/0"] {
+            let mode = RouteMode::Test {
+                cidrs: vec![full_default.parse().unwrap()],
+                capture_dns: false,
+            };
+            let p = plan(mode);
+
+            let mac_err = macos::MacOsRoutes.apply_commands(&p).unwrap_err();
+            assert!(
+                matches!(mac_err, TunnelError::Config { .. }),
+                "macOS apply_commands should reject {full_default}: {mac_err:?}"
+            );
+            let mac_revert_err = macos::MacOsRoutes.revert_commands(&p).unwrap_err();
+            assert!(
+                matches!(mac_revert_err, TunnelError::Config { .. }),
+                "macOS revert_commands should reject {full_default}: {mac_revert_err:?}"
+            );
+
+            let linux_err = linux::LinuxRoutes.apply_commands(&p).unwrap_err();
+            assert!(
+                matches!(linux_err, TunnelError::Config { .. }),
+                "linux apply_commands should reject {full_default}: {linux_err:?}"
+            );
+            let linux_revert_err = linux::LinuxRoutes.revert_commands(&p).unwrap_err();
+            assert!(
+                matches!(linux_revert_err, TunnelError::Config { .. }),
+                "linux revert_commands should reject {full_default}: {linux_revert_err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mode_still_allows_an_ordinary_bounded_cidr() {
+        // The /0 guard must not overreach into legitimate wide-but-bounded
+        // ranges (e.g. a /1 or /4 test target) — only the exact full-default
+        // prefix is refused.
+        assert!(
+            macos::MacOsRoutes
+                .apply_commands(&plan(test_mode(false)))
+                .is_ok()
+        );
+        assert!(
+            linux::LinuxRoutes
+                .apply_commands(&plan(test_mode(false)))
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn reverting_undoes_exactly_what_was_applied() {
         for mgr in [
             Box::new(macos::MacOsRoutes) as Box<dyn RouteManager>,
@@ -222,6 +294,31 @@ mod tests {
                 "every applied route needs a matching revert"
             );
             assert!(rendered(&reverted).iter().all(|c| c.contains("del")));
+
+            // Same count and "del" verb aren't enough on their own — a revert
+            // that undoes the wrong target (or in the wrong order) would still
+            // pass both checks above. Zip apply/revert pairwise and require
+            // every non-verb token (the CIDR/host address and the interface)
+            // to match exactly, so a reordered or mismatched target fails here.
+            fn strip_verb(cmd: &RouteCommand) -> Vec<&str> {
+                cmd.args
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|tok| !matches!(*tok, "add" | "delete" | "del"))
+                    .collect()
+            }
+
+            for (a, r) in applied.iter().zip(reverted.iter()) {
+                assert_eq!(
+                    a.program, r.program,
+                    "apply/revert pair uses a different program: {a:?} vs {r:?}"
+                );
+                assert_eq!(
+                    strip_verb(a),
+                    strip_verb(r),
+                    "apply/revert pair targets do not match once the verb is ignored: {a:?} vs {r:?}"
+                );
+            }
         }
     }
 }

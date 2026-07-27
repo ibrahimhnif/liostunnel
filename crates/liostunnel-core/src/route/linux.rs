@@ -1,7 +1,9 @@
 use std::net::IpAddr;
 
 use crate::error::TunnelError;
-use crate::route::{RouteCommand, RouteManager, RouteMode, RoutePlan};
+use crate::route::{
+    RouteCommand, RouteManager, RouteMode, RoutePlan, reject_full_default_prefixes,
+};
 
 pub struct LinuxRoutes;
 
@@ -26,6 +28,7 @@ impl RouteManager for LinuxRoutes {
         let mut cmds = Vec::new();
         match &plan.mode {
             RouteMode::Test { cidrs, capture_dns } => {
+                reject_full_default_prefixes(cidrs)?;
                 for cidr in cidrs {
                     cmds.push(RouteCommand::new(
                         "ip",
@@ -56,6 +59,7 @@ impl RouteManager for LinuxRoutes {
         let mut cmds = Vec::new();
         match &plan.mode {
             RouteMode::Test { cidrs, capture_dns } => {
+                reject_full_default_prefixes(cidrs)?;
                 for cidr in cidrs {
                     cmds.push(RouteCommand::new(
                         "ip",

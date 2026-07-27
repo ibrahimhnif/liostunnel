@@ -1,7 +1,9 @@
 use std::net::IpAddr;
 
 use crate::error::TunnelError;
-use crate::route::{RouteCommand, RouteManager, RouteMode, RoutePlan};
+use crate::route::{
+    RouteCommand, RouteManager, RouteMode, RoutePlan, reject_full_default_prefixes,
+};
 
 pub struct MacOsRoutes;
 
@@ -18,6 +20,7 @@ impl RouteManager for MacOsRoutes {
         let mut cmds = Vec::new();
         match &plan.mode {
             RouteMode::Test { cidrs, capture_dns } => {
+                reject_full_default_prefixes(cidrs)?;
                 for cidr in cidrs {
                     cmds.push(RouteCommand::new(
                         "route",
@@ -56,6 +59,7 @@ impl RouteManager for MacOsRoutes {
         let mut cmds = Vec::new();
         match &plan.mode {
             RouteMode::Test { cidrs, capture_dns } => {
+                reject_full_default_prefixes(cidrs)?;
                 for cidr in cidrs {
                     cmds.push(RouteCommand::new(
                         "route",
