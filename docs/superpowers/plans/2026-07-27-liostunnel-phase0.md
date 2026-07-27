@@ -3419,7 +3419,10 @@ Spec §7.2. This is the only place the synchronous stack thread and the tokio ru
 
 - [ ] **Step 1: Add the dependency**
 
-Add to `[workspace.dependencies]`: `tokio-util = { version = "0.7", features = ["sync"] }`, and to `crates/liostunnel-core/Cargo.toml`: `tokio-util.workspace = true`.
+Add to `[workspace.dependencies]`: `tokio-util = "0.7"` (no `features` list —
+tokio-util 0.7.19 has no `sync` feature at all; `PollSender` lives in its
+unconditional base), and to `crates/liostunnel-core/Cargo.toml`:
+`tokio-util.workspace = true`.
 
 - [ ] **Step 2: Write the failing tests**
 
