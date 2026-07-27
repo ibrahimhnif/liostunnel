@@ -70,7 +70,17 @@ handle.channel_open_direct_tcpip(host: A, port: u32, originator_address: B, orig
 handle.disconnect(reason: Disconnect, description: &str, language_tag: &str) -> Result<(), russh::Error>
 channel.into_stream() -> russh::ChannelStream<client::Msg>   // impl AsyncRead + AsyncWrite
 enum client::AuthResult { Success, Failure { remaining_methods: MethodSet, partial_success: bool } }
-russh::keys::{PrivateKeyWithHashAlg, HashAlg, check_known_hosts_path, ssh_key}
+russh::keys::known_hosts::{check_known_hosts_path, learn_known_hosts_path, known_host_keys_path}
+russh::keys::{PrivateKeyWithHashAlg, HashAlg, ssh_key}
+// check_known_hosts_path is TRI-state and its Ok(false) is NOT simply "unknown host":
+//   Ok(true)  = a recorded entry matches this exact key
+//   Err(KeyChanged) = a recorded entry uses the SAME algorithm with a DIFFERENT key
+//   Ok(false) = EITHER the host has no entry at all, OR it has entries but none
+//               uses this key's algorithm.
+// Treating Ok(false) as "unknown, trust on first use" is a machine-in-the-middle
+// acceptance path: an attacker answers with RSA for a host recorded as ed25519 and
+// is trusted AND persisted. Check known_host_keys_path for existing entries first;
+// TOFU only when that list is empty.
 ```
 
 ## File structure
@@ -1862,11 +1872,17 @@ impl client::Handler for ClientHandler {
                         TunnelError::HostKey(format!("cannot create known_hosts directory: {e}"))
                     })?;
                 }
+                // Does this host have ANY recorded key? Ok(false) below cannot
+                // distinguish "no entry" from "entry exists with another
+                // algorithm", and conflating them accepts a MITM key.
+                let existing = known_host_keys_path(&self.host, self.port, known_hosts)
+                    .map_err(|e| TunnelError::HostKey(format!("cannot read known_hosts: {e}")))?;
+
                 match check_known_hosts_path(&self.host, self.port, key, known_hosts) {
                     // Known and matching.
                     Ok(true) => Ok(true),
-                    // Unknown host: trust on first use, then record it.
-                    Ok(false) => {
+                    // Only genuine first contact may be trusted on first use.
+                    Ok(false) if existing.is_empty() => {
                         tracing::warn!(
                             host = %self.host, port = self.port,
                             fingerprint = %key.fingerprint(Default::default()),
@@ -1878,6 +1894,14 @@ impl client::Handler for ClientHandler {
                             })?;
                         Ok(true)
                     }
+                    // Host is recorded but this key did not match any entry.
+                    // Same severity as an outright key change. Never accept.
+                    Ok(false) => Err(TunnelError::HostKey(format!(
+                        "host {}:{} is known but presented a {} key matching no recorded entry",
+                        self.host,
+                        self.port,
+                        key.algorithm()
+                    ))),
                     // Known but different — the dangerous case. Never auto-accept.
                     Err(e) => Err(TunnelError::HostKey(format!(
                         "host key for {}:{} does not match {}: {e}",
