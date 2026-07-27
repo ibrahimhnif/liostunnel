@@ -1357,21 +1357,52 @@ impl PortableProfile {
     }
 }
 
-/// Creates the file with 0600 already set, so the secret is never briefly
-/// world-readable between `create` and `set_permissions`.
+/// Always creates a *fresh* file at 0600.
+///
+/// `create(true)` is not enough: POSIX applies `open`'s mode argument only when
+/// the file is newly created, so an existing file at a looser mode would keep it
+/// while receiving the secret — and an existing symlink would be followed.
+/// `create_new` avoids both; if the path exists we remove it and retry rather
+/// than inheriting unknown state. `id` is preserved across import, so the path
+/// is deterministic and this case is reachable on re-import.
 fn write_secret_file(path: &Path, value: &str) -> Result<(), TunnelError> {
     use std::io::Write;
 
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path).map_err(|e| {
-        TunnelError::config(format!("secret file {}", path.display()), format!("cannot write: {e}"))
-    })?;
+    let open_fresh = || {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(path)
+    };
+
+    let mut f = match open_fresh() {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path).map_err(|e| {
+                TunnelError::config(
+                    format!("secret file {}", path.display()),
+                    format!("cannot replace existing file: {e}"),
+                )
+            })?;
+            open_fresh().map_err(|e| {
+                TunnelError::config(
+                    format!("secret file {}", path.display()),
+                    format!("cannot create: {e}"),
+                )
+            })?
+        }
+        Err(e) => {
+            return Err(TunnelError::config(
+                format!("secret file {}", path.display()),
+                format!("cannot write: {e}"),
+            ));
+        }
+    };
+
     f.write_all(value.as_bytes())
         .map_err(|e| TunnelError::config(format!("secret file {}", path.display()), e.to_string()))
 }
