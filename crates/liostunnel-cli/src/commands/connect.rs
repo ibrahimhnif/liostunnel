@@ -159,7 +159,11 @@ pub async fn run(
     // TODO(Task 19/20): select the real resolver from `profile.dns` (DNS-over-TCP
     // or DoH) once those backends exist. Until then every DNS query fails and
     // drops silently on the wire -- the client's own resolver retries, which is
-    // strictly better than this CLI fabricating an answer.
+    // strictly better than this CLI fabricating an answer. `resolve_one`'s
+    // per-query failure is only logged at `debug`, which would otherwise make
+    // "every DNS query fails" indistinguishable from "DNS is working
+    // silently" -- so say it once, loudly, here instead.
+    tracing::warn!("DNS resolution is not yet implemented; DNS queries will fail");
     let resolver: Arc<dyn Resolver> = Arc::new(UnimplementedResolver);
     let engine = Engine::new(protocol, resolver, handles);
     let shutdown = engine.shutdown_handle();

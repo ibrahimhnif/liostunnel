@@ -23,6 +23,28 @@ use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Packet, UdpPacket};
 
 use crate::error::TunnelError;
 
+/// The largest payload [`build_udp_packet`] can carry: the IP total-length
+/// field is itself a `u16`, so the whole datagram — 20-byte IP header +
+/// 8-byte UDP header + payload — can never exceed `u16::MAX`. This is also
+/// the standard maximum UDP-over-IPv4 payload (65,507 bytes), not an
+/// arbitrary cap.
+///
+/// A DNS-over-TCP answer (RFC 1035's two-byte length prefix, Task 19) can
+/// legally be up to 65,535 bytes — comfortably past this limit — so this is
+/// a real, reachable path once that resolver lands, not a defensive-only
+/// bound.
+///
+/// This says nothing about the tunnel's actual MTU (`StackConfig::mtu`,
+/// default 1500): nothing here fragments the synthesised packet, and
+/// `dont_frag(true)` is set unconditionally below, so a legal answer under
+/// this cap but over the MTU still produces a frame the TUN device may
+/// refuse or the OS may drop — the same "looks like a hang" failure mode as
+/// a bad checksum, just for a different reason. `build_udp_packet` has no
+/// way to know the configured MTU without a signature change that would
+/// ripple through `StackCore::inject_datagram`, `testutil::build_udp`, and
+/// every caller of both — left as a follow-up, not solved here.
+pub const MAX_UDP_PAYLOAD: usize = u16::MAX as usize - 20 - 8;
+
 /// Resolves a DNS query by carrying it through the tunnel. Decision D3.
 ///
 /// Takes and returns raw DNS wire-format bytes only. Nothing in this trait,
@@ -74,6 +96,20 @@ pub fn build_udp_packet(
             ));
         }
     };
+
+    // Reject outright rather than truncate: `20 + 8 + payload.len()` cast
+    // down to `u16` for `set_total_len`/`set_len` would otherwise wrap
+    // silently for a payload at or beyond this bound, leaving those fields
+    // smaller than the buffer they describe — which is exactly what made
+    // `payload_mut()` panic (`slice index starts at 8 but ends at 0`) on an
+    // oversized answer. A dropped oversized answer is correct behaviour
+    // (the client's own resolver retries); a panic here takes down the
+    // single stack thread that owns every active flow for the session.
+    if payload.len() > MAX_UDP_PAYLOAD {
+        return Err(TunnelError::Dns(
+            "DNS answer is too large to synthesise into a single UDP/IP packet".into(),
+        ));
+    }
 
     let udp_len = 8 + payload.len();
     let total = 20 + udp_len;
@@ -155,6 +191,70 @@ mod tests {
         assert_eq!(udp.src_port(), 53);
         assert_eq!(udp.dst_port(), 51234);
         assert_eq!(udp.payload(), b"\xAB\xCD answer");
+    }
+
+    #[test]
+    fn the_largest_payload_that_fits_a_u16_ip_total_length_still_succeeds() {
+        // The boundary itself, not just comfortably inside it: an off-by-one
+        // in the guard (`>=` where it should be `>`, or vice versa) would
+        // only show up right at this edge.
+        let from = sa("1.1.1.1:53");
+        let to = sa("10.90.0.2:51234");
+        let payload = vec![0xAAu8; MAX_UDP_PAYLOAD];
+
+        let raw = build_udp_packet(from, to, &payload).expect("the boundary size must succeed");
+
+        let ip = Ipv4Packet::new_checked(&raw[..]).expect("valid IPv4");
+        assert!(ip.verify_checksum());
+        assert_eq!(ip.total_len() as usize, 20 + 8 + MAX_UDP_PAYLOAD);
+
+        let udp = UdpPacket::new_checked(ip.payload()).expect("valid UDP");
+        assert!(udp.verify_checksum(
+            &IpAddress::Ipv4(ip.src_addr()),
+            &IpAddress::Ipv4(ip.dst_addr())
+        ));
+        assert_eq!(udp.payload().len(), MAX_UDP_PAYLOAD);
+    }
+
+    #[test]
+    fn one_byte_past_the_boundary_is_rejected_rather_than_panicking() {
+        // Without this guard, this exact size (28 + payload.len() == 65536)
+        // wraps `set_total_len`'s `u16` cast to 0 -- the packet is still
+        // built and returned as `Ok`, but with a corrupted IP header rather
+        // than a matching one. Silent corruption, not a panic; the guard
+        // must catch it just as surely as the larger, louder failure below.
+        let from = sa("1.1.1.1:53");
+        let to = sa("10.90.0.2:51234");
+        let payload = vec![0xAAu8; MAX_UDP_PAYLOAD + 1];
+
+        let err = build_udp_packet(from, to, &payload)
+            .expect_err("one byte past the boundary must be rejected, not silently corrupted");
+        assert!(matches!(err, TunnelError::Dns(_)));
+    }
+
+    #[test]
+    fn a_payload_that_would_wrap_the_udp_length_field_is_rejected_not_panicked() {
+        // The exact reproduction of the reported defect: at `payload.len() ==
+        // 65528`, `8 + payload.len()` wraps `set_len`'s `u16` cast to 0, and
+        // `payload_mut()` — which slices `8..len()` — panics inside smoltcp
+        // rather than this function ever returning. Reproduced directly
+        // against the pre-fix code (guard temporarily removed):
+        //
+        //   thread '...' panicked at .../smoltcp-0.13.1/src/wire/udp.rs:215:18:
+        //   slice index starts at 8 but ends at 0
+        //
+        // That panic unwinds the single dedicated stack thread that owns
+        // every active flow for the session (see `poll.rs`), which the
+        // engine's own shutdown-race fix (this same task) reads as an
+        // ordinary clean close -- so one oversized DNS answer would silently
+        // end the whole tunnel with nothing in the logs to explain why.
+        let from = sa("1.1.1.1:53");
+        let to = sa("10.90.0.2:51234");
+        let payload = vec![0xAAu8; 65528];
+
+        let err = build_udp_packet(from, to, &payload)
+            .expect_err("a payload this large must be rejected, not panic the stack thread");
+        assert!(matches!(err, TunnelError::Dns(_)));
     }
 
     #[test]
