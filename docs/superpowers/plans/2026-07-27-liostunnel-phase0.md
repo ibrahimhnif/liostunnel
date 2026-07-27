@@ -988,6 +988,11 @@ Append to the `tests` module in `crates/liostunnel-core/src/config/profile.rs`:
 Run: `cargo test -p liostunnel-core profile`
 Expected: FAIL — `no method named validate found`.
 
+> **As implemented:** `valid_profile` takes a `tag: &str` and returns
+> `(ServerProfile, PathBuf)` so each test gets its own secret-file directory and
+> removes it, matching the cleanup convention in `secret.rs`. A single shared
+> temp path across parallel test threads was a latent write race.
+
 - [ ] **Step 3: Implement**
 
 Append to the non-test part of `crates/liostunnel-core/src/config/profile.rs`:
