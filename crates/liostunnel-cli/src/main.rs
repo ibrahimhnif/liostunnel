@@ -89,6 +89,59 @@ async fn run(cli: Cli) -> Result<(), liostunnel_core::TunnelError> {
             emit_warnings(&p);
             commands::probe::run(&p, user, &dest, policy).await
         }
+        Command::Connect {
+            profile,
+            user,
+            route_mode,
+            cidrs,
+            capture_dns,
+            tun_address,
+        } => {
+            let p = profile_io::load(&profile, &secret_dir)?;
+            p.validate(&FileSecretStore)?;
+            emit_warnings(&p);
+
+            let mode = match route_mode.as_str() {
+                "test" => {
+                    let parsed = cidrs
+                        .iter()
+                        .map(|c| {
+                            c.parse::<ipnet::IpNet>().map_err(|e| {
+                                liostunnel_core::TunnelError::config("--cidr", e.to_string())
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if parsed.is_empty() {
+                        return Err(liostunnel_core::TunnelError::config(
+                            "--cidr",
+                            "test route mode needs at least one prefix",
+                        ));
+                    }
+                    liostunnel_core::route::RouteMode::Test {
+                        cidrs: parsed,
+                        capture_dns,
+                    }
+                }
+                "default" => liostunnel_core::route::RouteMode::Default,
+                other => {
+                    return Err(liostunnel_core::TunnelError::config(
+                        "--route-mode",
+                        format!("expected `test` or `default`, got `{other}`"),
+                    ));
+                }
+            };
+
+            commands::connect::run(
+                &p,
+                user,
+                commands::connect::ConnectOpts {
+                    route_mode: mode,
+                    tun_address,
+                },
+                policy,
+            )
+            .await
+        }
     }
 }
 

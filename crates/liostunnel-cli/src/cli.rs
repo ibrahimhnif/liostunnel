@@ -41,4 +41,24 @@ pub enum Command {
         #[arg(long)]
         include_secrets: bool,
     },
+
+    /// Bring up the TUN device and route traffic through the tunnel.
+    Connect {
+        profile: PathBuf,
+        /// SSH username.
+        #[arg(long)]
+        user: String,
+        /// `test` routes only --cidr; `default` takes over all traffic (Task 21).
+        #[arg(long, default_value = "test")]
+        route_mode: String,
+        /// Prefixes to route in test mode. Repeatable.
+        #[arg(long = "cidr")]
+        cidrs: Vec<String>,
+        /// Also route the profile's DNS servers through the tunnel. Spec §10.
+        #[arg(long)]
+        capture_dns: bool,
+        /// Address assigned to the TUN interface.
+        #[arg(long, default_value = "10.90.0.1")]
+        tun_address: std::net::Ipv4Addr,
+    },
 }
