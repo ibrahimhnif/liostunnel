@@ -871,7 +871,7 @@ Append to the `tests` module in `crates/liostunnel-core/src/config/profile.rs`:
             host: "198.51.100.7".into(),
             port: 22,
             auth: AuthMethod::Password {
-                password: SecretRef::Env { var: "LIOS_VALID_PW".into() },
+                password: SecretRef::File { path: secret_file("valid", "pw") },
             },
             dns: DnsConfig { mode: DnsMode::Tcp, servers: vec![ip(1, 1, 1, 1)], https: None },
             split_tunnel: SplitTunnelRule::AllTraffic,
@@ -879,9 +879,29 @@ Append to the `tests` module in `crates/liostunnel-core/src/config/profile.rs`:
         }
     }
 
+    /// A real 0600 file rather than an env var. `std::env::set_var` is `unsafe`
+    /// in edition 2024 because concurrent set/get is UB, and cargo runs the
+    /// tests in one binary across threads — several of these tests share a
+    /// helper, so env vars would be a genuine data race.
+    fn secret_file(tag: &str, body: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = std::env::temp_dir().join(format!("lios-pv-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        path
+    }
+
     fn store() -> impl SecretStore {
-        // SAFETY: single-threaded test.
-        unsafe { std::env::set_var("LIOS_VALID_PW", "pw") };
         FileSecretStore
     }
 
@@ -927,10 +947,10 @@ Append to the `tests` module in `crates/liostunnel-core/src/config/profile.rs`:
     fn an_unresolvable_secret_is_rejected_at_validation_not_at_connect() {
         let mut p = valid_profile();
         p.auth = AuthMethod::Password {
-            password: SecretRef::Env { var: "LIOS_NEVER_SET_ANYWHERE".into() },
+            password: SecretRef::File { path: "/nonexistent/lios/secret".into() },
         };
         let e = p.validate(&store()).unwrap_err().to_string();
-        assert!(e.contains("LIOS_NEVER_SET_ANYWHERE"), "{e}");
+        assert!(e.contains("/nonexistent/lios/secret"), "{e}");
     }
 
     #[test]
@@ -1526,10 +1546,30 @@ fn profile(auth: AuthMethod) -> ServerProfile {
     }
 }
 
+/// File-backed rather than env-backed: `std::env::set_var` is `unsafe` in
+/// edition 2024 because concurrent set/get is UB, and these tests share this
+/// helper across threads in one test binary.
+fn secret_file(tag: &str, body: &str) -> PathBuf {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = scratch(tag);
+    let path = dir.join("secret");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    f.write_all(body.as_bytes()).unwrap();
+    path
+}
+
 fn password_auth() -> AuthMethod {
-    // SAFETY: tests in this file are single-threaded with respect to this var.
-    unsafe { std::env::set_var("LIOS_IT_PASSWORD", "tunnelpass") };
-    AuthMethod::Password { password: SecretRef::Env { var: "LIOS_IT_PASSWORD".into() } }
+    AuthMethod::Password {
+        password: SecretRef::File { path: secret_file("pw", "tunnelpass") },
+    }
 }
 
 #[tokio::test]
@@ -1598,8 +1638,9 @@ async fn connects_with_a_private_key() {
 #[tokio::test]
 #[ignore = "requires docker fixture: make -C testing/docker up"]
 async fn a_wrong_password_produces_an_auth_error() {
-    unsafe { std::env::set_var("LIOS_IT_BADPW", "not-the-password") };
-    let auth = AuthMethod::Password { password: SecretRef::Env { var: "LIOS_IT_BADPW".into() } };
+    let auth = AuthMethod::Password {
+        password: SecretRef::File { path: secret_file("badpw", "not-the-password") },
+    };
     let mut t = SshTunnel::new("tunneluser".into(), HostKeyPolicy::AcceptAny);
     let err = t.connect(&profile(auth), &FileSecretStore).await.unwrap_err();
     assert!(matches!(err, liostunnel_core::TunnelError::Auth(_)), "got {err:?}");
@@ -2178,49 +2219,29 @@ impl SshTunnel {
             self.counters.active_flows.clone(),
         );
 
-        // The permit lives as long as the stream.
-        Ok(Box::new(PermitStream { inner: stream, _permit: permit }))
-    }
-}
-
-/// Keeps a semaphore permit alive for the lifetime of the stream.
-struct PermitStream<S> {
-    inner: S,
-    _permit: tokio::sync::OwnedSemaphorePermit,
-}
-
-impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PermitStream<S> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PermitStream<S> {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
-    }
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        Ok(Box::new(stream))
     }
 }
 ```
+
+The semaphore permit is carried by `CountingStream` itself rather than a second
+wrapper. Add the field in `counting.rs` — a separate `PermitStream` would
+duplicate all four `poll_*` delegations verbatim for one extra field:
+
+```rust
+pub struct CountingStream<S> {
+    inner: S,
+    up: Arc<AtomicU64>,
+    down: Arc<AtomicU64>,
+    active: Arc<AtomicU64>,
+    /// Released when the stream drops, bounding concurrent SSH channels.
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+```
+
+with `new(...)` taking `permit: Option<tokio::sync::OwnedSemaphorePermit>` as its
+last argument (tests pass `None`), and `open_tcp_stream_named` passing
+`Some(permit)`.
 
 Change `Counters` to hold `Arc<AtomicU64>` fields so `CountingStream` can share them, and add the semaphore to `SshTunnel`:
 
