@@ -4922,7 +4922,7 @@ Spec §7.6 and §11.
 
 **Interfaces:**
 - Consumes: `NetStack`/`StackHandles`/`TcpFlow` (10, 14), `Protocol` (6), `ConnectionStats` (6).
-- Produces: `struct Engine` with `Engine::new(protocol: Arc<dyn Protocol>, handles: StackHandles) -> Self`, `async fn run(self) -> Result<(), TunnelError>`, `fn stats(&self) -> ConnectionStats`, `fn shutdown(&self)`.
+- Produces: `struct Engine` with `Engine::new(protocol: Arc<dyn Protocol>, handles: StackHandles) -> Self`, `async fn run(self) -> Result<(), TunnelError>`, `fn stats_handle(&self) -> StatsHandle`, `fn shutdown_handle(&self) -> ShutdownHandle`. (Task 17's `connect.rs` calls the `_handle` names — the Step 2 code below is authoritative.)
 
 - [ ] **Step 1: Write the failing tests**
 
