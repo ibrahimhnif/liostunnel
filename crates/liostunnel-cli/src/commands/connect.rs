@@ -10,11 +10,62 @@ use liostunnel_core::net::tun::{TunConfig, TunDevice};
 use liostunnel_core::net::{NetStack, ShutdownHandle, StackConfig};
 use liostunnel_core::protocols::Protocol;
 use liostunnel_core::protocols::ssh::{HostKeyPolicy, SshTunnel};
-use liostunnel_core::route::{RouteGuard, RouteMode, RoutePlan, platform_manager};
+use liostunnel_core::route::{
+    RouteGuard, RouteMode, RoutePlan, platform_manager, reject_full_default_prefixes,
+};
 
 pub struct ConnectOpts {
     pub route_mode: RouteMode,
     pub tun_address: Ipv4Addr,
+}
+
+/// Maps the CLI's `--route-mode`/`--cidr`/`--capture-dns` strings to a
+/// [`RouteMode`], purely -- no process spawn, no TUN device, no filesystem
+/// access, so it can (and does, see `tests` below) run without root or a
+/// stack thread ever existing.
+///
+/// Deliberately called from `main.rs` *before* `run` above does anything
+/// with side effects (SSH connect, `TunDevice::open`, `SmoltcpStack::start`):
+/// an obviously-invalid `--cidr` -- including the full-default-prefix case
+/// `reject_full_default_prefixes` rejects -- should fail before any of that
+/// runs, not after a TUN interface has already flickered into existence and
+/// back out. `RouteGuard::apply` (via `RouteManager::apply_commands`/
+/// `revert_commands`) calls `reject_full_default_prefixes` again
+/// unconditionally at route-installation time; that is not redundant dead
+/// code, it is defense in depth for the route layer's own callers, of which
+/// this CLI is only one.
+pub fn parse_route_mode(
+    route_mode: &str,
+    cidrs: &[String],
+    capture_dns: bool,
+) -> Result<RouteMode, TunnelError> {
+    match route_mode {
+        "test" => {
+            let parsed = cidrs
+                .iter()
+                .map(|c| {
+                    c.parse::<ipnet::IpNet>()
+                        .map_err(|e| TunnelError::config("--cidr", e.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if parsed.is_empty() {
+                return Err(TunnelError::config(
+                    "--cidr",
+                    "test route mode needs at least one prefix",
+                ));
+            }
+            reject_full_default_prefixes(&parsed)?;
+            Ok(RouteMode::Test {
+                cidrs: parsed,
+                capture_dns,
+            })
+        }
+        "default" => Ok(RouteMode::Default),
+        other => Err(TunnelError::config(
+            "--route-mode",
+            format!("expected `test` or `default`, got `{other}`"),
+        )),
+    }
 }
 
 /// Tells the stack thread to stop if this scope is torn down before the
@@ -157,5 +208,95 @@ mod tests {
             handle.is_shutdown(),
             "dropping the guard must signal the stack thread to stop"
         );
+    }
+
+    // `parse_route_mode` regression coverage. All hermetic: no TUN, no
+    // routes, no root -- it is a pure string/`Vec<String>` -> `RouteMode`
+    // mapping, exercised directly rather than only through
+    // `Cli::try_parse_from` (which stops at clap's own parsing and never
+    // reaches this logic at all).
+
+    #[test]
+    fn an_unknown_route_mode_is_a_clear_config_error() {
+        let e = parse_route_mode("bogus", &["10.0.0.0/24".into()], false).unwrap_err();
+        match e {
+            TunnelError::Config { field, reason } => {
+                assert_eq!(field, "--route-mode");
+                assert!(
+                    reason.contains("bogus"),
+                    "error should name the bad value: {reason}"
+                );
+            }
+            other => panic!("expected TunnelError::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mode_with_no_cidr_is_rejected() {
+        let e = parse_route_mode("test", &[], false).unwrap_err();
+        match e {
+            TunnelError::Config { field, reason } => {
+                assert_eq!(field, "--cidr");
+                assert!(reason.contains("at least one prefix"), "{reason}");
+            }
+            other => panic!("expected TunnelError::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_cidr_string_names_the_bad_value_and_the_flag() {
+        let e = parse_route_mode("test", &["not-a-cidr".into()], false).unwrap_err();
+        match e {
+            TunnelError::Config { field, .. } => assert_eq!(field, "--cidr"),
+            other => panic!("expected TunnelError::Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_valid_test_invocation_maps_to_the_expected_route_mode() {
+        let mode = parse_route_mode(
+            "test",
+            &["93.184.216.0/24".into(), "198.51.100.0/24".into()],
+            true,
+        )
+        .unwrap();
+        match mode {
+            RouteMode::Test { cidrs, capture_dns } => {
+                assert_eq!(
+                    cidrs,
+                    vec![
+                        "93.184.216.0/24".parse().unwrap(),
+                        "198.51.100.0/24".parse().unwrap(),
+                    ]
+                );
+                assert!(capture_dns);
+            }
+            other => panic!("expected RouteMode::Test, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_route_mode_string_maps_to_route_mode_default() {
+        assert!(matches!(
+            parse_route_mode("default", &[], false).unwrap(),
+            RouteMode::Default
+        ));
+    }
+
+    #[test]
+    fn a_full_default_prefix_is_rejected_before_anything_with_side_effects_runs() {
+        // The property this whole fix pass is about: this call is pure (no
+        // TUN device, no stack thread, no process spawned), so a `/0` being
+        // caught here -- rather than only later inside `RouteGuard::apply`
+        // -- means an operator never sees an interface flicker into
+        // existence for an argument this obviously wrong.
+        let e = parse_route_mode("test", &["0.0.0.0/0".into()], false).unwrap_err();
+        match e {
+            TunnelError::Config { field, reason } => {
+                assert_eq!(field, "route.test.cidrs");
+                assert!(reason.contains("full-default"), "{reason}");
+            }
+            other => panic!("expected TunnelError::Config, got {other:?}"),
+        }
     }
 }

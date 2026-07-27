@@ -101,35 +101,11 @@ async fn run(cli: Cli) -> Result<(), liostunnel_core::TunnelError> {
             p.validate(&FileSecretStore)?;
             emit_warnings(&p);
 
-            let mode = match route_mode.as_str() {
-                "test" => {
-                    let parsed = cidrs
-                        .iter()
-                        .map(|c| {
-                            c.parse::<ipnet::IpNet>().map_err(|e| {
-                                liostunnel_core::TunnelError::config("--cidr", e.to_string())
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    if parsed.is_empty() {
-                        return Err(liostunnel_core::TunnelError::config(
-                            "--cidr",
-                            "test route mode needs at least one prefix",
-                        ));
-                    }
-                    liostunnel_core::route::RouteMode::Test {
-                        cidrs: parsed,
-                        capture_dns,
-                    }
-                }
-                "default" => liostunnel_core::route::RouteMode::Default,
-                other => {
-                    return Err(liostunnel_core::TunnelError::config(
-                        "--route-mode",
-                        format!("expected `test` or `default`, got `{other}`"),
-                    ));
-                }
-            };
+            // Pure -- validated (including the full-default-prefix rejection)
+            // before `connect::run` does anything with side effects, so an
+            // obviously-bad `--cidr` fails before SSH, the TUN device, or the
+            // stack thread ever come into existence.
+            let mode = commands::connect::parse_route_mode(&route_mode, &cidrs, capture_dns)?;
 
             commands::connect::run(
                 &p,

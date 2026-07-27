@@ -71,7 +71,15 @@ impl RouteCommand {
 /// property requires. A check on the input value only: no process spawn, no
 /// filesystem access, no env read, so it stays inside the pure construction
 /// path.
-fn reject_full_default_prefixes(cidrs: &[IpNet]) -> Result<(), TunnelError> {
+///
+/// `pub` so a caller (e.g. the CLI, parsing `--cidr` before anything with
+/// side effects has run) can apply this same rule at argument-validation
+/// time instead of discovering it only after a TUN device and stack thread
+/// already exist. [`RouteManager::apply_commands`]/`revert_commands` call it
+/// too, unconditionally — this function does not trust callers to have done
+/// so already, and neither should you skip calling it here just because an
+/// earlier layer might have.
+pub fn reject_full_default_prefixes(cidrs: &[IpNet]) -> Result<(), TunnelError> {
     if let Some(cidr) = cidrs.iter().find(|c| c.prefix_len() == 0) {
         return Err(TunnelError::config(
             "route.test.cidrs",
