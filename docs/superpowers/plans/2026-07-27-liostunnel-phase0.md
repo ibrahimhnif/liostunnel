@@ -1514,7 +1514,12 @@ COPY keys/ssh_host_ed25519_key.pub /etc/ssh/ssh_host_ed25519_key.pub
 COPY keys/authorized_keys          /home/tunneluser/.ssh/authorized_keys
 RUN chmod 600 /etc/ssh/ssh_host_ed25519_key /home/tunneluser/.ssh/authorized_keys \
  && chown -R tunneluser:tunneluser /home/tunneluser/.ssh \
- && printf 'AllowTcpForwarding yes\nPermitOpen any\nPasswordAuthentication yes\nPubkeyAuthentication yes\nPermitRootLogin no\n' >> /etc/ssh/sshd_config
+ # OpenSSH takes the FIRST occurrence of a directive, and Alpine's stock
+ # config already sets `AllowTcpForwarding no`. Appending `yes` after it is
+ # silently ignored and every direct-tcpip request is refused, so rewrite
+ # the existing line rather than adding a second one.
+ && sed -i 's/^AllowTcpForwarding no$/AllowTcpForwarding yes/' /etc/ssh/sshd_config \
+ && printf 'PermitOpen any\nPasswordAuthentication yes\nPubkeyAuthentication yes\nPermitRootLogin no\n' >> /etc/ssh/sshd_config
 EXPOSE 22
 CMD ["/usr/sbin/sshd", "-D", "-e"]
 ```
@@ -2121,7 +2126,13 @@ async fn a_refused_destination_reports_a_protocol_error_without_killing_the_sess
 
     // Nothing listens on this port inside the container.
     let dest: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
-    let err = t.open_tcp_stream(dest).await.unwrap_err();
+    // `unwrap_err` requires T: Debug, and `Box<dyn TunnelStream>` deliberately
+    // has none — a Debug on a stream type is how payload bytes leak. Discard
+    // the Ok value instead.
+    let err = match t.open_tcp_stream(dest).await {
+        Ok(_) => panic!("expected the destination to be refused"),
+        Err(e) => e,
+    };
     assert!(matches!(err, liostunnel_core::TunnelError::Protocol(_)), "got {err:?}");
 
     // Spec §11: a per-flow failure must not tear down the session.
