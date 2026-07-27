@@ -13,8 +13,11 @@
 //! trait they implement, plus interception and synthesis, both of which are
 //! exercised end-to-end without either backend existing yet.
 
+#[cfg(feature = "doh")]
 pub mod over_https;
 pub mod over_tcp;
+#[cfg(all(test, feature = "doh"))]
+pub(crate) mod testutil;
 
 use std::net::SocketAddr;
 

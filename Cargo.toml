@@ -27,6 +27,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 tokio-util = "0.7"
+hyper = { version = "1.11", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+http = "1"
+tokio-rustls = "0.26"
+rustls = "0.23"
+webpki-roots = "1"
 
 [profile.release]
 strip = true

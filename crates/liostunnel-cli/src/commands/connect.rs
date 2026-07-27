@@ -4,8 +4,9 @@ use std::sync::Arc;
 use liostunnel_core::TunnelError;
 use liostunnel_core::config::profile::{DnsMode, ServerProfile};
 use liostunnel_core::config::secret::FileSecretStore;
+use liostunnel_core::dns::Resolver;
+use liostunnel_core::dns::over_https::DohResolver;
 use liostunnel_core::dns::over_tcp::TcpResolver;
-use liostunnel_core::dns::{Resolver, UnimplementedResolver};
 use liostunnel_core::engine::Engine;
 use liostunnel_core::net::smoltcp_stack::poll::SmoltcpStack;
 use liostunnel_core::net::tun::{TunConfig, TunDevice};
@@ -157,22 +158,25 @@ pub async fn run(
     )?;
 
     // 5. Run until interrupted.
-    // Select the real resolver backend from `profile.dns.mode`. Task 19 wires
-    // up DNS-over-TCP (RFC 7766, the zero-dependency default); DoH (Task 20)
-    // is still unimplemented -- until it lands, every DNS query in that mode
-    // fails and drops silently on the wire, which is strictly better than
-    // this CLI fabricating an answer. `resolve_one`'s per-query failure is
-    // only logged at `debug`, which would otherwise make "every DNS query
-    // fails" indistinguishable from "DNS is working silently" -- so say it
-    // once, loudly, here instead.
+    // Select the real resolver backend from `profile.dns.mode`: DNS-over-TCP
+    // (RFC 7766, Task 19, the zero-dependency default) or DNS-over-HTTPS
+    // (RFC 8484, Task 20, opt-in per profile). `ServerProfile::validate`
+    // already rejected `Https` mode without a `dns.https` block, so the
+    // `ok_or_else` below is a defence-in-depth check, not the primary guard.
     let resolver: Arc<dyn Resolver> = match profile.dns.mode {
         DnsMode::Tcp => Arc::new(TcpResolver::new(
             protocol.clone(),
             profile.dns.servers.clone(),
         )),
         DnsMode::Https => {
-            tracing::warn!("DNS-over-HTTPS is not yet implemented; DNS queries will fail");
-            Arc::new(UnimplementedResolver)
+            let doh = profile.dns.https.clone().ok_or_else(|| {
+                TunnelError::config("dns.https", "required when dns.mode is `https`")
+            })?;
+            Arc::new(DohResolver::new(
+                protocol.clone(),
+                profile.dns.servers.clone(),
+                doh,
+            ))
         }
     };
     let engine = Engine::new(protocol, resolver, handles);
