@@ -23,6 +23,26 @@ Every task's requirements implicitly include this section.
 - **A test that passes must be shown failing against the defect it names.** This project has produced at least thirteen tests that were green while the thing they named was broken — one whose fixture could not reach the branch it claimed to test, one that asserted a feature existed while it was absent from the screen. Every A/B is run and its transcript pasted.
 - `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --check`, and `flutter analyze` must pass before every commit.
 - **Dart changes require `./testing/build-ffi-for-tests.sh` before `flutter test`** — the app links Rust statically, but `flutter test` opens a dylib by path.
+### Amendments (adopted 2026-07-29, after the Task 2 review)
+
+- **AEAD-2022 is not offered.** The `2022-blake3-*` names exist in
+  `shadowsocks-crypto`'s `kind.rs`, but their `FromStr` arms are
+  `#[cfg(feature = "v2")]`, reachable only through `shadowsocks/aead-cipher-2022`
+  — which the feature constraint above forbids. Verified by building against
+  the exact dependency line: all three return `Err(ParseCipherKindError)`.
+  Spec §8's cipher table was written from the names in the source, not from
+  what this feature set can construct. The feature constraint governs: the
+  offered list is the three AEAD names only, the `ss-rust` fixture speaks
+  `chacha20-ietf-poly1305`, and Task 9's second test proves cipher-family
+  independence rather than AEAD-2022.
+- **`ShadowsocksTunnel` bounds its concurrent flows.** Task 2's original text
+  passed `None` for the permit, reasoning that Shadowsocks has no channel
+  budget. True of the protocol, but each flow is still a socket, and the
+  engine spawns one task per flow with no cap of its own — the tunnel's
+  semaphore is the system's only backpressure, and `open_dns_stream`
+  delegating here means DNS draws from the same pool. It gets its own
+  `Semaphore` mirroring the SSH path: 64 flows, 8 reserved for DNS.
+
 - Conventional commit prefixes. **Write commit messages to a file and use `git commit -F`** — backticks inside `-m` are command substitution and will execute. This has happened once in this project and ran a `route delete`.
 
 ## Verified API reference
@@ -51,9 +71,10 @@ ProxyClientStream::connect(ctx, &ServerConfig, Address)
 
 // Cipher names, read from shadowsocks-crypto-0.6.2/src/kind.rs:
 //   "aes-128-gcm" "aes-256-gcm" "chacha20-ietf-poly1305"
-//   "2022-blake3-aes-128-gcm" "2022-blake3-aes-256-gcm"
-//   "2022-blake3-chacha20-poly1305"
-// CipherKind implements FromStr and lowercases its input.
+// CipherKind implements FromStr and lowercases its input. The
+// "2022-blake3-*" names exist in kind.rs but their FromStr arms are
+// #[cfg(feature = "v2")], reachable only via shadowsocks/aead-cipher-2022,
+// which D2 forbids. They are NOT offered — see the amendment note.
 ```
 
 ```rust
@@ -160,7 +181,7 @@ In `AuthMethod`, after `PresharedKey`:
 
 ```rust
     /// Shadowsocks. `method` is a cipher name as Shadowsocks spells it
-    /// (`aes-256-gcm`, `2022-blake3-aes-256-gcm`); it is not secret. The
+    /// (`aes-256-gcm`, `chacha20-ietf-poly1305`); it is not secret. The
     /// password IS key material, hence a `SecretRef` — which is what makes
     /// the helper's ownership gate cover it with no new code.
     Shadowsocks {
@@ -362,9 +383,6 @@ const OFFERED: &[&str] = &[
     "aes-128-gcm",
     "aes-256-gcm",
     "chacha20-ietf-poly1305",
-    "2022-blake3-aes-128-gcm",
-    "2022-blake3-aes-256-gcm",
-    "2022-blake3-chacha20-poly1305",
 ];
 
 #[derive(Default)]
@@ -1276,9 +1294,6 @@ In `profile_editor.dart`, add state:
     'aes-128-gcm',
     'aes-256-gcm',
     'chacha20-ietf-poly1305',
-    '2022-blake3-aes-128-gcm',
-    '2022-blake3-aes-256-gcm',
-    '2022-blake3-chacha20-poly1305',
   ];
 ```
 
@@ -1477,7 +1492,7 @@ In `docker-compose.yml`:
   ss-rust:
     image: teddysun/shadowsocks-rust
     command: >
-      ssserver -s 0.0.0.0:8389 -k ${SS_PASSWORD} -m 2022-blake3-aes-256-gcm
+      ssserver -s 0.0.0.0:8389 -k ${SS_PASSWORD} -m chacha20-ietf-poly1305
     ports: ["127.0.0.1:8389:8389"]
     networks: [lios]
 ```
@@ -1489,10 +1504,10 @@ In the `Makefile`'s `up` target, before `docker compose up`:
 	SS_PASSWORD=$$(cat ss/conf/password) docker compose up -d --build
 ```
 
-**AEAD-2022 requires a base64 key of exact length for its cipher.** If
-`ss-rust` refuses the generated password, that is a real finding: record the
-requirement and generate a conforming key rather than switching cipher to make
-the error go away.
+**Both servers take the same plain password.** Neither cipher here imposes a
+key-length rule, so one generated password serves both. If either server
+refuses it, that is a real finding: record the requirement and generate a
+conforming key rather than switching cipher to make the error go away.
 
 - [ ] **Step 3: Bring it up and prove both answer**
 
@@ -1623,11 +1638,14 @@ async fn a_wrong_password_fails_at_connect() {
 
 #[tokio::test]
 #[ignore = "needs the fixture: make -C testing/docker up"]
-async fn connects_with_an_aead_2022_cipher() {
+async fn connects_to_the_rust_server_with_a_chacha_cipher() {
+    // The other implementation AND the other cipher family: libev on 8388
+    // speaks aes-256-gcm, rust on 8389 speaks chacha20-ietf-poly1305. If our
+    // cipher plumbing were hardcoded to one family this would catch it.
     let mut t = ShadowsocksTunnel::new();
-    t.connect(&profile(8389, "2022-blake3-aes-256-gcm"), &Pw(password()))
+    t.connect(&profile(8389, "chacha20-ietf-poly1305"), &Pw(password()))
         .await
-        .expect("the rust server must accept AEAD-2022");
+        .expect("the rust server must accept chacha20-ietf-poly1305");
 }
 ```
 
