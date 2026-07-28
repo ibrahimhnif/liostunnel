@@ -74,7 +74,7 @@ impl Session {
     pub fn connect_failed(&mut self, id: u64, e: &StartError) -> Vec<String> {
         self.connected = false;
         let kind = match e {
-            StartError::BadProfile
+            StartError::BadProfile(_)
             | StartError::BadRouteMode(_)
             | StartError::BadTunAddress
             | StartError::EnvSecretNotAllowed => ErrorKind::BadRequest,
@@ -90,8 +90,10 @@ impl Session {
             StartError::Tunnel(_) => ErrorKind::Internal,
         };
         // `e`'s Display is safe to send: every variant either carries no
-        // input at all or carries a path and uid. Task 6's tests pin that
-        // BadProfile does not acquire a payload later.
+        // input at all or carries a path and uid. `BadProfile` now carries a
+        // reason, but it is `&'static str` — a literal in `session.rs`, which
+        // no request can influence — and Task 6's echo tests still pin that
+        // the profile itself never comes back.
         vec![err(id, kind, &e.to_string())]
     }
 
@@ -522,6 +524,30 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
         assert_eq!(v["kind"], "bad_request");
         assert!(!s.is_connected());
+    }
+
+    #[test]
+    fn a_shadowsocks_probe_failure_is_not_reported_as_a_wrong_password() {
+        // Shadowsocks has no handshake, so `connect` proves the credentials
+        // with one relayed round trip — which means it can now fail for
+        // NETWORK reasons as well as credential ones. A probe that times out
+        // is `Transport`; a DoH resolver whose TLS failed through a
+        // proven-good relay is `Dns`. Neither means the password was wrong,
+        // and saying so sends the user to change a credential that works.
+        use liostunnel_core::TunnelError;
+        let mut s = sess();
+        let probe_failures = [
+            StartError::Tunnel(TunnelError::Transport(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "probe",
+            ))),
+            StartError::Tunnel(TunnelError::Dns("resolver refused the handshake".into())),
+        ];
+        for e in &probe_failures {
+            let out = s.connect_failed(3, e);
+            let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+            assert_eq!(v["kind"], "internal", "{e} was reported as {v}");
+        }
     }
 
     #[test]

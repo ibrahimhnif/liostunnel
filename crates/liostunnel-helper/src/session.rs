@@ -1,9 +1,9 @@
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use liostunnel_core::TunnelError;
-use liostunnel_core::config::profile::{DnsMode, ServerProfile};
+use liostunnel_core::config::profile::{DnsMode, ProtocolKind, ServerProfile};
 use liostunnel_core::config::secret::{Redacted, SecretRef};
 use liostunnel_core::dns::Resolver;
 use liostunnel_core::dns::over_https::DohResolver;
@@ -13,7 +13,8 @@ use liostunnel_core::net::smoltcp_stack::poll::SmoltcpStack;
 use liostunnel_core::net::tun::{TunConfig, TunDevice};
 use liostunnel_core::net::{NetStack, ShutdownHandle, StackConfig};
 use liostunnel_core::protocols::Protocol;
-use liostunnel_core::protocols::ssh::{HostKeyPolicy, SshTunnel};
+use liostunnel_core::protocols::shadowsocks::ShadowsocksTunnel;
+use liostunnel_core::protocols::ssh::{HostKeyPolicy, SshTunnel, pick_ipv4};
 use liostunnel_core::route::{
     RouteGuard, RouteMode, RoutePlan, platform_manager, reject_full_default_prefixes,
 };
@@ -23,10 +24,14 @@ use crate::auth::{self, AuthError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
-    /// Deliberately carries nothing. serde_json's Display quotes keys and
-    /// enum tags from the offending input, and that input is a profile.
-    #[error("profile is not valid")]
-    BadProfile,
+    /// Carries a FIXED reason and nothing derived from the input. serde_json's
+    /// Display quotes keys and enum tags from the offending input, and that
+    /// input is a profile — so the payload is `&'static str`, which cannot be
+    /// built from the request even by accident. It exists only so the gate can
+    /// name *which* rule refused, and every value it may take is a literal in
+    /// this file.
+    #[error("{0}")]
+    BadProfile(&'static str),
     #[error("{0}")]
     BadRouteMode(String),
     #[error("tun address is not a valid IPv4 address")]
@@ -159,35 +164,26 @@ impl Tunnel {
     /// than re-derives. Taking `Authorized` rather than `ConnectParams` makes
     /// "the gate ran first" a type-level fact instead of a convention.
     pub async fn start(auth: Authorized, paths: &HelperPaths) -> Result<Self, StartError> {
-        // 1. SSH before routes, so a failed handshake never leaves the machine
-        //    with routes pointing at an interface with nothing behind it.
+        // 1. The tunnel before routes, so a failed handshake never leaves the
+        //    machine with routes pointing at an interface with nothing behind
+        //    it.
         //
-        //    Host keys are verified against a root-owned store of the
-        //    daemon's own, never AcceptAny: the helper dials whatever host a
-        //    profile names, and accepting any key would turn it into a
-        //    machine-in-the-middle oracle for every profile it is given.
-        let policy = HostKeyPolicy::Verify {
-            known_hosts: paths.known_hosts.clone(),
-        };
         // Everything needed to diagnose a rejected login, and nothing that
         // would put a credential in a root-owned log that persists and gets
         // backed up. `RUST_LOG=liostunnel_helper=debug` turns it on.
         describe_connect_attempt(&auth.user, &auth.profile);
 
-        let mut ssh = SshTunnel::new(auth.user, policy);
-        // The secrets, not the paths. See `ResolvedSecrets`.
-        ssh.connect(&auth.profile, &auth.secrets).await?;
+        let (protocol, peer_addr) = connect_protocol(&auth, paths).await?;
 
-        // The address the SSH session actually reached, not a second
-        // independent lookup — a multi-A-record host could otherwise have the
-        // route pin a different peer than the one carrying the traffic.
-        let server_ip = ssh
-            .peer_addr()
-            .ok_or_else(|| {
-                TunnelError::Route("ssh session reports no peer address after connecting".into())
-            })?
-            .ip();
-        let protocol: Arc<dyn Protocol> = Arc::new(ssh);
+        // The address the *session* actually reached where the protocol can
+        // say so, and only otherwise a second independent lookup — a
+        // multi-A-record host could have the route pin a different peer than
+        // the one carrying the traffic. See `connect_protocol`'s doc: that
+        // `Option` is the P1b-6 finding, not an oversight.
+        let server_ip = match peer_addr {
+            Some(addr) => addr.ip(),
+            None => resolve_server_ip(&auth.profile).await?,
+        };
 
         // 2. TUN device.
         let tun = TunDevice::open(TunConfig {
@@ -333,8 +329,19 @@ impl Tunnel {
     ) -> Result<Authorized, StartError> {
         // Note the discarded error: serde_json's Display quotes keys and enum
         // tags from the input, and the input is a profile.
-        let profile: ServerProfile =
-            serde_json::from_str(&params.profile_json).map_err(|_| StartError::BadProfile)?;
+        let profile: ServerProfile = serde_json::from_str(&params.profile_json)
+            .map_err(|_| StartError::BadProfile("profile is not valid"))?;
+
+        // Refuse here rather than at connect: nothing privileged should
+        // happen for a protocol this build cannot speak. Written as an
+        // equality against the one unbuildable kind, not `!= Ssh` — the
+        // negative form silently refuses every protocol added after it, which
+        // is precisely the drift this slice exists to avoid.
+        if profile.protocol == ProtocolKind::WireGuard {
+            return Err(StartError::BadProfile(
+                "wireguard is not supported in this build",
+            ));
+        }
 
         let route_mode = parse_route_mode(&params.route_mode, &params.cidrs, params.capture_dns)?;
 
@@ -377,6 +384,87 @@ impl Tunnel {
             secrets: ResolvedSecrets(resolved),
         })
     }
+}
+
+/// Builds and connects whichever protocol the profile names.
+///
+/// THE ABSTRACTION TEST (spec §13, P1b-6). Everything protocol-specific lives
+/// inside an arm; anything that had to sit outside would be an SSH-shaped hole
+/// in `Protocol`, and is reported as such.
+///
+/// The `Option<SocketAddr>` in the return type is that hole, made explicit.
+/// `Protocol` exposes no peer address, so only a concrete `SshTunnel` can say
+/// which of a multi-A-record host's addresses its session actually reached —
+/// and the route that pins the server through the original gateway needs
+/// exactly that address. Returning `None` from an arm means "ask DNS again and
+/// hope it agrees", which is the dual-stack disagreement Phase 0's own comment
+/// warns about. It is expressed here rather than papered over by resolving for
+/// everyone, because resolving for everyone would silently give SSH the weaker
+/// guarantee too.
+///
+/// A free function rather than a method on `Tunnel` so the dispatch is
+/// reachable from a test: `Tunnel::start` needs a TUN device and root, this
+/// needs neither.
+async fn connect_protocol(
+    auth: &Authorized,
+    paths: &HelperPaths,
+) -> Result<(Arc<dyn Protocol>, Option<SocketAddr>), StartError> {
+    match auth.profile.protocol {
+        ProtocolKind::Ssh => {
+            // `HostKeyPolicy` lives in here, not in `start`'s body: it is
+            // meaningless for a protocol with no server identity, and leaving
+            // it in the shared path would be exactly the hole this slice
+            // exists to find.
+            //
+            // Host keys are verified against a root-owned store of the
+            // daemon's own, never AcceptAny: the helper dials whatever host a
+            // profile names, and accepting any key would turn it into a
+            // machine-in-the-middle oracle for every profile it is given.
+            let policy = HostKeyPolicy::Verify {
+                known_hosts: paths.known_hosts.clone(),
+            };
+            let mut ssh = SshTunnel::new(auth.user.clone(), policy);
+            // The secrets, not the paths. See `ResolvedSecrets`.
+            ssh.connect(&auth.profile, &auth.secrets).await?;
+            let peer = ssh.peer_addr().ok_or_else(|| {
+                TunnelError::Route("ssh session reports no peer address after connecting".into())
+            })?;
+            Ok((Arc::new(ssh), Some(peer)))
+        }
+        ProtocolKind::Shadowsocks => {
+            let mut ss = ShadowsocksTunnel::new();
+            // Not just "a socket opened": this proves the credentials with one
+            // relayed round trip, because Shadowsocks has no handshake that
+            // would. It can therefore fail for network reasons as well as
+            // config ones — `dispatch::connect_failed` maps everything that is
+            // not `TunnelError::Auth` to `Internal`, so a probe timeout is
+            // never reported as a wrong password.
+            ss.connect(&auth.profile, &auth.secrets).await?;
+            Ok((Arc::new(ss), None))
+        }
+        // Unreachable through the daemon: `authorize_params` refuses this
+        // before any privileged work. Kept because `start` is `pub` and the
+        // type system does not know that, and a fall-through to SSH here is
+        // the failure this arm exists to make impossible.
+        ProtocolKind::WireGuard => Err(StartError::BadProfile(
+            "wireguard is not supported in this build",
+        )),
+    }
+}
+
+/// Resolves the address to pin, for a protocol that cannot report the one it
+/// used.
+///
+/// `pick_ipv4` comes from `protocols::ssh` — the second half of the same
+/// finding. It is not SSH policy, it is the packet stack's IPv4-only
+/// constraint, and pinning an AAAA record the relay never used would send the
+/// tunnel's own traffic into the tunnel. Reused rather than re-implemented so
+/// the two paths cannot disagree about what "the server's address" means.
+async fn resolve_server_ip(profile: &ServerProfile) -> Result<IpAddr, StartError> {
+    let candidates = tokio::net::lookup_host((profile.host.as_str(), profile.port))
+        .await
+        .map_err(TunnelError::Transport)?;
+    Ok(pick_ipv4(candidates)?.ip())
 }
 
 /// Logs what a connection attempt is about to use.
@@ -443,7 +531,13 @@ fn describe_connect_attempt(user: &str, profile: &ServerProfile) {
             },
         };
         tracing::debug!(
-            ssh_user = %user,
+            // `user`, not `ssh_user`: this runs for every protocol now, and a
+            // Shadowsocks connect has no SSH user. The rest of the record —
+            // where the credential lives, its size, its mode, its owner, its
+            // trailing whitespace — diagnoses a Shadowsocks password exactly
+            // as well as an SSH one, which is why the call stays in the shared
+            // path rather than moving into the SSH arm.
+            user = %user,
             host = %profile.host,
             port = profile.port,
             auth = ?std::mem::discriminant(&profile.auth),
@@ -707,6 +801,165 @@ mod tests {
         let mut params = params_with_file_secret(&p);
         params.cidrs = vec!["0.0.0.0/0".into()];
         assert!(Tunnel::authorize_params(&params, me()).is_err());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// A profile document with the protocol, host and auth block varied and
+    /// everything else fixed. Only the three fields the factory dispatches on
+    /// and fails on ever differ between these tests.
+    fn profile_json(protocol: &str, host: &str, auth: &str) -> String {
+        format!(
+            r#"{{"id":"00000000-0000-0000-0000-000000000000","name":"t",
+                "protocol":"{protocol}","host":"{host}","port":22,
+                "auth":{auth},
+                "dns":["1.1.1.1"],"split_tunnel":{{"type":"all_traffic"}},
+                "kill_switch":false}}"#
+        )
+    }
+
+    const PASSWORD_AUTH: &str =
+        r#"{"type":"password","password":{"source":"file","path":"/tmp/lios-absent"}}"#;
+
+    fn shadowsocks_auth(path: &std::path::Path) -> String {
+        format!(
+            r#"{{"type":"shadowsocks","method":"aes-256-gcm",
+                 "password":{{"source":"file","path":"{}"}}}}"#,
+            path.display()
+        )
+    }
+
+    /// Params for a Shadowsocks profile whose password is `path`. Everything
+    /// but the profile document is identical to the SSH case on purpose: the
+    /// gate must not be able to tell them apart.
+    fn ss_params_with_file_secret(path: &std::path::Path) -> ConnectParams {
+        let mut p = params_with_file_secret(path);
+        p.profile_json = profile_json("shadowsocks", "127.0.0.1", &shadowsocks_auth(path));
+        p
+    }
+
+    /// An `Authorized` built directly rather than through the gate, so the
+    /// factory can be exercised on profiles the gate itself refuses — and with
+    /// no secrets at all, because every case below fails before one is read.
+    fn authorized(profile_json: &str) -> Authorized {
+        Authorized {
+            profile: serde_json::from_str(profile_json).expect("test profile must parse"),
+            user: "someone".into(),
+            route_mode: RouteMode::Default,
+            tun_address: "10.90.0.1".parse().unwrap(),
+            secrets: ResolvedSecrets::default(),
+        }
+    }
+
+    /// Pure path arithmetic — no file is created or read by these tests.
+    fn paths() -> HelperPaths {
+        HelperPaths::beside_socket(std::path::Path::new("/tmp/lios-factory-test.sock"))
+    }
+
+    #[tokio::test]
+    async fn a_shadowsocks_profile_gets_a_shadowsocks_tunnel() {
+        // The dispatch itself, with no network and no privilege: a Shadowsocks
+        // profile carrying SSH-shaped credentials is refused by
+        // `ShadowsocksTunnel::prepare` before it opens anything, and the
+        // wording is one only that type produces. An `SshTunnel` handed the
+        // same profile says "shadowsocks is not supported in this build"
+        // instead, so the assertion cannot be satisfied by the wrong arm.
+        let auth = authorized(&profile_json("shadowsocks", "127.0.0.1", PASSWORD_AUTH));
+        // let-else rather than `expect_err`, which needs the Ok type to be
+        // Debug: `Protocol` deliberately is not, because a Debug of a live
+        // tunnel is the last thing that should reach the helper's log.
+        let Err(err) = connect_protocol(&auth, &paths()).await else {
+            panic!("shadowsocks credentials are required");
+        };
+        assert!(
+            format!("{err}").contains("shadowsocks profile needs shadowsocks credentials"),
+            "the shadowsocks arm must have been taken: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ssh_profile_still_gets_an_ssh_tunnel() {
+        // The other half of the dispatch. `::1` is an IPv6 literal, so
+        // `lookup_host` answers from the literal parser without touching DNS
+        // and `SshTunnel` fails in `pick_ipv4` — a message only the SSH arm
+        // can produce, reached without a single socket. A `ShadowsocksTunnel`
+        // handed this profile would say it "cannot carry a Ssh profile".
+        let auth = authorized(&profile_json("ssh", "::1", PASSWORD_AUTH));
+        let Err(err) = connect_protocol(&auth, &paths()).await else {
+            panic!("the stack is IPv4-only");
+        };
+        let text = format!("{err}");
+        assert!(
+            text.contains("IPv6") && text.contains("IPv4-only"),
+            "the ssh arm must have been taken: {text}"
+        );
+        assert!(
+            !text.to_lowercase().contains("shadowsocks"),
+            "an ssh profile must not reach a shadowsocks tunnel: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_factory_refuses_wireguard_rather_than_falling_through() {
+        // Unreachable through the daemon — the gate refuses it first — but
+        // `start` is public and the type system does not know that. A
+        // fall-through to SSH here would dial a WireGuard endpoint with SSH.
+        let auth = authorized(&profile_json("wireguard", "127.0.0.1", PASSWORD_AUTH));
+        let Err(err) = connect_protocol(&auth, &paths()).await else {
+            panic!("wireguard is not built");
+        };
+        assert!(
+            matches!(err, StartError::BadProfile(_)) && format!("{err}").contains("wireguard"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_shadowsocks_password_the_caller_does_not_own_is_refused_by_the_same_rule() {
+        // A Shadowsocks password is a `SecretRef`, so the Phase 1a ownership
+        // gate covers it with NO new code — `secret_refs()` enumerates it and
+        // the one loop in `authorize_params` reads it. This test exists to
+        // keep it that way: a second rule for a second protocol is how the two
+        // drift, and the drift would be silent.
+        let d = scratch("ss-foreign-secret");
+        let p = owned_secret(&d);
+        let err = Tunnel::authorize_params(&ss_params_with_file_secret(&p), me().wrapping_add(1))
+            .expect_err("a shadowsocks password the caller does not own must be refused");
+        assert!(
+            matches!(err, StartError::SecretNotPermitted(_)),
+            "got {err:?}"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_shadowsocks_profile_the_caller_owns_passes_the_gate_untouched() {
+        // The other side of the same rule: refusing WireGuard by name must not
+        // become "refuse anything that is not SSH", which would leave
+        // Shadowsocks unreachable through the daemon while every SSH test
+        // stayed green.
+        let d = scratch("ss-own-secret");
+        let p = owned_secret(&d);
+        let ok = Tunnel::authorize_params(&ss_params_with_file_secret(&p), me())
+            .expect("a shadowsocks profile with an owned password must be accepted");
+        assert_eq!(ok.profile.protocol, ProtocolKind::Shadowsocks);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_wireguard_profile_is_refused_by_name() {
+        // The factory must reject what it cannot build, rather than falling
+        // through to SSH and producing a confusing failure much later.
+        let d = scratch("wg");
+        let p = owned_secret(&d);
+        let mut params = params_with_file_secret(&p);
+        params.profile_json = params
+            .profile_json
+            .replace(r#""protocol":"ssh""#, r#""protocol":"wireguard""#);
+        let err = Tunnel::authorize_params(&params, me()).expect_err("wireguard is not built");
+        assert!(
+            format!("{err}").to_lowercase().contains("wireguard"),
+            "name it: {err}"
+        );
         std::fs::remove_dir_all(&d).ok();
     }
 
