@@ -10,7 +10,9 @@ void main() {
   setUpAll(() async => await RustLib.init());
 
   test('an encoded request is one newline-free line', () async {
-    final line = await encodeRequest(req: RequestDto.disconnect(id: BigInt.from(4)));
+    final line = await encodeRequest(
+      req: RequestDto.disconnect(id: BigInt.from(4)),
+    );
     expect(line, isNot(contains('\n')));
     expect(line, contains('"type":"disconnect"'));
   });
@@ -32,7 +34,8 @@ void main() {
   test('an error decodes with a typed kind, not a string', () async {
     // The UI branches on this. A String would let a typo compile.
     final m = await decodeMessage(
-      line: '{"type":"error","id":9,"kind":"secret_not_permitted","message":"nope"}',
+      line:
+          '{"type":"error","id":9,"kind":"secret_not_permitted","message":"nope"}',
     );
     expect(m, isA<IncomingDto_Error>());
     expect((m as IncomingDto_Error).kind, ErrorKindDto.secretNotPermitted);
@@ -40,7 +43,8 @@ void main() {
 
   test('a stats event decodes with its counters', () async {
     final m = await decodeMessage(
-      line: '{"type":"stats","snapshot":{"bytes_up":10,"bytes_down":20,'
+      line:
+          '{"type":"stats","snapshot":{"bytes_up":10,"bytes_down":20,'
           '"active_flows":1,"flows_failed":0,"dns_queries":3}}',
     );
     expect(m, isA<IncomingDto_Stats>());

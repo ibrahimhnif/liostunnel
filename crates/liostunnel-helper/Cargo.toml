@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 liostunnel-core = { path = "../liostunnel-core" }
-liostunnel-ffi  = { path = "../liostunnel-ffi" }
+liostunnel_ffi  = { path = "../liostunnel-ffi" }
 ipnet.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -73,8 +73,9 @@ class ProfilesScreen extends StatelessWidget {
                   leading: const Icon(Icons.dns_outlined),
                   title: Text(dto.name),
                   subtitle: Text('${dto.host}:${dto.port} · ${dto.protocol}'),
-                  trailing:
-                      p.path == selectedPath ? const Icon(Icons.check) : null,
+                  trailing: p.path == selectedPath
+                      ? const Icon(Icons.check)
+                      : null,
                   onTap: () => onSelect(p),
                 );
               },

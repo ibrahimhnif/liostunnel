@@ -49,7 +49,10 @@ void main() {
     // thing that reads as success.
     final first = await echoProbe(
       input: const ProbeDto(
-        name: 'z', count: 1, items: [], choice: ProbeChoice.first(),
+        name: 'z',
+        count: 1,
+        items: [],
+        choice: ProbeChoice.first(),
       ),
     );
     expect(first.choice, isNot(isA<ProbeChoice_Second>()));

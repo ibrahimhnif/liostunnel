@@ -51,12 +51,12 @@ class ConnectionModel extends ChangeNotifier {
         // A banner that outlives its cause is worse than no banner.
         _lastFault = null;
       case StatsEvent(
-          :final bytesUp,
-          :final bytesDown,
-          :final activeFlows,
-          :final flowsFailed,
-          :final dnsQueries
-        ):
+        :final bytesUp,
+        :final bytesDown,
+        :final activeFlows,
+        :final flowsFailed,
+        :final dnsQueries,
+      ):
         _bytesUp = bytesUp;
         _bytesDown = bytesDown;
         _activeFlows = activeFlows;
@@ -74,15 +74,15 @@ class ConnectionModel extends ChangeNotifier {
       // Exhaustive over ErrorKindDto: a new variant in the protocol fails to
       // compile here rather than falling through to a generic message.
       HelperError(:final kind) => switch (kind) {
-          ErrorKindDto.versionMismatch => Fault.versionMismatch,
-          ErrorKindDto.unauthorized => Fault.unauthorized,
-          ErrorKindDto.secretNotPermitted => Fault.secretNotPermitted,
-          ErrorKindDto.alreadyConnected => Fault.alreadyConnected,
-          ErrorKindDto.notConnected => Fault.notConnected,
-          ErrorKindDto.authFailed => Fault.authFailed,
-          ErrorKindDto.badRequest => Fault.badRequest,
-          ErrorKindDto.internal => Fault.internal,
-        },
+        ErrorKindDto.versionMismatch => Fault.versionMismatch,
+        ErrorKindDto.unauthorized => Fault.unauthorized,
+        ErrorKindDto.secretNotPermitted => Fault.secretNotPermitted,
+        ErrorKindDto.alreadyConnected => Fault.alreadyConnected,
+        ErrorKindDto.notConnected => Fault.notConnected,
+        ErrorKindDto.authFailed => Fault.authFailed,
+        ErrorKindDto.badRequest => Fault.badRequest,
+        ErrorKindDto.internal => Fault.internal,
+      },
       _ => Fault.internal,
     };
     notifyListeners();
@@ -94,27 +94,27 @@ class ConnectionModel extends ChangeNotifier {
   /// contract; the wording is ours, and a UI that displayed the helper's text
   /// would break the first time that text changed.
   String? get userFacingError => switch (_lastFault) {
-        null => null,
-        Fault.helperNotInstalled =>
-          'The helper is not installed or not running. '
-              'Run packaging/install-helper.sh.',
-        Fault.notAuthorized =>
-          'You are not authorized to use the helper. It was installed '
-              'for a different user.',
-        Fault.versionMismatch =>
-          'The helper is out of date. Reinstall it to match this app.',
-        Fault.unauthorized => 'This user is not authorized to use the helper.',
-        Fault.secretNotPermitted =>
-          'That profile points at a key file you do not own. '
-              'The helper will not read it on your behalf.',
-        Fault.alreadyConnected =>
-          'A tunnel is already running. Disconnect it first.',
-        Fault.notConnected => 'No tunnel is running.',
-        Fault.authFailed => 'The server rejected the credentials.',
-        Fault.badRequest =>
-          'The helper rejected the request. Reinstall it and try again.',
-        Fault.internal => 'The helper hit an internal error. Check its log.',
-      };
+    null => null,
+    Fault.helperNotInstalled =>
+      'The helper is not installed or not running. '
+          'Run packaging/install-helper.sh.',
+    Fault.notAuthorized =>
+      'You are not authorized to use the helper. It was installed '
+          'for a different user.',
+    Fault.versionMismatch =>
+      'The helper is out of date. Reinstall it to match this app.',
+    Fault.unauthorized => 'This user is not authorized to use the helper.',
+    Fault.secretNotPermitted =>
+      'That profile points at a key file you do not own. '
+          'The helper will not read it on your behalf.',
+    Fault.alreadyConnected =>
+      'A tunnel is already running. Disconnect it first.',
+    Fault.notConnected => 'No tunnel is running.',
+    Fault.authFailed => 'The server rejected the credentials.',
+    Fault.badRequest =>
+      'The helper rejected the request. Reinstall it and try again.',
+    Fault.internal => 'The helper hit an internal error. Check its log.',
+  };
 
   void _zeroStats() {
     _bytesUp = BigInt.zero;

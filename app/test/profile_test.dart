@@ -37,14 +37,16 @@ void main() {
     expect(p.dnsMode, 'tcp');
   });
 
-  test('what reaches Dart describes where a secret lives, not what it is',
-      () async {
-    final p = await parseProfile(json: keyfile);
-    expect(p.authKind, 'private_key');
-    expect(p.authSecretSource, 'file:/home/u/.ssh/id_ed25519');
-    // Nothing on this object may be key material — it gets rendered on screen.
-    expect(p.toString(), isNot(contains('BEGIN')));
-  });
+  test(
+    'what reaches Dart describes where a secret lives, not what it is',
+    () async {
+      final p = await parseProfile(json: keyfile);
+      expect(p.authKind, 'private_key');
+      expect(p.authSecretSource, 'file:/home/u/.ssh/id_ed25519');
+      // Nothing on this object may be key material — it gets rendered on screen.
+      expect(p.toString(), isNot(contains('BEGIN')));
+    },
+  );
 
   test('a DoH profile carries its endpoint across', () async {
     final p = await parseProfile(json: keyfile);
@@ -70,13 +72,15 @@ void main() {
     expect(s, isNot(contains('\n')));
   });
 
-  test('an invalid profile throws rather than returning something empty',
-      () async {
-    // A silently-empty profile would show up in the list as a nameless entry
-    // that fails only at connect time.
-    await expectLater(
-      parseProfile(json: '{"protocol":"nonsense"}'),
-      throwsA(anything),
-    );
-  });
+  test(
+    'an invalid profile throws rather than returning something empty',
+    () async {
+      // A silently-empty profile would show up in the list as a nameless entry
+      // that fails only at connect time.
+      await expectLater(
+        parseProfile(json: '{"protocol":"nonsense"}'),
+        throwsA(anything),
+      );
+    },
+  );
 }

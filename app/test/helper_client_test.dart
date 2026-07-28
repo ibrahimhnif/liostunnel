@@ -34,13 +34,13 @@ class FakeHelper {
           .transform(utf8.decoder)
           .transform(const LineSplitter())
           .listen((line) {
-        received.add(line);
-        final msg = jsonDecode(line) as Map<String, dynamic>;
-        sock.write('${jsonEncode({"type": "ack", "id": msg["id"]})}\n');
-        for (final p in _toPush) {
-          sock.write('$p\n');
-        }
-      });
+            received.add(line);
+            final msg = jsonDecode(line) as Map<String, dynamic>;
+            sock.write('${jsonEncode({"type": "ack", "id": msg["id"]})}\n');
+            for (final p in _toPush) {
+              sock.write('$p\n');
+            }
+          });
     });
   }
 
@@ -95,7 +95,7 @@ void main() {
         "active_flows": 1,
         "flows_failed": 0,
         "dns_queries": 3,
-      }
+      },
     });
     final helper = FakeHelper(path, push: [stats]);
     await helper.start();
@@ -122,26 +122,29 @@ void main() {
     final addr = InternetAddress(path, type: InternetAddressType.unix);
     final server = await ServerSocket.bind(addr, 0);
     final sub = server.listen((s) {
-      s.cast<List<int>>().transform(utf8.decoder).transform(const LineSplitter()).listen((line) {
-        final id = jsonDecode(line)['id'];
-        s.write('${jsonEncode({
-              "type": "error",
-              "id": id,
-              "kind": "version_mismatch",
-              "message": "helper speaks v1",
-            })}\n');
-      });
+      s
+          .cast<List<int>>()
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .listen((line) {
+            final id = jsonDecode(line)['id'];
+            s.write(
+              '${jsonEncode({"type": "error", "id": id, "kind": "version_mismatch", "message": "helper speaks v1"})}\n',
+            );
+          });
     });
 
     final client = HelperClient();
     await client.connect(path);
     await expectLater(
       client.hello(),
-      throwsA(isA<HelperError>().having(
-        (e) => e.kind,
-        'kind',
-        ErrorKindDto.versionMismatch,
-      )),
+      throwsA(
+        isA<HelperError>().having(
+          (e) => e.kind,
+          'kind',
+          ErrorKindDto.versionMismatch,
+        ),
+      ),
     );
 
     await client.close();
@@ -152,38 +155,43 @@ void main() {
     } catch (_) {}
   });
 
-  test('connecting to a missing socket reports the helper is not installed',
-      () async {
-    final client = HelperClient();
-    await expectLater(
-      client.connect('${Directory.systemTemp.path}/definitely-not-here.sock'),
-      throwsA(isA<HelperUnavailable>()),
-    );
-  });
+  test(
+    'connecting to a missing socket reports the helper is not installed',
+    () async {
+      final client = HelperClient();
+      await expectLater(
+        client.connect('${Directory.systemTemp.path}/definitely-not-here.sock'),
+        throwsA(isA<HelperUnavailable>()),
+      );
+    },
+  );
 
-  test('a socket the user cannot open reports unauthorized, not missing',
-      () async {
-    // Spec §10 lists "socket permission denied" as its own case. It means the
-    // helper is installed but this user is not authorized — the opposite
-    // advice from "helper not installed", so the two must not collapse.
-    final path = sock('noperm');
-    try {
-      File(path).deleteSync();
-    } catch (_) {}
-    final addr = InternetAddress(path, type: InternetAddressType.unix);
-    final server = await ServerSocket.bind(addr, 0);
-    final sub = server.listen((_) {});
-    await Process.run('chmod', ['000', path]);
+  test(
+    'a socket the user cannot open reports unauthorized, not missing',
+    () async {
+      // Spec §10 lists "socket permission denied" as its own case. It means the
+      // helper is installed but this user is not authorized — the opposite
+      // advice from "helper not installed", so the two must not collapse.
+      final path = sock('noperm');
+      try {
+        File(path).deleteSync();
+      } catch (_) {}
+      final addr = InternetAddress(path, type: InternetAddressType.unix);
+      final server = await ServerSocket.bind(addr, 0);
+      final sub = server.listen((_) {});
+      await Process.run('chmod', ['000', path]);
 
-    final client = HelperClient();
-    await expectLater(client.connect(path), throwsA(isA<HelperForbidden>()));
+      final client = HelperClient();
+      await expectLater(client.connect(path), throwsA(isA<HelperForbidden>()));
 
-    await sub.cancel();
-    await server.close();
-    try {
-      File(path).deleteSync();
-    } catch (_) {}
-  }, skip: isRoot ? 'root bypasses file permission bits' : null);
+      await sub.cancel();
+      await server.close();
+      try {
+        File(path).deleteSync();
+      } catch (_) {}
+    },
+    skip: isRoot ? 'root bypasses file permission bits' : null,
+  );
 
   test('a partial line is buffered until its newline arrives', () async {
     // Framing regression: JSON split across socket reads must not be parsed
@@ -243,40 +251,45 @@ void main() {
     } catch (_) {}
   });
 
-  test('the helper dying mid-session surfaces as a disconnect, not a hang',
-      () async {
-    // The UI must not sit on "Connected" forever after the daemon dies.
-    final path = sock('death');
-    try {
-      File(path).deleteSync();
-    } catch (_) {}
-    final addr = InternetAddress(path, type: InternetAddressType.unix);
-    final server = await ServerSocket.bind(addr, 0);
-    final sub = server.listen((s) async {
-      s.write('{"type":"state","state":"Connected"}\n');
-      await Future.delayed(const Duration(milliseconds: 50));
-      await s.close();
-    });
+  test(
+    'the helper dying mid-session surfaces as a disconnect, not a hang',
+    () async {
+      // The UI must not sit on "Connected" forever after the daemon dies.
+      final path = sock('death');
+      try {
+        File(path).deleteSync();
+      } catch (_) {}
+      final addr = InternetAddress(path, type: InternetAddressType.unix);
+      final server = await ServerSocket.bind(addr, 0);
+      final sub = server.listen((s) async {
+        s.write('{"type":"state","state":"Connected"}\n');
+        await Future.delayed(const Duration(milliseconds: 50));
+        await s.close();
+      });
 
-    final client = HelperClient(retryDelay: const Duration(milliseconds: 20));
-    final states = <String>[];
-    await client.connect(path);
-    client.events.listen((e) {
-      if (e is StateEvent) states.add(e.state);
-    });
-    await Future.delayed(const Duration(milliseconds: 400));
+      final client = HelperClient(retryDelay: const Duration(milliseconds: 20));
+      final states = <String>[];
+      await client.connect(path);
+      client.events.listen((e) {
+        if (e is StateEvent) states.add(e.state);
+      });
+      await Future.delayed(const Duration(milliseconds: 400));
 
-    expect(states, contains('Connected'));
-    expect(states, contains('Disconnected'),
-        reason: 'a dropped socket must produce a Disconnected state event');
+      expect(states, contains('Connected'));
+      expect(
+        states,
+        contains('Disconnected'),
+        reason: 'a dropped socket must produce a Disconnected state event',
+      );
 
-    await client.close();
-    await sub.cancel();
-    await server.close();
-    try {
-      File(path).deleteSync();
-    } catch (_) {}
-  });
+      await client.close();
+      await sub.cancel();
+      await server.close();
+      try {
+        File(path).deleteSync();
+      } catch (_) {}
+    },
+  );
 
   test('an in-flight request fails when the socket drops', () async {
     // Otherwise the future never completes and the connect button spins
@@ -326,8 +339,11 @@ void main() {
 
     await reconnected.timeout(const Duration(seconds: 5));
     expect(second.received.length, greaterThanOrEqualTo(1));
-    expect(jsonDecode(second.received.first)['type'], 'hello',
-        reason: 'a reconnect must re-handshake');
+    expect(
+      jsonDecode(second.received.first)['type'],
+      'hello',
+      reason: 'a reconnect must re-handshake',
+    );
 
     await client.close();
     await second.stop();

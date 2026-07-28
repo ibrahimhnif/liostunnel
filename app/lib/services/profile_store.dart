@@ -39,12 +39,13 @@ class ProfileStore {
     final dir = Directory(directory);
     if (!dir.existsSync()) return const [];
 
-    final files = dir
-        .listSync()
-        .whereType<File>()
-        .where((f) => f.path.endsWith('.json'))
-        .toList()
-      ..sort((a, b) => a.path.compareTo(b.path));
+    final files =
+        dir
+            .listSync()
+            .whereType<File>()
+            .where((f) => f.path.endsWith('.json'))
+            .toList()
+          ..sort((a, b) => a.path.compareTo(b.path));
 
     final out = <LoadedProfile>[];
     for (final f in files) {

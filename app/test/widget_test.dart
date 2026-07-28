@@ -21,9 +21,9 @@ const sample = '''
 ''';
 
 Widget wrap(ConnectionModel m, Widget child) => ChangeNotifierProvider.value(
-      value: m,
-      child: MaterialApp(home: child),
-    );
+  value: m,
+  child: MaterialApp(home: child),
+);
 
 /// Built directly rather than through the FFI.
 ///
@@ -55,71 +55,88 @@ void main() {
 
   testWidgets('the button reads Connect when disconnected', (tester) async {
     final m = ConnectionModel();
-    await tester.pumpWidget(wrap(
-      m,
-      ConnectionScreen(
-        selected: aProfile,
-        onConnect: () {},
-        onDisconnect: () {},
+    await tester.pumpWidget(
+      wrap(
+        m,
+        ConnectionScreen(
+          selected: aProfile,
+          onConnect: () {},
+          onDisconnect: () {},
+        ),
       ),
-    ));
+    );
     expect(find.text('Connect'), findsOneWidget);
     expect(find.text('Disconnect'), findsNothing);
   });
 
   testWidgets('the button reads Disconnect once connected', (tester) async {
     final m = ConnectionModel()..applyEvent(const StateEvent('Connected'));
-    await tester.pumpWidget(wrap(
-      m,
-      ConnectionScreen(
-        selected: aProfile,
-        onConnect: () {},
-        onDisconnect: () {},
+    await tester.pumpWidget(
+      wrap(
+        m,
+        ConnectionScreen(
+          selected: aProfile,
+          onConnect: () {},
+          onDisconnect: () {},
+        ),
       ),
-    ));
+    );
     expect(find.text('Disconnect'), findsOneWidget);
   });
 
-  testWidgets('the button is disabled with no profile selected',
-      (tester) async {
+  testWidgets('the button is disabled with no profile selected', (
+    tester,
+  ) async {
     // A connect with nothing selected can only produce an error the user
     // cannot act on.
-    await tester.pumpWidget(wrap(
-      ConnectionModel(),
-      ConnectionScreen(selected: null, onConnect: () {}, onDisconnect: () {}),
-    ));
-    final button = tester.widget<FilledButton>(find.byKey(const Key('connect-button')));
+    await tester.pumpWidget(
+      wrap(
+        ConnectionModel(),
+        ConnectionScreen(selected: null, onConnect: () {}, onDisconnect: () {}),
+      ),
+    );
+    final button = tester.widget<FilledButton>(
+      find.byKey(const Key('connect-button')),
+    );
     expect(button.onPressed, isNull);
   });
 
   testWidgets('no error banner when nothing has gone wrong', (tester) async {
-    await tester.pumpWidget(wrap(
-      ConnectionModel(),
-      ConnectionScreen(selected: null, onConnect: () {}, onDisconnect: () {}),
-    ));
+    await tester.pumpWidget(
+      wrap(
+        ConnectionModel(),
+        ConnectionScreen(selected: null, onConnect: () {}, onDisconnect: () {}),
+      ),
+    );
     expect(find.byKey(const Key('error-banner')), findsNothing);
   });
 
-  testWidgets('a fault shows our wording, never the helper\'s message',
-      (tester) async {
+  testWidgets('a fault shows our wording, never the helper\'s message', (
+    tester,
+  ) async {
     final m = ConnectionModel()
       ..applyError(const HelperUnavailable('ENOENT from the socket layer'));
-    await tester.pumpWidget(wrap(
-      m,
-      ConnectionScreen(selected: null, onConnect: () {}, onDisconnect: () {}),
-    ));
+    await tester.pumpWidget(
+      wrap(
+        m,
+        ConnectionScreen(selected: null, onConnect: () {}, onDisconnect: () {}),
+      ),
+    );
     expect(find.byKey(const Key('error-banner')), findsOneWidget);
     expect(find.textContaining('not installed'), findsOneWidget);
     expect(find.textContaining('ENOENT'), findsNothing);
   });
 
-  testWidgets('the banner clears once the helper reports a state',
-      (tester) async {
+  testWidgets('the banner clears once the helper reports a state', (
+    tester,
+  ) async {
     final m = ConnectionModel()..applyError(const HelperUnavailable());
-    await tester.pumpWidget(wrap(
-      m,
-      ConnectionScreen(selected: null, onConnect: () {}, onDisconnect: () {}),
-    ));
+    await tester.pumpWidget(
+      wrap(
+        m,
+        ConnectionScreen(selected: null, onConnect: () {}, onDisconnect: () {}),
+      ),
+    );
     expect(find.byKey(const Key('error-banner')), findsOneWidget);
     m.applyEvent(const StateEvent('Connected'));
     await tester.pump();
@@ -128,57 +145,70 @@ void main() {
 
   testWidgets('stats render as they arrive', (tester) async {
     final m = ConnectionModel()..applyEvent(const StateEvent('Connected'));
-    await tester.pumpWidget(wrap(
-      m,
-      ConnectionScreen(selected: null, onConnect: () {}, onDisconnect: () {}),
-    ));
-    m.applyEvent(StatsEvent(
-      bytesUp: BigInt.from(2048),
-      bytesDown: BigInt.from(4096),
-      activeFlows: 3,
-      flowsFailed: BigInt.zero,
-      dnsQueries: BigInt.from(11),
-    ));
+    await tester.pumpWidget(
+      wrap(
+        m,
+        ConnectionScreen(selected: null, onConnect: () {}, onDisconnect: () {}),
+      ),
+    );
+    m.applyEvent(
+      StatsEvent(
+        bytesUp: BigInt.from(2048),
+        bytesDown: BigInt.from(4096),
+        activeFlows: 3,
+        flowsFailed: BigInt.zero,
+        dnsQueries: BigInt.from(11),
+      ),
+    );
     await tester.pump();
     expect(find.text('2.0 KiB'), findsOneWidget);
     expect(find.text('4.0 KiB'), findsOneWidget);
     expect(find.text('3'), findsOneWidget);
   });
 
-  testWidgets('the list renders a profile as name, host, port and protocol',
-      (tester) async {
+  testWidgets('the list renders a profile as name, host, port and protocol', (
+    tester,
+  ) async {
     // Rendering only. That the DTO came from parse_profile rather than a Dart
     // reimplementation — P1a-1 — is proven by the store test below and by
     // profile_test.dart, not here.
     const loaded = aProfile;
-    await tester.pumpWidget(MaterialApp(
-      home: ProfilesScreen(
-        profiles: [loaded],
-        directory: '/tmp/whatever',
-        selectedPath: null,
-        onSelect: (_) {},
-        onReload: () {},
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ProfilesScreen(
+          profiles: [loaded],
+          directory: '/tmp/whatever',
+          selectedPath: null,
+          onSelect: (_) {},
+          onReload: () {},
+        ),
       ),
-    ));
+    );
     expect(find.text('Home VPS'), findsOneWidget);
     expect(find.text('198.51.100.7:22 · ssh'), findsOneWidget);
   });
 
-  testWidgets('an unreadable profile is shown as broken, not hidden',
-      (tester) async {
+  testWidgets('an unreadable profile is shown as broken, not hidden', (
+    tester,
+  ) async {
     // A profile that silently vanishes from the list looks the same as one
     // the user never saved.
-    await tester.pumpWidget(MaterialApp(
-      home: ProfilesScreen(
-        profiles: const [
-          LoadedProfile(path: '/tmp/broken.json', error: 'not a valid profile'),
-        ],
-        directory: '/tmp/whatever',
-        selectedPath: null,
-        onSelect: (_) {},
-        onReload: () {},
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ProfilesScreen(
+          profiles: const [
+            LoadedProfile(
+              path: '/tmp/broken.json',
+              error: 'not a valid profile',
+            ),
+          ],
+          directory: '/tmp/whatever',
+          selectedPath: null,
+          onSelect: (_) {},
+          onReload: () {},
+        ),
       ),
-    ));
+    );
     expect(find.text('broken.json'), findsOneWidget);
     expect(find.text('not a valid profile'), findsOneWidget);
   });
@@ -186,30 +216,35 @@ void main() {
   testWidgets('tapping a profile selects it', (tester) async {
     LoadedProfile? picked;
     const loaded = aProfile;
-    await tester.pumpWidget(MaterialApp(
-      home: ProfilesScreen(
-        profiles: [loaded],
-        directory: '/tmp/whatever',
-        selectedPath: null,
-        onSelect: (p) => picked = p,
-        onReload: () {},
+    await tester.pumpWidget(
+      MaterialApp(
+        home: ProfilesScreen(
+          profiles: [loaded],
+          directory: '/tmp/whatever',
+          selectedPath: null,
+          onSelect: (p) => picked = p,
+          onReload: () {},
+        ),
       ),
-    ));
+    );
     await tester.tap(find.text('Home VPS'));
     expect(picked?.path, loaded.path);
   });
 
-  testWidgets('an empty profiles directory says where to put one',
-      (tester) async {
-    await tester.pumpWidget(const MaterialApp(
-      home: ProfilesScreen(
-        profiles: [],
-        directory: '/somewhere/.liostunnel',
-        selectedPath: null,
-        onSelect: _ignore,
-        onReload: _noop,
+  testWidgets('an empty profiles directory says where to put one', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      const MaterialApp(
+        home: ProfilesScreen(
+          profiles: [],
+          directory: '/somewhere/.liostunnel',
+          selectedPath: null,
+          onSelect: _ignore,
+          onReload: _noop,
+        ),
       ),
-    ));
+    );
     expect(find.textContaining('/somewhere/.liostunnel'), findsOneWidget);
   });
 
@@ -234,8 +269,9 @@ void main() {
   });
 
   test('a missing profiles directory is empty, not an error', () async {
-    final loaded =
-        await ProfileStore(directory: '/nonexistent/lios-profiles').load();
+    final loaded = await ProfileStore(
+      directory: '/nonexistent/lios-profiles',
+    ).load();
     expect(loaded, isEmpty);
   });
 }

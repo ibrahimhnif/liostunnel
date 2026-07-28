@@ -23,13 +23,15 @@ void main() {
 
   test('a stats event updates counters', () {
     final m = ConnectionModel();
-    m.applyEvent(StatsEvent(
-      bytesUp: BigInt.from(5),
-      bytesDown: BigInt.from(9),
-      activeFlows: 2,
-      flowsFailed: BigInt.one,
-      dnsQueries: BigInt.from(4),
-    ));
+    m.applyEvent(
+      StatsEvent(
+        bytesUp: BigInt.from(5),
+        bytesDown: BigInt.from(9),
+        activeFlows: 2,
+        flowsFailed: BigInt.one,
+        dnsQueries: BigInt.from(4),
+      ),
+    );
     expect(m.bytesUp, BigInt.from(5));
     expect(m.activeFlows, 2);
     expect(m.dnsQueries, BigInt.from(4));
@@ -37,10 +39,12 @@ void main() {
 
   test('a helper refusal is surfaced by kind, not message text', () {
     final m = ConnectionModel();
-    m.applyError(const HelperError(
-      ErrorKindDto.versionMismatch,
-      'helper speaks v1, client speaks v2',
-    ));
+    m.applyError(
+      const HelperError(
+        ErrorKindDto.versionMismatch,
+        'helper speaks v1, client speaks v2',
+      ),
+    );
     expect(m.lastFault, Fault.versionMismatch);
     // The UI decides its own wording from the kind; the helper's message is
     // diagnostic only and is never rendered.
@@ -70,8 +74,11 @@ void main() {
       expect(m.lastFault, isNotNull, reason: '$k produced no fault');
       seen.add(m.lastFault!);
     }
-    expect(seen.length, ErrorKindDto.values.length,
-        reason: 'two kinds collapsed onto one fault');
+    expect(
+      seen.length,
+      ErrorKindDto.values.length,
+      reason: 'two kinds collapsed onto one fault',
+    );
   });
 
   test('every fault has wording the user can act on', () {
@@ -87,20 +94,25 @@ void main() {
     final m = ConnectionModel()..applyError(const HelperUnavailable());
     expect(m.lastFault, isNotNull);
     m.applyEvent(const StateEvent('Connected'));
-    expect(m.lastFault, isNull,
-        reason: 'a stale banner outlives the problem it named');
+    expect(
+      m.lastFault,
+      isNull,
+      reason: 'a stale banner outlives the problem it named',
+    );
   });
 
   test('disconnecting zeroes the stats rather than freezing them', () {
     // Numbers left on screen after a tunnel stops read as live traffic.
     final m = ConnectionModel()
-      ..applyEvent(StatsEvent(
-        bytesUp: BigInt.from(100),
-        bytesDown: BigInt.from(200),
-        activeFlows: 3,
-        flowsFailed: BigInt.zero,
-        dnsQueries: BigInt.from(7),
-      ))
+      ..applyEvent(
+        StatsEvent(
+          bytesUp: BigInt.from(100),
+          bytesDown: BigInt.from(200),
+          activeFlows: 3,
+          flowsFailed: BigInt.zero,
+          dnsQueries: BigInt.from(7),
+        ),
+      )
       ..applyEvent(const StateEvent('Disconnected'));
     expect(m.bytesUp, BigInt.zero);
     expect(m.activeFlows, 0);

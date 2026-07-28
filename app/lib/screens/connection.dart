@@ -50,8 +50,10 @@ class ConnectionScreen extends StatelessWidget {
               style: Theme.of(context).textTheme.titleLarge,
             ),
             if (dto != null)
-              Text('${dto.host}:${dto.port} · ${dto.protocol}',
-                  style: Theme.of(context).textTheme.bodySmall),
+              Text(
+                '${dto.host}:${dto.port} · ${dto.protocol}',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
             const SizedBox(height: 20),
             Row(
               children: [
@@ -102,9 +104,12 @@ class _StatRow extends StatelessWidget {
       child: Row(
         children: [
           SizedBox(width: 140, child: Text(label)),
-          Text(value, style: const TextStyle(fontFeatures: [
-            FontFeature.tabularFigures(),
-          ])),
+          Text(
+            value,
+            style: const TextStyle(
+              fontFeatures: [FontFeature.tabularFigures()],
+            ),
+          ),
         ],
       ),
     );

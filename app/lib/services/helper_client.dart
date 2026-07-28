@@ -142,19 +142,21 @@ class HelperClient {
       case IncomingDto_State(:final state):
         _events.add(StateEvent(state));
       case IncomingDto_Stats(
-          :final bytesUp,
-          :final bytesDown,
-          :final activeFlows,
-          :final flowsFailed,
-          :final dnsQueries
-        ):
-        _events.add(StatsEvent(
-          bytesUp: bytesUp,
-          bytesDown: bytesDown,
-          activeFlows: activeFlows,
-          flowsFailed: flowsFailed,
-          dnsQueries: dnsQueries,
-        ));
+        :final bytesUp,
+        :final bytesDown,
+        :final activeFlows,
+        :final flowsFailed,
+        :final dnsQueries,
+      ):
+        _events.add(
+          StatsEvent(
+            bytesUp: bytesUp,
+            bytesDown: bytesDown,
+            activeFlows: activeFlows,
+            flowsFailed: flowsFailed,
+            dnsQueries: dnsQueries,
+          ),
+        );
     }
   }
 

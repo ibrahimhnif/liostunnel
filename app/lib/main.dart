@@ -83,16 +83,18 @@ class _HomePageState extends State<HomePage> {
     final selected = _selected;
     if (selected?.profile == null) return;
     try {
-      await _client.sendConnect(ConnectParamsDto(
-        // The helper re-parses this itself, after authorizing the caller, so
-        // the document is passed through rather than reconstructed.
-        profileJson: File(selected!.path).readAsStringSync(),
-        user: Platform.environment['USER'] ?? '',
-        routeMode: 'default',
-        cidrs: const [],
-        captureDns: true,
-        tunAddress: '10.90.0.1',
-      ));
+      await _client.sendConnect(
+        ConnectParamsDto(
+          // The helper re-parses this itself, after authorizing the caller, so
+          // the document is passed through rather than reconstructed.
+          profileJson: File(selected!.path).readAsStringSync(),
+          user: Platform.environment['USER'] ?? '',
+          routeMode: 'default',
+          cidrs: const [],
+          captureDns: true,
+          tunAddress: '10.90.0.1',
+        ),
+      );
     } catch (e) {
       model.applyError(e);
     }
@@ -140,7 +142,10 @@ class _HomePageState extends State<HomePage> {
         onDestinationSelected: (i) => setState(() => _tab = i),
         destinations: const [
           NavigationDestination(icon: Icon(Icons.list), label: 'Profiles'),
-          NavigationDestination(icon: Icon(Icons.vpn_lock), label: 'Connection'),
+          NavigationDestination(
+            icon: Icon(Icons.vpn_lock),
+            label: 'Connection',
+          ),
         ],
       ),
     );
