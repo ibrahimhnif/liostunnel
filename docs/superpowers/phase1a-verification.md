@@ -14,22 +14,28 @@ per platform is worth less than one that means nothing.
 | | Linux | macOS |
 |---|---|---|
 | P1a-1 — profiles parsed through FRB, not Dart | ✅ | ✅ |
-| P1a-2 — connect brings up a real tunnel and traffic flows | ✅ | ✅ in use, script re-run pending |
-| P1a-3 — stats update live while traffic moves | ✅ | ✅ in use, script re-run pending |
+| P1a-2 — connect brings up a real tunnel and traffic flows | ✅ | ✅ |
+| P1a-3 — stats update live while traffic moves | ✅ | ✅ |
 | P1a-4 — the tunnel outlives the UI | ✅ | ✅ |
 | P1a-5 — an unauthorized uid is refused | ✅ | ✅ |
 | P1a-6 — a secret the caller does not own is refused | ✅ | ✅ |
 | P1a-7 — a version-mismatched client fails cleanly | ✅ | ✅ |
 
-**Linux: 14 checks, 0 failures.**
+**14 checks, 0 failures, on both platforms.**
 
-macOS was 12 of 14 when this was first written, with P1a-2 and P1a-3 blocked
-by the double-framing defect described below. That defect is fixed, and the
-tunnel has since been observed carrying real traffic on macOS through the app
-— a live SSH session to a remote server, with the helper logging DNS activity
-over it. **The verification script has not been re-run there since the fix**,
-so those two rows are reported as observed rather than as measured. Run
-`sudo ./testing/verify-phase1a.sh` to close them properly.
+The two runs agree on the numbers, which is worth more than either alone:
+
+| | bytes_up | bytes_down | fetches |
+|---|---|---|---|
+| Linux | 468 | 1156 | 4/4 |
+| macOS | 464 | 1156 | 4/4 |
+
+Four bytes apart, which is the length of the shorter `Host:` header. Two
+independent kernels, two TUN implementations and two routing layers arriving
+at the same byte counts is corroboration a passing tally cannot manufacture.
+
+macOS was 12 of 14 when this was first written, blocked by the double-framing
+defect below.
 
 P1a-1 is covered by the automated suites rather than this script: 9 Dart tests
 parse real profile documents through the FFI, and the widget tests render what
@@ -42,13 +48,17 @@ entered the tunnel and vanished", so the run captures on the tunnel device
 while it fetches:
 
 ```
-10.90.0.1.47022 > 192.168.158.3.80: Flags [S],  seq 1074111891
-192.168.158.3.80 > 10.90.0.1.47022: Flags [S.], seq 986182308, ack 1074111892
-10.90.0.1.47022 > 192.168.158.3.80: Flags [P.], length 117: HTTP: GET / HTTP/1.1
-192.168.158.3.80 > 10.90.0.1.47022: Flags [P.], length 231: HTTP: HTTP/1.1 200 OK
+# macOS, utun9
+10.90.0.1.56676 > 192.168.158.3.80: Flags [SEW], seq 3765070832
+192.168.158.3.80 > 10.90.0.1.56676: Flags [S.],  seq 3668317105, ack 3765070833
+10.90.0.1.56676 > 192.168.158.3.80: Flags [P.], length 116: HTTP: GET / HTTP/1.1
+192.168.158.3.80 > 10.90.0.1.56676: Flags [P.], length 231: HTTP: HTTP/1.1 200 OK
 
-stats after traffic: {'bytes_up': 468, 'bytes_down': 1156, ...}
+stats after traffic: {'bytes_up': 464, 'bytes_down': 1156, 'active_flows': 0}
 ```
+
+`active_flows: 0` afterwards matters as much as the bytes: the flows closed
+rather than accumulating.
 
 Source `10.90.0.1` is the TUN address, so those packets can only have crossed
 the tunnel. The target is routed as a `/32`, which beats the container's `/24`
@@ -150,6 +160,26 @@ three of them reported green over a real failure:
 - **`stat -f` means "filesystem status" on Linux** and succeeds, so a
   `stat -f ... || stat -c ...` fallback never fired and a wall of filesystem
   statistics was compared against a uid.
+- **P1a-3's own assertion was an `or`.** `bytes_up` alone satisfied it, and
+  bytes going *up* only prove data was pushed at the tunnel, never that it
+  arrived anywhere. A macOS run with four timed-out fetches, `bytes_down: 0`
+  and 83 stalled flows reported `14 passed, 0 failed`. It now requires a fetch
+  that returned *and* bytes coming back.
+- **The default target was a public DNS resolver.** On a machine using
+  `1.1.1.1` as its nameserver, routing it through the tunnel sends every DNS
+  query on the box into a tunnel whose own resolver is that same address —
+  which is where those 83 flows came from. The target is now the fixture's
+  own nginx.
+- **The first A/B of that fix was itself invalid**: `verify-linux.sh` passed
+  `-e LIOS_TARGET` unconditionally, so both arms ran against the working
+  target and both passed.
+
+The count is worth stating plainly: this harness found five real defects in
+the product and produced six of its own, and every one of its own was a green
+result over something that had not been tested. It kept finding the class in
+the code while committing it in the tests. The only thing that reliably caught
+it was measurement — byte counters and packet captures — never an assertion
+reading its own output.
 
 ## Scope notes
 
