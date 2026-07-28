@@ -979,23 +979,66 @@ pub struct Listener {
     inner: UnixListener,
     path: PathBuf,
     authorized_uid: u32,
+    /// Identity of the socket file we bound, so Drop never removes someone
+    /// else's. Taken with `stat` on the path, NOT `fstat` on the descriptor:
+    /// for an AF_UNIX socket, fstat returns the socket's own kernel inode,
+    /// unrelated to the directory entry. Measured on macOS — fstat gave
+    /// dev=-1 ino=529782 where stat gave dev=16777231 ino=66740537.
+    id: FileId,
+    /// Released on drop, after which another helper may take this path.
+    _lock: PathLock,
 }
 
 impl Listener {
     pub fn bind(path: &Path, authorized_uid: u32) -> std::io::Result<Self> {
-        // A crash leaves the socket file behind and bind(2) then fails with
-        // EADDRINUSE forever. Remove it first; the permissions on the parent
-        // directory are what stop an attacker planting one.
-        let _ = std::fs::remove_file(path);
+        // Liveness is an flock on `<path>.lock`, never a connect() probe.
+        // A live listener with a full accept backlog refuses connections
+        // exactly like a dead one — macOS returns ECONNREFUSED for both, and
+        // on Linux the connect blocks forever — so probing unlinks a healthy
+        // instance's socket and steals its name, which is the takeover it was
+        // meant to prevent. It is self-inflicting too: every probe that does
+        // connect leaves a phantom connection in the live listener's backlog,
+        // so a restart loop exhausts the backlog itself. flock has the
+        // property the probe was reaching for — the kernel releases it when
+        // the holder dies, SIGKILL included.
+        let lock = PathLock::acquire(path)?;   // Err(AddrInUse) if held
+
+        // Holding the lock means anything here is debris: a crash leaves the
+        // socket file and bind(2) then fails EADDRINUSE forever. remove_file
+        // acts on the name, so a dangling symlink goes too — otherwise bind
+        // fails EADDRINUSE on Linux and strands the real socket on macOS.
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
 
         let inner = UnixListener::bind(path)?;
+        let id = stat_path(path)?;   // remove the file if this fails
 
-        // Owner-only. Not sufficient on its own (spec §7.1) but there is no
-        // reason to be reachable by other users at all.
+        // Constructed before the remaining fallible steps, so Drop owns the
+        // cleanup from the moment the socket file exists.
+        let listener = Self { inner, path: path.to_path_buf(), authorized_uid, id, _lock: lock };
+
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-
-        Ok(Self { inner, path: path.to_path_buf(), authorized_uid })
+        listener.give_to_authorized_uid()?;
+        Ok(listener)
     }
+
+    /// Hands the socket to the uid this helper serves.
+    ///
+    /// Both platforms enforce a socket's permission bits on connect(), so a
+    /// root-owned 0600 socket is unreachable by the unprivileged GUI it
+    /// exists for — the daemon runs correctly and the app can never reach it.
+    /// Ownership plus 0600 means exactly one user can open it; the peer-uid
+    /// check at accept stays as the second gate, because mode bits say
+    /// nothing about *which* user connected (spec §7.1).
+    ///
+    /// A no-op when the uid is already ours (the ordinary dev case). When it
+    /// is not and the chown fails, that is a startup error, never a silent
+    /// continue — a socket the intended reader cannot open is worse than no
+    /// socket.
+    fn give_to_authorized_uid(&self) -> std::io::Result<()> { /* libc::chown */ }
 
     /// Accepts a connection and authorizes it, refusing any other uid.
     pub fn accept(&self) -> Result<UnixStream, AcceptError> {
@@ -1008,10 +1051,17 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Only if the path still refers to the exact file we bound. A
+        // mismatch means someone else's socket lives there now and removing
+        // it would tear down a healthy service. Never panic here.
+        if stat_path(&self.path).is_ok_and(|id| id == self.id) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 ```
+
+`PathLock` opens `<path>.lock` mode 0600 and takes `flock(LOCK_EX | LOCK_NB)`, mapping `EWOULDBLOCK` to an `AddrInUse` error naming the live instance. **The lockfile is never unlinked** — the lock lives on the inode, not the name, so removing it would let a second helper create a fresh one, lock that, and start alongside us.
 
 - [ ] **Step 4: Wire up the CLI**
 
@@ -1070,13 +1120,34 @@ fn main() -> std::process::ExitCode {
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p liostunnel-helper listener`
-Expected: PASS — 5 passed.
+```bash
+cargo test -p liostunnel-helper
+docker run --rm -v "$PWD":/w -w /w -e CARGO_TARGET_DIR=/w/target-linux \
+  rust:1.93-slim cargo test -p liostunnel-helper -- --include-ignored
+```
+Expected: macOS 22 passed / 2 ignored; Linux 24 passed / 0 ignored. The ignored pair are the root-only fixtures; they must show as `ignored`, never skipped silently.
 
-- [ ] **Step 6: Verify the permissive-default refusal by hand**
+- [ ] **Step 6: Test the permissive-default refusal, do not eyeball it**
 
-Run: `cargo run -p liostunnel-helper -- --socket /tmp/x.sock`
-Expected: exits non-zero with `--uid is required`. Paste the output.
+"A helper started without an authorized uid refuses every connection" is a binding constraint, so it gets a test, not a manual check. `main` needs no refactor to be testable — spawn the real binary:
+
+```rust
+// crates/liostunnel-helper/tests/cli.rs
+Command::new(env!("CARGO_BIN_EXE_liostunnel-helper"))
+    .arg("--socket").arg(&tmp)
+    .output()
+```
+Assert a non-zero exit and that stderr says why. Run it against the previous commit to see it red — `main` there ignored its arguments and exited 0. Never leave a spawned helper running: bound the wait and kill-and-reap.
+
+- [ ] **Step 6a: A/B the two guards this task adds**
+
+**Socket ownership.** Delete the `give_to_authorized_uid` call. `a_socket_bound_for_another_uid_belongs_to_that_uid_or_is_not_created` must FAIL on *both* platforms — as root because the socket stays root-owned, as an ordinary user because bind wrongly succeeds and leaves a socket the target can never open. Restore, confirm green.
+
+Note what this means for test design: a test that binds for our *own* uid cannot catch this at all, because the socket is born owned by us. That is exactly how the bug survived review.
+
+**Liveness.** Reintroduce a `connect()` probe before the lock. `a_refused_bind_never_connects_to_the_live_listener` must FAIL on both platforms — the probe leaves a phantom connection queued on the live listener. Restore, confirm green.
+
+Paste all four transcripts.
 
 - [ ] **Step 7: Commit**
 
