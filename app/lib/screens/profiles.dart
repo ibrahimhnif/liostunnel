@@ -90,9 +90,18 @@ class ProfilesScreen extends StatelessWidget {
                   leading: const Icon(Icons.dns_outlined),
                   title: Text(dto.name),
                   subtitle: Text('${dto.host}:${dto.port} · ${dto.protocol}'),
-                  trailing: p.path == selectedPath
-                      ? const Icon(Icons.check)
-                      : null,
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (p.path == selectedPath) const Icon(Icons.check),
+                      IconButton(
+                        key: ValueKey('edit-${p.path}'),
+                        icon: const Icon(Icons.edit_outlined),
+                        tooltip: 'Edit',
+                        onPressed: () => onEdit(p),
+                      ),
+                    ],
+                  ),
                   onTap: () => onSelect(p),
                 );
               },

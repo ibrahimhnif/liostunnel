@@ -219,6 +219,51 @@ void main() {
     expect(find.text('not a valid profile'), findsOneWidget);
   });
 
+  testWidgets('every row has an edit button, including a broken one',
+      (tester) async {
+    // The feature shipped with this button on the BROKEN-profile branch only:
+    // a patch failed to match the healthy branch after dart format rewrapped
+    // it, and nothing asserted the affordance existed. The whole feature was
+    // unreachable for every profile that actually parsed, with a green suite.
+    const broken = LoadedProfile(path: '/tmp/b.json', error: 'not a valid profile');
+    await tester.pumpWidget(MaterialApp(
+      home: ProfilesScreen(
+        profiles: const [aProfile, broken],
+        directory: '/tmp/whatever',
+        selectedPath: aProfile.path,
+        onSelect: _ignore,
+        onReload: _noop,
+        onCreate: _noop,
+        onEdit: _ignore,
+      ),
+    ));
+    expect(find.byIcon(Icons.edit_outlined), findsNWidgets(2));
+    expect(find.byKey(ValueKey('edit-${aProfile.path}')), findsOneWidget,
+        reason: 'a healthy profile must be editable');
+    expect(find.byKey(const ValueKey('edit-/tmp/b.json')), findsOneWidget,
+        reason: 'and a broken one especially so');
+    // The selected row shows both a tick and an edit button.
+    expect(find.byIcon(Icons.check), findsOneWidget);
+  });
+
+  testWidgets('the edit button reports which profile it belongs to',
+      (tester) async {
+    LoadedProfile? edited;
+    await tester.pumpWidget(MaterialApp(
+      home: ProfilesScreen(
+        profiles: const [aProfile],
+        directory: '/tmp/whatever',
+        selectedPath: null,
+        onSelect: _ignore,
+        onReload: _noop,
+        onCreate: _noop,
+        onEdit: (p) => edited = p,
+      ),
+    ));
+    await tester.tap(find.byKey(ValueKey('edit-${aProfile.path}')));
+    expect(edited?.path, aProfile.path);
+  });
+
   testWidgets('tapping a profile selects it', (tester) async {
     LoadedProfile? picked;
     const loaded = aProfile;
