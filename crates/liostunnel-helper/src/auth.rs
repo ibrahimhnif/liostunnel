@@ -86,9 +86,17 @@ mod tests {
     }
 
     #[test]
-    fn peer_uid_is_not_silently_zero() {
-        // Guards the specific bug where an unchecked getsockopt leaves the
-        // output buffer zeroed and every caller is authorised as root.
+    fn peer_uid_of_a_socketpair_reports_our_real_uid_on_success() {
+        // NB: this only proves that on a *successful* getsockopt call we
+        // report the real (and, for a non-root test process, nonzero) uid.
+        // It is NOT a guard against a checked-vs-unchecked getsockopt bug:
+        // a real connected socketpair's getsockopt call succeeds and fills
+        // the output buffer correctly whether or not the caller checks the
+        // return code, so this fixture cannot tell a checked implementation
+        // from an unchecked one apart — confirmed empirically, this test
+        // still passes with the `rc`/error check deleted from `peer_uid`.
+        // See `peer_uid_on_getsockopt_failure_does_not_silently_report_uid_zero`
+        // below for the fixture that can tell them apart.
         let (a, _b) = UnixStream::pair().unwrap();
         let got = peer_uid(a.as_raw_fd()).unwrap();
         let expected = unsafe { libc::getuid() };
@@ -98,8 +106,53 @@ mod tests {
     }
 
     #[test]
-    fn peer_uid_on_a_non_socket_fd_is_an_error_not_a_panic() {
+    fn peer_uid_on_getsockopt_failure_does_not_silently_report_uid_zero() {
+        // This is the fixture that can distinguish a checked getsockopt
+        // from an unchecked one: on a non-socket fd the syscall genuinely
+        // fails, so an implementation that forgets to check the return
+        // code / Result falls through to the zeroed output buffer and
+        // would silently report uid 0 (i.e. authorize the connection as
+        // root) instead of surfacing an error. A/B-verified: deleting the
+        // rc/error check from `peer_uid` turns this test red.
         let f = std::fs::File::open("/dev/null").unwrap();
-        assert!(peer_uid(f.as_raw_fd()).is_err());
+        let result = peer_uid(f.as_raw_fd());
+        assert!(
+            result.is_err(),
+            "a non-socket fd must surface an error, not silently succeed with a zeroed uid: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn authorize_accepts_our_own_uid() {
+        // `authorize` is the function that embodies P1a-5 ("who is allowed
+        // to talk to me"); this proves the accept path actually accepts the
+        // right caller, not just that `peer_uid` works in isolation.
+        let (a, _b) = UnixStream::pair().unwrap();
+        // SAFETY: getuid cannot fail and has no preconditions.
+        let our_uid = unsafe { libc::getuid() };
+        assert!(authorize(a.as_raw_fd(), our_uid).is_ok());
+    }
+
+    #[test]
+    fn authorize_rejects_a_mismatched_uid() {
+        // The other half of P1a-5: a caller who is not the expected uid
+        // must be refused, and the error must carry both uids (never
+        // anything else — no path, no token, no credential material) so
+        // the caller can log who was refused and who was expected.
+        let (a, _b) = UnixStream::pair().unwrap();
+        // SAFETY: getuid cannot fail and has no preconditions.
+        let our_uid = unsafe { libc::getuid() };
+        let expected = our_uid.wrapping_add(1);
+
+        match authorize(a.as_raw_fd(), expected) {
+            Err(AuthError::WrongUid {
+                expected: got_expected,
+                actual,
+            }) => {
+                assert_eq!(got_expected, expected);
+                assert_eq!(actual, our_uid);
+            }
+            other => panic!("expected Err(AuthError::WrongUid {{ .. }}), got {other:?}"),
+        }
     }
 }
