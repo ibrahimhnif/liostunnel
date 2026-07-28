@@ -13,7 +13,18 @@ class LoadedProfile {
   /// user never saved.
   final String? error;
 
-  const LoadedProfile({required this.path, this.profile, this.error});
+  /// The account on the server, from the `.user` sidecar.
+  ///
+  /// Not part of `ServerProfile` — it is a connect-time parameter — so it is
+  /// kept beside the profile rather than inside it.
+  final String? sshUser;
+
+  const LoadedProfile({
+    required this.path,
+    this.profile,
+    this.error,
+    this.sshUser,
+  });
 
   bool get ok => profile != null;
   String get name => profile?.name ?? path.split('/').last;
@@ -51,7 +62,14 @@ class ProfileStore {
     for (final f in files) {
       try {
         final dto = await parseProfile(json: f.readAsStringSync());
-        out.add(LoadedProfile(path: f.path, profile: dto));
+        final sidecar = File('${f.path}.user');
+        out.add(LoadedProfile(
+          path: f.path,
+          profile: dto,
+          sshUser: sidecar.existsSync()
+              ? sidecar.readAsStringSync().trim()
+              : null,
+        ));
       } catch (_) {
         // Deliberately not the underlying message: it may quote parts of a
         // profile document. The path is enough to find the file.

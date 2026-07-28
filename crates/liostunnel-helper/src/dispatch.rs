@@ -71,7 +71,15 @@ impl Session {
             | StartError::BadTunAddress
             | StartError::EnvSecretNotAllowed => ErrorKind::BadRequest,
             StartError::SecretNotPermitted(_) => ErrorKind::SecretNotPermitted,
-            StartError::Tunnel(_) => ErrorKind::AuthFailed,
+            // Only a real authentication failure may be reported as one.
+            // This was `Tunnel(_) => AuthFailed` for every variant, so a DNS
+            // failure, an unreachable host, a host-key mismatch and a route
+            // error all told the user "the server rejected the credentials"
+            // -- sending them to re-check a password that was never the
+            // problem. Everything else is Internal, whose wording points at
+            // the helper log, which does name the cause.
+            StartError::Tunnel(liostunnel_core::TunnelError::Auth(_)) => ErrorKind::AuthFailed,
+            StartError::Tunnel(_) => ErrorKind::Internal,
         };
         // `e`'s Display is safe to send: every variant either carries no
         // input at all or carries a path and uid. Task 6's tests pin that

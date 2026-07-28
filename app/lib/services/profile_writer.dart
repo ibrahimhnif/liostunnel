@@ -23,11 +23,26 @@ class ProfileWriter {
   /// The document is produced by `export_profile`, not by string-building
   /// here — the schema has one owner (P1a-1), and a hand-rolled encoder in
   /// Dart would be a second one free to drift.
-  Future<File> writeProfile(ProfileDto dto) async {
+  /// Writes the profile and, beside it, the SSH username.
+  ///
+  /// The username is NOT part of `ServerProfile` — it is a connect-time
+  /// parameter, so the schema has nowhere to put it. Without somewhere to
+  /// keep it the app fell back to the local account name, which is almost
+  /// never the account on the server: every connection to a host like
+  /// `user-provider.com@host` failed as "the server rejected the
+  /// credentials" while the password was fine.
+  ///
+  /// A sidecar rather than an extension to the profile format: that format is
+  /// shared with the CLI and belongs to the core, and widening it from here
+  /// would fork it.
+  Future<File> writeProfile(ProfileDto dto, {String? sshUser}) async {
     final json = await exportProfile(dto: dto);
     Directory(directory).createSync(recursive: true);
     final file = File('$directory/${_slug(dto.name)}.json');
     file.writeAsStringSync(json);
+    if (sshUser != null && sshUser.trim().isNotEmpty) {
+      File('${file.path}.user').writeAsStringSync(sshUser.trim());
+    }
     return file;
   }
 

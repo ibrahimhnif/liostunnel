@@ -4,6 +4,7 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:liostunnel_app/services/profile_store.dart';
 import 'package:liostunnel_app/services/profile_writer.dart';
 import 'package:liostunnel_app/src/rust/api/config.dart';
 import 'package:liostunnel_app/src/rust/dto/profile.dart';
@@ -115,10 +116,53 @@ void main() {
     await expectLater(checkProfile(dto: noDns), throwsA(anything));
   });
 
+  usernameTests();
+
   test('a fresh id is a distinct UUID each time', () async {
     final a = await newProfileId();
     final b = await newProfileId();
     expect(a, isNot(b));
     expect(a.length, 36);
+  });
+}
+
+// The SSH username is a connect-time parameter with nowhere to live in
+// ServerProfile, so it is kept beside the profile. Losing it means falling
+// back to the local account name, which for a host like
+// `user-provider.com@server` fails as "credentials rejected" while the
+// password is perfectly good — a message that sends you after the wrong fix.
+void usernameTests() {
+  test('the ssh username survives a write and a reload', () async {
+    final dir = Directory.systemTemp.createTempSync('lios-user');
+    final w = ProfileWriter(directory: dir.path);
+    await w.writeProfile(dto(), sshUser: 'hanif-provider.com');
+
+    final loaded = await ProfileStore(directory: dir.path).load();
+    expect(loaded.single.sshUser, 'hanif-provider.com');
+    dir.deleteSync(recursive: true);
+  });
+
+  test('a profile saved without one reports null, not an empty string',
+      () async {
+    // Null means "fall back"; an empty string would be sent to the server as
+    // a username and rejected.
+    final dir = Directory.systemTemp.createTempSync('lios-nouser');
+    final w = ProfileWriter(directory: dir.path);
+    await w.writeProfile(dto(), sshUser: '   ');
+
+    final loaded = await ProfileStore(directory: dir.path).load();
+    expect(loaded.single.sshUser, isNull);
+    dir.deleteSync(recursive: true);
+  });
+
+  test('the sidecar is not mistaken for a profile', () async {
+    // It sits next to the .json; the store must not try to parse it.
+    final dir = Directory.systemTemp.createTempSync('lios-sidecar');
+    await ProfileWriter(directory: dir.path)
+        .writeProfile(dto(), sshUser: 'someone');
+    final loaded = await ProfileStore(directory: dir.path).load();
+    expect(loaded.length, 1);
+    expect(loaded.single.ok, isTrue);
+    dir.deleteSync(recursive: true);
   });
 }

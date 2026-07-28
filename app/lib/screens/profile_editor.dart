@@ -89,7 +89,7 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       // Checked by the same Rust that will read it back, so a profile the
       // app accepts is one the helper can parse.
       await checkProfile(dto: dto);
-      final file = await widget.writer.writeProfile(dto);
+      final file = await widget.writer.writeProfile(dto, sshUser: _user.text);
       if (!mounted) return;
       setState(() => _saved = file.path);
       widget.onSaved();

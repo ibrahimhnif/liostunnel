@@ -91,7 +91,10 @@ class _HomePageState extends State<HomePage> {
           // The helper re-parses this itself, after authorizing the caller, so
           // the document is passed through rather than reconstructed.
           profileJson: File(selected!.path).readAsStringSync(),
-          user: Platform.environment['USER'] ?? '',
+          // The account on the SERVER, not this machine's login. Falling
+          // back to the local name is what made every connection to a host
+          // whose account differs fail as "credentials rejected".
+          user: selected.sshUser ?? Platform.environment['USER'] ?? '',
           routeMode: 'default',
           cidrs: const [],
           captureDns: true,
