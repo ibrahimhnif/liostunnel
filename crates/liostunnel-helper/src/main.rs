@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod dispatch;
 pub mod listener;
 
 use std::path::PathBuf;
