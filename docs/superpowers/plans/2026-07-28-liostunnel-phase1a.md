@@ -443,21 +443,42 @@ mod tests {
     }
 
     #[test]
-    fn peer_uid_is_not_silently_zero() {
-        // Guards the specific bug where an unchecked getsockopt leaves the
-        // output buffer zeroed and every caller is authorised as root.
-        let (a, _b) = UnixStream::pair().unwrap();
-        let got = peer_uid(a.as_raw_fd()).unwrap();
-        let expected = unsafe { libc::getuid() };
-        if expected != 0 {
-            assert_ne!(got, 0, "a non-root test process must not report peer uid 0");
-        }
+    fn peer_uid_on_getsockopt_failure_does_not_silently_report_uid_zero() {
+        // THE zero-buffer guard. It must use an fd where the syscall really
+        // fails: /dev/null is not a socket, so getsockopt returns ENOTSOCK on
+        // macOS and nix's PeerCredentials errors on Linux. An implementation
+        // that ignores the failure falls through to the zeroed xucred and
+        // hands back Ok(0) -- every caller authorised as root.
+        //
+        // A socketpair CANNOT test this. getsockopt always succeeds there and
+        // fills the buffer correctly whether or not the caller checks the
+        // return code, so a test on that fixture passes against both the
+        // correct and the broken implementation.
+        let f = std::fs::File::open("/dev/null").unwrap();
+        let result = peer_uid(f.as_raw_fd());
+        assert!(result.is_err(), "must be an error, not Ok(0); got {result:?}");
     }
 
     #[test]
-    fn peer_uid_on_a_non_socket_fd_is_an_error_not_a_panic() {
-        let f = std::fs::File::open("/dev/null").unwrap();
-        assert!(peer_uid(f.as_raw_fd()).is_err());
+    fn authorize_accepts_our_own_uid() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let ours = unsafe { libc::getuid() };
+        assert!(authorize(a.as_raw_fd(), ours).is_ok());
+    }
+
+    #[test]
+    fn authorize_rejects_a_mismatched_uid() {
+        // The function P1a-5 is actually about. Without this, an inverted
+        // comparison passes every other test in the file.
+        let (a, _b) = UnixStream::pair().unwrap();
+        let ours = unsafe { libc::getuid() };
+        match authorize(a.as_raw_fd(), ours.wrapping_add(1)) {
+            Err(AuthError::WrongUid { expected, actual }) => {
+                assert_eq!(expected, ours.wrapping_add(1));
+                assert_eq!(actual, ours);
+            }
+            other => panic!("expected WrongUid, got {other:?}"),
+        }
     }
 }
 ```
@@ -539,18 +560,24 @@ pub fn authorize(fd: RawFd, expected: u32) -> Result<(), AuthError> {
 }
 ```
 
-Add `thiserror.workspace = true` to `crates/liostunnel-helper/Cargo.toml`, and `pub mod auth;` to `main.rs`.
+Add `thiserror.workspace = true` to `crates/liostunnel-helper/Cargo.toml`, and `pub mod auth;` to `main.rs` — **in Step 1**, not here, or the RED run fails on a missing module instead of the missing function.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p liostunnel-helper auth`
-Expected: PASS — 3 passed.
+Expected: PASS — 5 passed.
 
-- [ ] **Step 5: A/B the zero-check test**
+- [ ] **Step 5: A/B both guards**
 
-Temporarily change the macOS (or Linux) implementation to ignore the return code and return `Ok(0)`. Run the tests again and confirm `peer_uid_is_not_silently_zero` and `peer_uid_of_a_socketpair_is_our_own_uid` both FAIL. Restore the implementation and confirm they pass. Paste both outputs in your report.
+The two arms fail through different mechanisms, so the injected defect is not the same edit on both. Do each on its own platform and paste all four transcripts.
 
-This matters because "authorises everyone as root" is the exact failure mode an unchecked `getsockopt` produces, and it is invisible to a test that only asserts success.
+**The zero-buffer guard.** On macOS, delete the `if rc != 0` check so the zeroed `xucred` falls through. On Linux, swallow the `?` and default to `0`. Confirm `peer_uid_on_getsockopt_failure_does_not_silently_report_uid_zero` FAILS with `got Ok(0)`. Restore, confirm green.
+
+Note what does *not* move: `peer_uid_of_a_socketpair_is_our_own_uid` stays green through both breaks, because `getsockopt` always succeeds on a socketpair and fills the buffer correctly whether or not the caller checks the return code. That test proves the happy path is wired; it cannot prove the guard exists. Keeping the distinction visible is the point.
+
+**The authorization comparison.** Invert `actual != expected` to `==`. Confirm `authorize_rejects_a_mismatched_uid` FAILS. Restore, confirm green.
+
+This matters because "authorises everyone as root" is the exact failure mode an unchecked `getsockopt` produces, and it is invisible to a test that only asserts success on a fixture where the syscall never fails.
 
 - [ ] **Step 6: Commit**
 
@@ -625,26 +652,26 @@ Append to the `tests` module in `crates/liostunnel-helper/src/auth.rs`:
 
     #[test]
     fn a_file_owned_by_another_uid_is_refused() {
-        // THE ESCALATION. A root-owned file that this uid does not own must be
-        // refused even though the helper, running as root, could trivially read
-        // it. /etc/shadow is the canonical target: name it as your private key
-        // and its contents leave via an auth attempt or an error message.
+        // THE ESCALATION. A file this uid does not own must be refused even
+        // though the helper, running as root, could trivially read it.
+        //
+        // The discriminator is a mismatched *uid argument*, not a foreign-owned
+        // file. Do not reach for /etc/shadow: it does not exist on macOS, the
+        // Docker container runs as root so every file is "ours", and on Debian
+        // it is mode 0640 -- refused by the mode check that runs BEFORE the
+        // ownership check, so the test would pass for the wrong reason. Every
+        // one of those makes this test vacuous exactly where it must not be.
+        // Task 2's authorize() faced the same problem and solved it this way.
+        let d = scratch("foreign");
+        let p = write_owned(&d, 0o600);
         let me = unsafe { libc::getuid() };
-        if me == 0 {
-            eprintln!("skipped: running as root, every file is 'ours'");
-            return;
-        }
-        let target = std::path::Path::new("/etc/shadow");
-        if !target.exists() {
-            eprintln!("skipped: /etc/shadow absent on this platform");
-            return;
-        }
-        let err = secret_readable_by(target, me)
+        let err = secret_readable_by(&p, me.wrapping_add(1))
             .expect_err("a file owned by another uid must be refused");
         assert!(
             matches!(err, AuthError::SecretNotOwned { .. }),
             "expected SecretNotOwned, got {err:?}"
         );
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -666,26 +693,48 @@ Append to the `tests` module in `crates/liostunnel-helper/src/auth.rs`:
     }
 
     #[test]
-    fn a_symlink_is_judged_by_its_target_not_the_link() {
-        // A symlink the caller owns pointing at a file they do not is the
-        // obvious bypass. `metadata` follows the link, which is what we want —
-        // this test pins that we did not reach for `symlink_metadata`.
-        let me = unsafe { libc::getuid() };
-        if me == 0 {
-            eprintln!("skipped: running as root");
-            return;
-        }
-        let target = std::path::Path::new("/etc/shadow");
-        if !target.exists() {
-            eprintln!("skipped: /etc/shadow absent");
-            return;
-        }
+    fn a_symlink_resolves_its_type_and_mode_through_the_link() {
+        // Pins that `metadata` follows the link: a symlink's own inode is not
+        // a regular file and its own mode is 0777, so an implementation using
+        // `symlink_metadata` fails the type check here.
+        //
+        // This test deliberately does NOT claim to prove ownership is read
+        // from the target. Both link and target are created by this process,
+        // so their owners are identical and the two implementations are
+        // indistinguishable on this fixture. The test below covers that.
         let d = scratch("symlink");
+        let target = write_owned(&d, 0o600);
         let link = d.join("link");
-        std::os::unix::fs::symlink(target, &link).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let me = unsafe { libc::getuid() };
+        assert!(secret_readable_by(&link, me).is_ok());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    #[ignore = "needs root: chowns a file to a non-root uid to make \
+                link-owner != target-owner. Run as root with: docker run --rm \
+                -v \"$PWD\":/w -w /w -e CARGO_TARGET_DIR=/w/target-linux \
+                rust:1.93-slim cargo test -p liostunnel-helper auth -- --include-ignored"]
+    fn a_root_owned_link_to_a_foreign_owned_target_is_still_refused() {
+        // A symlink the caller owns pointing at a file they do not is the
+        // obvious bypass, and the ONLY fixture that can prove ownership is
+        // resolved through the link is one where the two owners differ.
+        // Constructing that needs CAP_CHOWN, so this is #[ignore]d rather than
+        // silently returning early — an ignored test prints as "ignored",
+        // where a silent skip prints as a pass it never earned.
+        let me = unsafe { libc::getuid() };
+        assert_eq!(me, 0, "requires root; do not let it pass unrun, got uid {me}");
+        let d = scratch("symlink-foreign-owner");
+        let target = write_owned(&d, 0o600);      // root-owned
+        chown_to_nobody(&target);                  // now foreign-owned
+        let link = d.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();  // link stays root-owned
+        let err = secret_readable_by(&link, 0)
+            .expect_err("a link to a foreign-owned target must be refused");
         assert!(
-            secret_readable_by(&link, me).is_err(),
-            "a symlink to a file the caller does not own must be refused"
+            matches!(err, AuthError::SecretNotOwned { .. }),
+            "expected SecretNotOwned, got {err:?}"
         );
         std::fs::remove_dir_all(&d).ok();
     }
@@ -755,14 +804,28 @@ pub fn secret_readable_by(path: &Path, uid: u32) -> Result<(), AuthError> {
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p liostunnel-helper auth -- --nocapture`
-Expected: PASS — 8 passed (3 from Task 2 plus 5 new). Note any `skipped:` lines printed.
+Run: `cargo test -p liostunnel-helper auth`
+Expected: PASS — 10 passed, 1 ignored. **No test may print a `skipped:` line or take an early `return`** — a silent skip reports the same green as a real pass, which is how the first two attempts at this task shipped tests that proved nothing. The one ignored test is the root-only fixture, and it must be visible as `ignored`.
 
-- [ ] **Step 5: A/B the escalation test — this is exit criterion P1a-6**
+Then run it for real, as root, where the ignored test executes:
 
-Temporarily delete the `meta.uid() != uid` check — the naive implementation, which is what you would write if you had not thought about the daemon case. Run the tests. Confirm `a_file_owned_by_another_uid_is_refused` and `a_symlink_is_judged_by_its_target_not_the_link` both FAIL. Restore and confirm they pass.
+```bash
+docker run --rm -v "$PWD":/w -w /w -e CARGO_TARGET_DIR=/w/target-linux \
+  rust:1.93-slim cargo test -p liostunnel-helper auth -- --include-ignored
+```
+Expected: 11 passed, 0 ignored.
 
-Paste both transcripts. A security test that has never been seen failing is not evidence.
+- [ ] **Step 5: A/B both guards — this is exit criterion P1a-6**
+
+Two different defects, two different tests. Inject each separately and paste all four transcripts.
+
+**Ownership omitted.** Delete the `meta.uid() != uid` check — the naive implementation, which is what you would write if you had not thought about the daemon case. Confirm `a_file_owned_by_another_uid_is_refused` FAILS. Restore, confirm green.
+
+**Ownership read from the link.** Leave the type and mode checks on the followed `metadata`, but resolve ownership from a separate `symlink_metadata` call. This is the split-check refactor a later maintainer could plausibly introduce. Confirm `a_root_owned_link_to_a_foreign_owned_target_is_still_refused` FAILS in the container. Restore, confirm green.
+
+Note that `a_symlink_resolves_its_type_and_mode_through_the_link` stays green through the second break — by design. Its fixture has identical link and target owners, so it cannot see that defect, which is exactly why the root-only test exists.
+
+Paste all four transcripts. A security test that has never been seen failing is not evidence.
 
 - [ ] **Step 6: Commit**
 
@@ -916,23 +979,66 @@ pub struct Listener {
     inner: UnixListener,
     path: PathBuf,
     authorized_uid: u32,
+    /// Identity of the socket file we bound, so Drop never removes someone
+    /// else's. Taken with `stat` on the path, NOT `fstat` on the descriptor:
+    /// for an AF_UNIX socket, fstat returns the socket's own kernel inode,
+    /// unrelated to the directory entry. Measured on macOS — fstat gave
+    /// dev=-1 ino=529782 where stat gave dev=16777231 ino=66740537.
+    id: FileId,
+    /// Released on drop, after which another helper may take this path.
+    _lock: PathLock,
 }
 
 impl Listener {
     pub fn bind(path: &Path, authorized_uid: u32) -> std::io::Result<Self> {
-        // A crash leaves the socket file behind and bind(2) then fails with
-        // EADDRINUSE forever. Remove it first; the permissions on the parent
-        // directory are what stop an attacker planting one.
-        let _ = std::fs::remove_file(path);
+        // Liveness is an flock on `<path>.lock`, never a connect() probe.
+        // A live listener with a full accept backlog refuses connections
+        // exactly like a dead one — macOS returns ECONNREFUSED for both, and
+        // on Linux the connect blocks forever — so probing unlinks a healthy
+        // instance's socket and steals its name, which is the takeover it was
+        // meant to prevent. It is self-inflicting too: every probe that does
+        // connect leaves a phantom connection in the live listener's backlog,
+        // so a restart loop exhausts the backlog itself. flock has the
+        // property the probe was reaching for — the kernel releases it when
+        // the holder dies, SIGKILL included.
+        let lock = PathLock::acquire(path)?;   // Err(AddrInUse) if held
+
+        // Holding the lock means anything here is debris: a crash leaves the
+        // socket file and bind(2) then fails EADDRINUSE forever. remove_file
+        // acts on the name, so a dangling symlink goes too — otherwise bind
+        // fails EADDRINUSE on Linux and strands the real socket on macOS.
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
 
         let inner = UnixListener::bind(path)?;
+        let id = stat_path(path)?;   // remove the file if this fails
 
-        // Owner-only. Not sufficient on its own (spec §7.1) but there is no
-        // reason to be reachable by other users at all.
+        // Constructed before the remaining fallible steps, so Drop owns the
+        // cleanup from the moment the socket file exists.
+        let listener = Self { inner, path: path.to_path_buf(), authorized_uid, id, _lock: lock };
+
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-
-        Ok(Self { inner, path: path.to_path_buf(), authorized_uid })
+        listener.give_to_authorized_uid()?;
+        Ok(listener)
     }
+
+    /// Hands the socket to the uid this helper serves.
+    ///
+    /// Both platforms enforce a socket's permission bits on connect(), so a
+    /// root-owned 0600 socket is unreachable by the unprivileged GUI it
+    /// exists for — the daemon runs correctly and the app can never reach it.
+    /// Ownership plus 0600 means exactly one user can open it; the peer-uid
+    /// check at accept stays as the second gate, because mode bits say
+    /// nothing about *which* user connected (spec §7.1).
+    ///
+    /// A no-op when the uid is already ours (the ordinary dev case). When it
+    /// is not and the chown fails, that is a startup error, never a silent
+    /// continue — a socket the intended reader cannot open is worse than no
+    /// socket.
+    fn give_to_authorized_uid(&self) -> std::io::Result<()> { /* libc::chown */ }
 
     /// Accepts a connection and authorizes it, refusing any other uid.
     pub fn accept(&self) -> Result<UnixStream, AcceptError> {
@@ -945,10 +1051,17 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Only if the path still refers to the exact file we bound. A
+        // mismatch means someone else's socket lives there now and removing
+        // it would tear down a healthy service. Never panic here.
+        if stat_path(&self.path).is_ok_and(|id| id == self.id) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 ```
+
+`PathLock` opens `<path>.lock` mode 0600 and takes `flock(LOCK_EX | LOCK_NB)`, mapping `EWOULDBLOCK` to an `AddrInUse` error naming the live instance. **The lockfile is never unlinked** — the lock lives on the inode, not the name, so removing it would let a second helper create a fresh one, lock that, and start alongside us.
 
 - [ ] **Step 4: Wire up the CLI**
 
@@ -1007,13 +1120,34 @@ fn main() -> std::process::ExitCode {
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test -p liostunnel-helper listener`
-Expected: PASS — 5 passed.
+```bash
+cargo test -p liostunnel-helper
+docker run --rm -v "$PWD":/w -w /w -e CARGO_TARGET_DIR=/w/target-linux \
+  rust:1.93-slim cargo test -p liostunnel-helper -- --include-ignored
+```
+Expected: macOS 22 passed / 2 ignored; Linux 24 passed / 0 ignored. The ignored pair are the root-only fixtures; they must show as `ignored`, never skipped silently.
 
-- [ ] **Step 6: Verify the permissive-default refusal by hand**
+- [ ] **Step 6: Test the permissive-default refusal, do not eyeball it**
 
-Run: `cargo run -p liostunnel-helper -- --socket /tmp/x.sock`
-Expected: exits non-zero with `--uid is required`. Paste the output.
+"A helper started without an authorized uid refuses every connection" is a binding constraint, so it gets a test, not a manual check. `main` needs no refactor to be testable — spawn the real binary:
+
+```rust
+// crates/liostunnel-helper/tests/cli.rs
+Command::new(env!("CARGO_BIN_EXE_liostunnel-helper"))
+    .arg("--socket").arg(&tmp)
+    .output()
+```
+Assert a non-zero exit and that stderr says why. Run it against the previous commit to see it red — `main` there ignored its arguments and exited 0. Never leave a spawned helper running: bound the wait and kill-and-reap.
+
+- [ ] **Step 6a: A/B the two guards this task adds**
+
+**Socket ownership.** Delete the `give_to_authorized_uid` call. `a_socket_bound_for_another_uid_belongs_to_that_uid_or_is_not_created` must FAIL on *both* platforms — as root because the socket stays root-owned, as an ordinary user because bind wrongly succeeds and leaves a socket the target can never open. Restore, confirm green.
+
+Note what this means for test design: a test that binds for our *own* uid cannot catch this at all, because the socket is born owned by us. That is exactly how the bug survived review.
+
+**Liveness.** Reintroduce a `connect()` probe before the lock. `a_refused_bind_never_connects_to_the_live_listener` must FAIL on both platforms — the probe leaves a phantom connection queued on the live listener. Restore, confirm green.
+
+Paste all four transcripts.
 
 - [ ] **Step 7: Commit**
 
@@ -1108,16 +1242,64 @@ mod tests {
 
     #[test]
     fn a_malformed_line_does_not_carry_its_contents_back() {
-        // serde_json's Display echoes the offending input. Phase 0 shipped
-        // exactly this leak in profile_io::load, where a misplaced secret came
-        // back in the error text. The same rule crosses the socket.
+        // serde_json's Display echoes parts of the input, and Phase 0 shipped
+        // exactly that leak in profile_io::load. The same rule crosses the
+        // socket.
+        //
+        // Measured which shapes actually echo, because guessing produced a
+        // test that could not fail: serde_json quotes KEYS and ENUM TAGS,
+        // never values.
+        //
+        //   {"type":"X"}             -> unknown variant `X`, expected …   LEAKS
+        //   {…,"params":{"X":…}}     -> unknown field `X`, expected …     LEAKS
+        //   {…,"profile_json":"X"}   -> missing field `user`              no echo
+        //   {…,"profile_json":X}     -> expected value at line 1 col 51   no echo
+        //
+        // Put the marker in a value and the test passes against a
+        // deliberately echoing implementation, proving nothing.
+        let leaky = [
+            r#"{"type":"hunter2-SECRET","id":1}"#,
+            r#"{"type":"connect","id":1,"params":{"hunter2-SECRET":"x"}}"#,
+        ];
+        for line in leaky {
+            let mut s = Session::new();
+            let joined = s.handle(line).join(" ");
+            assert!(
+                !joined.contains("hunter2-SECRET"),
+                "the error must not echo request content.\n  input: {line}\n  reply: {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_hello_does_not_leave_the_session_greeted() {
+        // Otherwise the version gate is decorative: a mismatched client is
+        // told to reinstall and then served anyway.
         let mut s = Session::new();
-        let out = s.handle(r#"{"type":"connect","id":1,"params":{"profile_json":"hunter2-SECRET"}}"#);
-        let joined = out.join(" ");
-        assert!(
-            !joined.contains("hunter2-SECRET"),
-            "the error must not echo request content: {joined}"
-        );
+        s.handle(&serde_json::to_string(&Request::Hello {
+            id: 1, protocol_version: PROTOCOL_VERSION + 1,
+        }).unwrap());
+        let v = parse_one(&s.handle(&serde_json::to_string(&Request::GetStatus { id: 2 }).unwrap()));
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["kind"], "bad_request");
+    }
+
+    #[test]
+    fn every_reply_is_a_single_line() {
+        // The framing is newline-delimited JSON, so an embedded newline in a
+        // reply desynchronises the client for the rest of the connection.
+        // Cheap to pin, impossible to notice by eye.
+        let mut s = Session::new();
+        let mut all: Vec<String> = vec![];
+        all.extend(s.handle("{not json"));
+        all.extend(s.handle(&serde_json::to_string(&Request::Hello {
+            id: 1, protocol_version: PROTOCOL_VERSION,
+        }).unwrap()));
+        all.extend(s.handle(&serde_json::to_string(&Request::GetStatus { id: 2 }).unwrap()));
+        for line in &all {
+            assert!(!line.contains('\n'), "reply must be one line: {line:?}");
+        }
+        assert!(!all.is_empty());
     }
 
     #[test]
@@ -1273,15 +1455,15 @@ Add `mod dispatch;` to `main.rs`.
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p liostunnel-helper dispatch`
-Expected: PASS — 7 passed.
+Expected: PASS — 10 passed.
 
 - [ ] **Step 5: A/B the secret-echo test**
 
 Temporarily change the malformed-JSON arm to include the serde error:
 `&format!("malformed request: {e}")`. Run the tests. Confirm
-`a_malformed_line_does_not_carry_its_contents_back` FAILS. Restore and confirm it passes.
+`a_malformed_line_does_not_carry_its_contents_back` FAILS with the unknown-variant message quoting the marker. Restore and confirm it passes.
 
-Paste both. This is the same leak Phase 0 shipped and had to fix in Task 8; the test only means something if it has been seen catching it.
+Paste both. This is the same leak Phase 0 shipped and had to fix in Task 8; the test only means something if it has been seen catching it. **If it does not go red, the test is wrong, not the implementation** — check the marker is in a key or tag position, since serde_json never quotes values.
 
 - [ ] **Step 6: Commit**
 

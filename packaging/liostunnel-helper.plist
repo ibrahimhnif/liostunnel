@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd daemon for the LiosTunnel privileged helper.
+
+  @UID@ is substituted by install-helper.sh with the uid of the user who ran
+  it. That makes the authorized uid root-owned configuration living in a
+  root-owned file, which an unprivileged process cannot alter — spec §7.1.
+  The helper refuses every connection if this argument is missing, so a
+  botched substitution fails closed rather than open.
+
+  SMAppService.daemon() is the right long-term answer on macOS 13+, but it is
+  entangled with code signing and distribution (spec §11). That is its own
+  slice.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.liostunnel.helper</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/liostunnel-helper</string>
+        <string>--socket</string>
+        <string>/var/run/liostunnel.sock</string>
+        <string>--uid</string>
+        <string>@UID@</string>
+    </array>
+
+    <!-- The connect diagnostic (ssh user, host, port, and the SHAPE of the
+         credential: its path, size, mode, owner and trailing whitespace) is
+         logged at debug. It never prints a credential's value: this log is
+         root-owned, persists, and ends up in backups. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>liostunnel_helper=debug,liostunnel_core=info</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/liostunnel-helper.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/liostunnel-helper.log</string>
+</dict>
+</plist>

@@ -138,9 +138,17 @@ never had — the CLI ran as whoever invoked it. Two gates.
 
 ### 7.1 Gate one — who may connect
 
-The socket lives at `/var/run/liostunnel.sock`, mode `0600`, owned by root. On
-`accept`, the helper reads the peer's uid (`LOCAL_PEERCRED` on macOS,
-`SO_PEERCRED` on Linux) and refuses any uid other than the authorized one.
+The socket lives at `/var/run/liostunnel.sock`, mode `0600`, **owned by the
+authorized uid** — not by root. On `accept`, the helper reads the peer's uid
+(`LOCAL_PEERCRED` on macOS, `SO_PEERCRED` on Linux) and refuses any uid other
+than the authorized one.
+
+The ownership detail is not cosmetic. Both platforms enforce the socket file's
+permission bits on `connect()`, so a root-owned `0600` socket is unreachable by
+the very GUI it exists to serve — the daemon would run correctly and the app
+could never reach it. The helper is root at bind time and chowns the socket to
+the uid it was configured to serve. Verified on macOS: connecting to a mode-`0000`
+socket fails `EACCES` even for its owner.
 
 The authorized uid is written by the install script into the launchd plist /
 systemd unit as a command-line argument, so it is root-owned configuration the
@@ -152,7 +160,13 @@ Filesystem permissions alone are insufficient: they are advisory against a
 root-adjacent attacker and say nothing about *which* user connected.
 
 The helper must unlink a stale socket before binding — a crash leaves the file
-behind.
+behind. It must not unlink a *live* one: a supervisor restarting the helper
+under load can start a replacement before the old process exits, and an
+unconditional unlink lets the newcomer steal the path while the original serves
+on unaware. `connect()` alone cannot tell the two apart — a live listener whose
+backlog is full also refuses connections — so liveness is decided by an
+advisory lock on a sibling lockfile, which the kernel releases on process death
+however abrupt.
 
 ### 7.2 Gate two — whose secrets the helper may read
 

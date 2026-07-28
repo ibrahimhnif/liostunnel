@@ -1,14 +1,24 @@
 # LiosTunnel
 
-Cross-platform tunnel client with one shared Rust core. **Phase 0: CLI only.**
+Cross-platform tunnel client with one shared Rust core.
+**Phase 0: the CLI and engine. Phase 1a: a desktop UI over a privileged
+helper** — see
+[`docs/superpowers/specs/2026-07-28-liostunnel-phase1a-desktop-ui-design.md`](docs/superpowers/specs/2026-07-28-liostunnel-phase1a-desktop-ui-design.md)
+and its [verification](docs/superpowers/phase1a-verification.md).
 
 Routes TCP traffic from a TUN device through an SSH tunnel on macOS and
 Linux, with DNS resolved over the tunnel via one of two backends
-(DNS-over-TCP or DNS-over-HTTPS). No UI, no mobile, no WireGuard or
-Shadowsocks yet — profiles for those protocols parse, but connecting with
-one is rejected. See [`PRD.md`](PRD.md) for the full roadmap and
+(DNS-over-TCP or DNS-over-HTTPS). No mobile, no WireGuard or Shadowsocks yet
+— profiles for those protocols parse, but connecting with one is rejected. See [`PRD.md`](PRD.md) for the full roadmap and
 [`docs/superpowers/specs/2026-07-27-liostunnel-phase0-design.md`](docs/superpowers/specs/2026-07-27-liostunnel-phase0-design.md)
 for exactly what Phase 0 does and does not include.
+
+> **A note on where Phase 0 was verified.** Every one of Phase 0's
+> traffic-carrying exit criteria ran in a Linux container. macOS was never
+> exercised end to end, and it did not in fact work: the utun address-family
+> header was applied twice, so the platform carried no traffic at all until
+> Phase 1a's verification found it (`231b8ef`). Read the EC table below as
+> "verified on Linux" unless it says otherwise.
 
 ## Build
 
