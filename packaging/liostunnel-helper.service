@@ -1,0 +1,29 @@
+# systemd unit for the LiosTunnel privileged helper.
+#
+# @UID@ is substituted by install-helper.sh with the uid of the user who ran
+# it. That makes the authorized uid root-owned configuration in a root-owned
+# file, which an unprivileged process cannot alter — spec §7.1. The helper
+# refuses every connection if this argument is missing, so a botched
+# substitution fails closed rather than open.
+
+[Unit]
+Description=LiosTunnel privileged helper
+Documentation=https://github.com/hanif/liostunnel
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/liostunnel-helper \
+          --socket /var/run/liostunnel.sock \
+          --uid @UID@
+Restart=on-failure
+RestartSec=2
+
+# The helper needs to create a TUN device and rewrite the routing table, so
+# it genuinely needs these. Everything else is dropped.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN
+NoNewPrivileges=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
