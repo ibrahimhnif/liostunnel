@@ -26,6 +26,42 @@ permissions:
   contents: read
 
 jobs:
+  # The Flutter half. It ran nowhere until an independent review pointed out
+  # that "the suite is green" had only ever been a claim about the Rust side —
+  # which is how four Dart tests that pass against the implementations they
+  # name survived being written.
+  #
+  # Both platforms, because the app links the Rust statically through cargokit
+  # on macOS and through CMake on Linux, and those are different build paths.
+  flutter:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+      - uses: Swatinem/rust-cache@v2
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      # `flutter test` runs on the plain Dart VM with no Xcode or CMake build
+      # behind it, so it opens the library by path rather than linking it.
+      - name: stage the FFI library for the test loader
+        run: ./testing/build-ffi-for-tests.sh
+      - name: flutter pub get
+        run: flutter pub get
+        working-directory: app
+      - name: flutter analyze
+        run: flutter analyze
+        working-directory: app
+      - name: flutter test
+        run: flutter test
+        working-directory: app
+
   # Everything that needs neither root nor a TUN device nor a network peer.
   # Runs on every push/PR, on both target platforms (spec §12: D2 forces
   # macOS utun and Linux TUN to diverge as little as possible, so CI covers

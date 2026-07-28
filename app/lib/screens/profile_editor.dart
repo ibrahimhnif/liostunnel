@@ -80,8 +80,11 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
     // written to a file and never kept here, which is the point.
     final source = p.authSecretSource;
     if (source.startsWith('env:')) {
-      _secretMode = 'env';
-      _secretPath.text = source.substring(4);
+      // Kept viewable so an imported profile can be repaired, but the form
+      // will not produce one: the helper refuses env secrets outright,
+      // because they resolve against root's environment.
+      _secretMode = 'file';
+      _secretPath.text = '';
     } else if (source.startsWith('file:')) {
       _secretMode = 'file';
       _secretPath.text = source.substring(5);
@@ -114,19 +117,33 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       _saved = null;
     });
     try {
+      final old = widget.existing?.profile;
+      // An edit keeps its id. Minting a new one would make the profile a
+      // different server as far as anything keyed on id is concerned.
+      final id = old?.id ?? await newProfileId();
+
+      // Refuse the name BEFORE writing a secret. Doing it afterwards meant a
+      // collision destroyed another profile's credential and then reported
+      // failure, so the user believed nothing had happened.
+      widget.writer.checkNameFree(
+        _name.text.trim(),
+        replacingPath: widget.existing?.path,
+      );
+
       // A typed password becomes a 0600 file and the profile keeps the path.
       final source = _secretMode == 'typed'
-          ? await widget.writer.writeSecret(_name.text, _secret.text)
-          : _secretMode == 'env'
-              ? 'env:${_secretPath.text.trim()}'
-              : 'file:${_secretPath.text.trim()}';
+          ? await widget.writer.writeSecret(id, _secret.text)
+          : 'file:${_secretPath.text.trim()}';
 
       final dto = ProfileDto(
-        // An edit keeps its id. Minting a new one would make the profile a
-        // different server as far as anything keyed on id is concerned.
-        id: widget.existing?.profile?.id ?? await newProfileId(),
+        id: id,
         name: _name.text.trim(),
-        protocol: 'ssh',
+        // Every field the form does not offer is carried through, not
+        // defaulted. Rebuilding from scratch quietly rewrote a wireguard
+        // profile to ssh, dropped an encrypted key's passphrase reference,
+        // turned kill_switch off and reset split_tunnel — on a save where the
+        // user had only corrected a typo.
+        protocol: old?.protocol ?? 'ssh',
         host: _host.text.trim(),
         port: int.parse(_port.text),
         authKind: _authKind,
@@ -141,9 +158,11 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
             .map((s) => s.trim())
             .where((s) => s.isNotEmpty)
             .toList(),
-        splitTunnel: 'all_traffic',
-        splitTunnelApps: const [],
-        killSwitch: false,
+        authPassphraseSource: old?.authPassphraseSource,
+        peerPublicKey: old?.peerPublicKey,
+        splitTunnel: old?.splitTunnel ?? 'all_traffic',
+        splitTunnelApps: old?.splitTunnelApps ?? const [],
+        killSwitch: old?.killSwitch ?? false,
       );
 
       // Checked by the same Rust that will read it back, so a profile the
@@ -257,6 +276,12 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
                 DropdownMenuItem(value: 'password', child: Text('Password')),
                 DropdownMenuItem(
                     value: 'private_key', child: Text('Private key')),
+                // Present so opening a preshared_key profile does not crash
+                // the form: DropdownButtonFormField asserts its value matches
+                // exactly one item. WireGuard is not connectable yet, but the
+                // profile is editable and must survive a round trip.
+                DropdownMenuItem(
+                    value: 'preshared_key', child: Text('Pre-shared key')),
               ],
               onChanged: (v) => setState(() => _authKind = v!),
             ),
@@ -268,8 +293,6 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
               items: const [
                 DropdownMenuItem(
                     value: 'file', child: Text('A file I already have')),
-                DropdownMenuItem(
-                    value: 'env', child: Text('An environment variable')),
                 DropdownMenuItem(
                     value: 'typed', child: Text('Type it — save to a 0600 file')),
               ],
@@ -288,16 +311,11 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
             else
               _text(
                 _secretPath,
-                _secretMode == 'env' ? 'Variable name' : 'Path to the file',
+                'Path to the file',
                 key: 'f-secret-path',
-                hint: _secretMode == 'env'
-                    ? 'LIOS_PASSWORD'
-                    : '/Users/you/.ssh/id_ed25519',
-                help: _secretMode == 'env'
-                    ? 'Environment variables are refused by the helper: it '
-                        'would be reading root’s environment, not yours.'
-                    : 'Must be owned by you and mode 0600, or the helper will '
-                        'refuse it.',
+                hint: '/Users/you/.ssh/id_ed25519',
+                help: 'Must be owned by you and mode 0600, or the helper will '
+                    'refuse it.',
               ),
 
             const SizedBox(height: 16),

@@ -241,7 +241,13 @@ void main() {
     final client = HelperClient();
     await client.connect(path);
     final ev = await client.events.first.timeout(const Duration(seconds: 5));
-    expect(ev, isA<StateEvent>(), reason: 'the good line must still arrive');
+    // Must assert the STATE, not just the type: taking the connection down
+    // over the unknown line routes through _onDropped, which emits
+    // StateEvent('Disconnected') — satisfying isA<StateEvent> and passing
+    // against the exact failure this test is named for.
+    expect(ev, isA<StateEvent>());
+    expect((ev as StateEvent).state, 'Connected',
+        reason: 'the good line must arrive, not a synthesised disconnect');
 
     await client.close();
     await sub.cancel();
@@ -349,19 +355,35 @@ void main() {
     await second.stop();
   });
 
-  test('close stops the reconnect loop', () async {
-    // A client the UI has dismissed must not keep dialling in the background
-    // for the life of the process.
+  test('close stops a reconnect loop that is actually running', () async {
+    // A client the UI has dismissed must not keep dialling for the life of
+    // the process.
+    //
+    // The earlier version of this closed a healthy client and asserted
+    // isRetrying was false — but no drop had occurred, so no retry had ever
+    // been scheduled and the assertion held with close()'s cancel removed
+    // entirely. The loop has to be running before stopping it means anything.
     final path = sock('closeloop');
     final helper = FakeHelper(path);
     await helper.start();
 
-    final client = HelperClient(retryDelay: const Duration(milliseconds: 20));
+    final client = HelperClient(retryDelay: const Duration(milliseconds: 40));
     await client.connect(path);
-    await client.close();
-    await helper.stop();
+    await client.hello();
 
-    await Future.delayed(const Duration(milliseconds: 120));
+    await helper.stop();                       // now it must be retrying
+    await Future.delayed(const Duration(milliseconds: 60));
+    expect(client.isRetrying, isTrue, reason: 'the loop must be live first');
+
+    await client.close();
     expect(client.isRetrying, isFalse);
+
+    // And it stays stopped: a helper coming back must not be picked up.
+    final second = FakeHelper(path);
+    await second.start();
+    await Future.delayed(const Duration(milliseconds: 200));
+    expect(second.received, isEmpty,
+        reason: 'a closed client must not dial a returning helper');
+    await second.stop();
   });
 }

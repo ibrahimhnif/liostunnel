@@ -18,6 +18,20 @@ class ProfileWriter {
   /// Where a password written by [writeSecret] lives.
   String get secretsDirectory => '$directory/secrets';
 
+  /// Throws if saving under [name] would land on a different profile.
+  ///
+  /// Separate from [writeProfile] so it can run *before* a secret is written.
+  /// It used to be checked inside the write, after [writeSecret] had already
+  /// replaced a credential — so a name collision destroyed another profile's
+  /// password and then reported failure, leaving the user certain nothing had
+  /// happened.
+  void checkNameFree(String name, {String? replacingPath}) {
+    final path = '$directory/${_slug(name)}.json';
+    if (File(path).existsSync() && path != replacingPath) {
+      throw StateError('a different profile is already called "$name"');
+    }
+  }
+
   /// Serialises through the FFI and writes it.
   ///
   /// The document is produced by `export_profile`, not by string-building
@@ -49,12 +63,7 @@ class ProfileWriter {
     final json = await exportProfile(dto: dto);
     Directory(directory).createSync(recursive: true);
     final file = File('$directory/${_slug(dto.name)}.json');
-
-    if (file.existsSync() && file.path != replacingPath) {
-      throw StateError(
-        'a different profile is already called "${dto.name}"',
-      );
-    }
+    checkNameFree(dto.name, replacingPath: replacingPath);
 
     file.writeAsStringSync(json);
     final sidecar = File('${file.path}.user');
@@ -94,15 +103,24 @@ class ProfileWriter {
   /// Created with `0600` *before* anything is written to it. Writing first
   /// and chmod-ing after leaves a window where the file exists with default
   /// permissions and the secret already in it.
-  Future<String> writeSecret(String name, String secret) async {
+  /// [profileId] rather than a name.
+  ///
+  /// Names are many-to-one under [_slug] — `Home VPS`, `home vps` and
+  /// `HOME-VPS` all collapse to `home-vps`, and a name with no alphanumerics
+  /// becomes `profile`. Two profiles therefore shared one secret file, and
+  /// the second silently overwrote the first's credential. An id is unique by
+  /// construction.
+  Future<String> writeSecret(String profileId, String secret) async {
     final dir = Directory(secretsDirectory);
     dir.createSync(recursive: true);
     // 0700: the file is 0600, but a world-readable parent would let anyone
     // list what secrets exist and for which host.
     await Process.run('chmod', ['700', dir.path]);
 
-    final path = '${dir.path}/${_slug(name)}';
+    final path = '${dir.path}/${_slug(profileId)}';
     final file = File(path);
+    // Not exclusive: re-saving an edit legitimately replaces its own secret,
+    // and the id makes "its own" unambiguous.
     file.createSync();
     final chmod = await Process.run('chmod', ['600', path]);
     if (chmod.exitCode != 0) {

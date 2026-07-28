@@ -119,6 +119,7 @@ void main() {
   usernameTests();
   editTests();
   dohTests();
+  criticalTests();
 
   test('a fresh id is a distinct UUID each time', () async {
     final a = await newProfileId();
@@ -324,6 +325,94 @@ void dohTests() {
     expect(back.dnsMode, 'https');
     expect(back.dohSni, 'cloudflare-dns.com');
     expect(back.dohPath, '/dns-query');
+    dir.deleteSync(recursive: true);
+  });
+}
+
+// Three defects an independent review found, each of which destroyed user
+// data on a path the user believed had failed safely.
+void criticalTests() {
+  /// A profile using every field the editor does not offer.
+  ProfileDto rich() => const ProfileDto(
+        id: 'b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f',
+        name: 'Rich',
+        protocol: 'wireguard',
+        host: 'h.example',
+        port: 51820,
+        authKind: 'preshared_key',
+        authSecretSource: 'file:/tmp/k',
+        peerPublicKey: 'AAAA',
+        dnsMode: 'tcp',
+        dnsServers: ['1.1.1.1'],
+        splitTunnel: 'exclude_apps',
+        splitTunnelApps: ['Mail', 'Music'],
+        killSwitch: true,
+      );
+
+  test('a field the editor does not offer survives a round trip', () async {
+    // The editor rebuilt the DTO from scratch, hardcoding protocol to ssh,
+    // kill_switch to false and split_tunnel to all_traffic, and dropping the
+    // passphrase and peer key entirely. Correcting a typo in the host
+    // silently rewrote a wireguard profile to ssh with its app list gone.
+    final dir = Directory.systemTemp.createTempSync('lios-rich');
+    final file = await ProfileWriter(directory: dir.path).writeProfile(rich());
+    final back = await parseProfile(json: file.readAsStringSync());
+
+    expect(back.protocol, 'wireguard');
+    expect(back.authKind, 'preshared_key');
+    expect(back.peerPublicKey, 'AAAA');
+    expect(back.splitTunnel, 'exclude_apps');
+    expect(back.splitTunnelApps, ['Mail', 'Music']);
+    expect(back.killSwitch, isTrue);
+    dir.deleteSync(recursive: true);
+  });
+
+  test('a name collision is refused before any secret is written', () async {
+    // writeSecret used to run first, so a collision overwrote another
+    // profile's password and THEN reported failure — the user saw an error,
+    // assumed nothing had happened, and the first profile now authenticated
+    // with the second's password.
+    final dir = Directory.systemTemp.createTempSync('lios-order');
+    final w = ProfileWriter(directory: dir.path);
+    await w.writeProfile(dto(name: 'Server A'));
+
+    expect(
+      () => w.checkNameFree('server a'),
+      throwsA(isA<StateError>()),
+      reason: 'names slug to the same file, so this must be refused',
+    );
+    // And nothing was written on the way to finding that out.
+    expect(Directory(w.secretsDirectory).existsSync(), isFalse);
+    dir.deleteSync(recursive: true);
+  });
+
+  test('two profiles with colliding names get separate secret files',
+      () async {
+    // The secret filename came from the profile NAME, which is many-to-one:
+    // "Home VPS", "home vps" and "HOME-VPS" all collapsed to one file, and
+    // the second profile silently overwrote the first's credential.
+    final dir = Directory.systemTemp.createTempSync('lios-two');
+    final w = ProfileWriter(directory: dir.path);
+    final a = await w.writeSecret('11111111-1111-1111-1111-111111111111', 'first');
+    final b = await w.writeSecret('22222222-2222-2222-2222-222222222222', 'second');
+
+    expect(a, isNot(b),
+        reason: 'distinct profiles must not share a secret file');
+    expect(File(a.substring(5)).readAsStringSync(), 'first',
+        reason: 'the first credential must survive the second being written');
+    expect(File(b.substring(5)).readAsStringSync(), 'second');
+    dir.deleteSync(recursive: true);
+  });
+
+  test('saving an edit may replace its own secret', () async {
+    // The flip side: an id is stable across edits, so re-saving must be able
+    // to overwrite the file it owns.
+    final dir = Directory.systemTemp.createTempSync('lios-own');
+    final w = ProfileWriter(directory: dir.path);
+    const id = '11111111-1111-1111-1111-111111111111';
+    await w.writeSecret(id, 'old');
+    final again = await w.writeSecret(id, 'new');
+    expect(File(again.substring(5)).readAsStringSync(), 'new');
     dir.deleteSync(recursive: true);
   });
 }
