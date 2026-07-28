@@ -1,4 +1,5 @@
 pub mod counting;
+pub mod shadowsocks;
 pub mod ssh;
 
 use std::net::SocketAddr;
