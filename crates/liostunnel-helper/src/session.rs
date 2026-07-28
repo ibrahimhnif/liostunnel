@@ -1,9 +1,23 @@
 use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use liostunnel_core::config::profile::ServerProfile;
-use liostunnel_core::config::secret::SecretRef;
-use liostunnel_core::route::{RouteMode, reject_full_default_prefixes};
-use liostunnel_ffi::dto::protocol::ConnectParams;
+use liostunnel_core::TunnelError;
+use liostunnel_core::config::profile::{DnsMode, ServerProfile};
+use liostunnel_core::config::secret::{FileSecretStore, SecretRef};
+use liostunnel_core::dns::Resolver;
+use liostunnel_core::dns::over_https::DohResolver;
+use liostunnel_core::dns::over_tcp::TcpResolver;
+use liostunnel_core::engine::{Engine, StatsHandle};
+use liostunnel_core::net::smoltcp_stack::poll::SmoltcpStack;
+use liostunnel_core::net::tun::{TunConfig, TunDevice};
+use liostunnel_core::net::{NetStack, ShutdownHandle, StackConfig};
+use liostunnel_core::protocols::Protocol;
+use liostunnel_core::protocols::ssh::{HostKeyPolicy, SshTunnel};
+use liostunnel_core::route::{
+    RouteGuard, RouteMode, RoutePlan, platform_manager, reject_full_default_prefixes,
+};
+use liostunnel_ffi::dto::protocol::{ConnectParams, StatsSnapshot};
 
 use crate::auth::{self, AuthError};
 
@@ -51,7 +65,217 @@ impl std::fmt::Debug for Authorized {
     }
 }
 
-pub struct Tunnel {/* engine handles land here in Step 5 */}
+/// Where the daemon keeps its own root-owned files.
+///
+/// All derived from the socket path, so a test instance is isolated from a
+/// real one and nothing lands in any user's home. The helper is root: its
+/// route-recovery record and its host-key store are its own, not the calling
+/// user's.
+#[derive(Clone, Debug)]
+pub struct HelperPaths {
+    pub applied_routes: PathBuf,
+    pub known_hosts: PathBuf,
+}
+
+impl HelperPaths {
+    pub fn beside_socket(socket: &Path) -> Self {
+        let sibling = |suffix: &str| {
+            let mut s = socket.as_os_str().to_os_string();
+            s.push(suffix);
+            PathBuf::from(s)
+        };
+        Self {
+            applied_routes: sibling(".routes.json"),
+            known_hosts: sibling(".known_hosts"),
+        }
+    }
+}
+
+/// Tells the stack thread to stop if this scope is torn down before the
+/// engine takes over that responsibility.
+///
+/// Between `SmoltcpStack::start` returning and the engine existing there are
+/// several fallible steps — gateway detection, route installation — whose
+/// failure has nothing to do with the stack thread but must still stop it,
+/// or the background thread and the open TUN device leak for the life of the
+/// process. `shutdown` only sets a flag and wakes the loop, so firing again
+/// later on the engine's own path is harmless.
+struct StackShutdownOnDrop(ShutdownHandle);
+
+impl Drop for StackShutdownOnDrop {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
+
+pub struct Tunnel {
+    shutdown: ShutdownHandle,
+    stats: StatsHandle,
+    guard: Option<RouteGuard>,
+    state_path: PathBuf,
+    engine_task: tokio::task::JoinHandle<Result<(), TunnelError>>,
+}
+
+impl Tunnel {
+    /// Brings up the tunnel: SSH, then the TUN device and packet stack, and
+    /// only then the routing table.
+    ///
+    /// The ordering is Phase 0's and is load-bearing — see
+    /// `liostunnel-cli/src/commands/connect.rs`, which this mirrors rather
+    /// than re-derives. Taking `Authorized` rather than `ConnectParams` makes
+    /// "the gate ran first" a type-level fact instead of a convention.
+    pub async fn start(auth: Authorized, paths: &HelperPaths) -> Result<Self, StartError> {
+        // 1. SSH before routes, so a failed handshake never leaves the machine
+        //    with routes pointing at an interface with nothing behind it.
+        //
+        //    Host keys are verified against a root-owned store of the
+        //    daemon's own, never AcceptAny: the helper dials whatever host a
+        //    profile names, and accepting any key would turn it into a
+        //    machine-in-the-middle oracle for every profile it is given.
+        let policy = HostKeyPolicy::Verify {
+            known_hosts: paths.known_hosts.clone(),
+        };
+        let mut ssh = SshTunnel::new(auth.user, policy);
+        ssh.connect(&auth.profile, &FileSecretStore).await?;
+
+        // The address the SSH session actually reached, not a second
+        // independent lookup — a multi-A-record host could otherwise have the
+        // route pin a different peer than the one carrying the traffic.
+        let server_ip = ssh
+            .peer_addr()
+            .ok_or_else(|| {
+                TunnelError::Route("ssh session reports no peer address after connecting".into())
+            })?
+            .ip();
+        let protocol: Arc<dyn Protocol> = Arc::new(ssh);
+
+        // 2. TUN device.
+        let tun = TunDevice::open(TunConfig {
+            address: auth.tun_address,
+            ..TunConfig::default()
+        })?;
+        let interface = tun.name()?;
+        tracing::info!(%interface, address = %auth.tun_address, "TUN interface up");
+
+        // 3. Packet stack, guarded from here until the engine owns it.
+        let handles = SmoltcpStack::default().start(
+            Box::new(tun),
+            StackConfig {
+                address: auth.tun_address,
+                ..StackConfig::default()
+            },
+        )?;
+        let stack_guard = StackShutdownOnDrop(handles.shutdown.clone());
+
+        // 4. Routes last.
+        let manager = platform_manager();
+        let gateway = manager.detect_gateway()?;
+        let plan = RoutePlan {
+            interface,
+            mode: auth.route_mode,
+            server_ip,
+            original_gateway: gateway,
+            dns_servers: auth.profile.dns.servers.clone(),
+            ipv6_available: manager.ipv6_available(),
+        };
+
+        // Recover anything a previously killed run left behind before
+        // installing anything new. Survives kill -9, which neither
+        // RouteGuard's Drop nor a signal handler can.
+        liostunnel_core::route::state::recover_if_stale(&paths.applied_routes)?;
+
+        // Record before applying. A crash between these two lines leaves a
+        // record of routes that were never installed, and reverting those is
+        // harmless; the reverse order loses them entirely. Do not "optimise"
+        // this by moving the save after apply.
+        liostunnel_core::route::state::AppliedState {
+            interface: plan.interface.clone(),
+            revert: manager.revert_commands(&plan)?,
+            pid: std::process::id(),
+        }
+        .save(&paths.applied_routes)?;
+
+        let guard = RouteGuard::apply(manager, plan)?;
+
+        // 5. Engine.
+        let resolver: Arc<dyn Resolver> = match auth.profile.dns.mode {
+            DnsMode::Tcp => Arc::new(TcpResolver::new(
+                protocol.clone(),
+                auth.profile.dns.servers.clone(),
+            )),
+            DnsMode::Https => {
+                let doh = auth.profile.dns.https.clone().ok_or_else(|| {
+                    TunnelError::config("dns.https", "required when dns.mode is `https`")
+                })?;
+                Arc::new(DohResolver::new(
+                    protocol.clone(),
+                    auth.profile.dns.servers.clone(),
+                    doh,
+                ))
+            }
+        };
+        let engine = Engine::new(protocol, resolver, handles);
+        let shutdown = engine.shutdown_handle();
+        let stats = engine.stats_handle();
+        let engine_task = tokio::spawn(engine.run());
+
+        // The engine owns the stack's lifetime from here, and `Tunnel`'s own
+        // Drop calls the same shutdown. Letting this guard fire on the way
+        // out of `start` would stop the stack we just handed over.
+        std::mem::forget(stack_guard);
+
+        Ok(Self {
+            shutdown,
+            stats,
+            guard: Some(guard),
+            state_path: paths.applied_routes.clone(),
+            engine_task,
+        })
+    }
+
+    pub fn stats(&self) -> StatsSnapshot {
+        let s = self.stats.load();
+        StatsSnapshot {
+            bytes_up: s.bytes_up,
+            bytes_down: s.bytes_down,
+            active_flows: s.active_flows,
+            flows_failed: s.flows_failed,
+            dns_queries: s.dns_queries,
+        }
+    }
+
+    /// True once the engine has exited on its own — a stack-thread panic, or
+    /// the poller giving up — rather than being asked to stop.
+    ///
+    /// Phase 0 shipped the bug this exists to catch: a process sitting
+    /// waiting forever with routes installed and no packet engine behind
+    /// them, a silent network blackout while stats still read Connected.
+    pub fn has_stopped(&self) -> bool {
+        self.engine_task.is_finished()
+    }
+
+    /// Shuts down, reverts routes, clears the state file, aborts the engine.
+    /// Consuming `self` runs `Drop`, where those four live, so there is
+    /// exactly one teardown path rather than two that can drift.
+    pub fn stop(self) {}
+}
+
+impl Drop for Tunnel {
+    fn drop(&mut self) {
+        // The same four actions the CLI performs on Ctrl-C, in the same
+        // order. `shutdown` is a plain method call, not something any Drop
+        // reaches for on its own, so it has to be explicit here.
+        self.shutdown.shutdown();
+        if let Some(mut g) = self.guard.take() {
+            g.revert_now();
+        }
+        // The routes are gone, so a record of them is stale the moment this
+        // process exits; clear it, or the next start mistakes a clean stop
+        // for a crash to recover from.
+        liostunnel_core::route::state::AppliedState::clear(&self.state_path);
+        self.engine_task.abort();
+    }
+}
 
 impl Tunnel {
     /// Everything that must be checked *before* any privileged action.

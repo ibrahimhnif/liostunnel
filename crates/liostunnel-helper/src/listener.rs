@@ -213,6 +213,24 @@ impl Listener {
         Ok(stream)
     }
 
+    /// A duplicate of the listening descriptor, for an async runtime to drive.
+    ///
+    /// The original stays owned by this `Listener`, so `Drop` still releases
+    /// the lock and unlinks the socket even though something else is doing
+    /// the accepting.
+    pub fn try_clone_std(&self) -> std::io::Result<UnixListener> {
+        self.inner.try_clone()
+    }
+
+    /// The peer-uid gate, for callers accepting through a cloned descriptor.
+    ///
+    /// Same check `accept` performs; exposed separately because an async
+    /// runtime accepts on its own copy and must still pass through here
+    /// before reading a byte.
+    pub fn authorize_peer<F: AsRawFd>(&self, peer: &F) -> Result<(), AcceptError> {
+        auth::authorize(peer.as_raw_fd(), self.authorized_uid).map_err(AcceptError::Unauthorized)
+    }
+
     #[cfg(test)]
     fn inner(&self) -> &UnixListener {
         &self.inner
