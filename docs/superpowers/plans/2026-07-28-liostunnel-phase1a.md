@@ -652,26 +652,26 @@ Append to the `tests` module in `crates/liostunnel-helper/src/auth.rs`:
 
     #[test]
     fn a_file_owned_by_another_uid_is_refused() {
-        // THE ESCALATION. A root-owned file that this uid does not own must be
-        // refused even though the helper, running as root, could trivially read
-        // it. /etc/shadow is the canonical target: name it as your private key
-        // and its contents leave via an auth attempt or an error message.
+        // THE ESCALATION. A file this uid does not own must be refused even
+        // though the helper, running as root, could trivially read it.
+        //
+        // The discriminator is a mismatched *uid argument*, not a foreign-owned
+        // file. Do not reach for /etc/shadow: it does not exist on macOS, the
+        // Docker container runs as root so every file is "ours", and on Debian
+        // it is mode 0640 -- refused by the mode check that runs BEFORE the
+        // ownership check, so the test would pass for the wrong reason. Every
+        // one of those makes this test vacuous exactly where it must not be.
+        // Task 2's authorize() faced the same problem and solved it this way.
+        let d = scratch("foreign");
+        let p = write_owned(&d, 0o600);
         let me = unsafe { libc::getuid() };
-        if me == 0 {
-            eprintln!("skipped: running as root, every file is 'ours'");
-            return;
-        }
-        let target = std::path::Path::new("/etc/shadow");
-        if !target.exists() {
-            eprintln!("skipped: /etc/shadow absent on this platform");
-            return;
-        }
-        let err = secret_readable_by(target, me)
+        let err = secret_readable_by(&p, me.wrapping_add(1))
             .expect_err("a file owned by another uid must be refused");
         assert!(
             matches!(err, AuthError::SecretNotOwned { .. }),
             "expected SecretNotOwned, got {err:?}"
         );
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -693,26 +693,48 @@ Append to the `tests` module in `crates/liostunnel-helper/src/auth.rs`:
     }
 
     #[test]
-    fn a_symlink_is_judged_by_its_target_not_the_link() {
-        // A symlink the caller owns pointing at a file they do not is the
-        // obvious bypass. `metadata` follows the link, which is what we want —
-        // this test pins that we did not reach for `symlink_metadata`.
-        let me = unsafe { libc::getuid() };
-        if me == 0 {
-            eprintln!("skipped: running as root");
-            return;
-        }
-        let target = std::path::Path::new("/etc/shadow");
-        if !target.exists() {
-            eprintln!("skipped: /etc/shadow absent");
-            return;
-        }
+    fn a_symlink_resolves_its_type_and_mode_through_the_link() {
+        // Pins that `metadata` follows the link: a symlink's own inode is not
+        // a regular file and its own mode is 0777, so an implementation using
+        // `symlink_metadata` fails the type check here.
+        //
+        // This test deliberately does NOT claim to prove ownership is read
+        // from the target. Both link and target are created by this process,
+        // so their owners are identical and the two implementations are
+        // indistinguishable on this fixture. The test below covers that.
         let d = scratch("symlink");
+        let target = write_owned(&d, 0o600);
         let link = d.join("link");
-        std::os::unix::fs::symlink(target, &link).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let me = unsafe { libc::getuid() };
+        assert!(secret_readable_by(&link, me).is_ok());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    #[ignore = "needs root: chowns a file to a non-root uid to make \
+                link-owner != target-owner. Run as root with: docker run --rm \
+                -v \"$PWD\":/w -w /w -e CARGO_TARGET_DIR=/w/target-linux \
+                rust:1.93-slim cargo test -p liostunnel-helper auth -- --include-ignored"]
+    fn a_root_owned_link_to_a_foreign_owned_target_is_still_refused() {
+        // A symlink the caller owns pointing at a file they do not is the
+        // obvious bypass, and the ONLY fixture that can prove ownership is
+        // resolved through the link is one where the two owners differ.
+        // Constructing that needs CAP_CHOWN, so this is #[ignore]d rather than
+        // silently returning early — an ignored test prints as "ignored",
+        // where a silent skip prints as a pass it never earned.
+        let me = unsafe { libc::getuid() };
+        assert_eq!(me, 0, "requires root; do not let it pass unrun, got uid {me}");
+        let d = scratch("symlink-foreign-owner");
+        let target = write_owned(&d, 0o600);      // root-owned
+        chown_to_nobody(&target);                  // now foreign-owned
+        let link = d.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();  // link stays root-owned
+        let err = secret_readable_by(&link, 0)
+            .expect_err("a link to a foreign-owned target must be refused");
         assert!(
-            secret_readable_by(&link, me).is_err(),
-            "a symlink to a file the caller does not own must be refused"
+            matches!(err, AuthError::SecretNotOwned { .. }),
+            "expected SecretNotOwned, got {err:?}"
         );
         std::fs::remove_dir_all(&d).ok();
     }
@@ -782,14 +804,28 @@ pub fn secret_readable_by(path: &Path, uid: u32) -> Result<(), AuthError> {
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p liostunnel-helper auth -- --nocapture`
-Expected: PASS — 8 passed (3 from Task 2 plus 5 new). Note any `skipped:` lines printed.
+Run: `cargo test -p liostunnel-helper auth`
+Expected: PASS — 10 passed, 1 ignored. **No test may print a `skipped:` line or take an early `return`** — a silent skip reports the same green as a real pass, which is how the first two attempts at this task shipped tests that proved nothing. The one ignored test is the root-only fixture, and it must be visible as `ignored`.
 
-- [ ] **Step 5: A/B the escalation test — this is exit criterion P1a-6**
+Then run it for real, as root, where the ignored test executes:
 
-Temporarily delete the `meta.uid() != uid` check — the naive implementation, which is what you would write if you had not thought about the daemon case. Run the tests. Confirm `a_file_owned_by_another_uid_is_refused` and `a_symlink_is_judged_by_its_target_not_the_link` both FAIL. Restore and confirm they pass.
+```bash
+docker run --rm -v "$PWD":/w -w /w -e CARGO_TARGET_DIR=/w/target-linux \
+  rust:1.93-slim cargo test -p liostunnel-helper auth -- --include-ignored
+```
+Expected: 11 passed, 0 ignored.
 
-Paste both transcripts. A security test that has never been seen failing is not evidence.
+- [ ] **Step 5: A/B both guards — this is exit criterion P1a-6**
+
+Two different defects, two different tests. Inject each separately and paste all four transcripts.
+
+**Ownership omitted.** Delete the `meta.uid() != uid` check — the naive implementation, which is what you would write if you had not thought about the daemon case. Confirm `a_file_owned_by_another_uid_is_refused` FAILS. Restore, confirm green.
+
+**Ownership read from the link.** Leave the type and mode checks on the followed `metadata`, but resolve ownership from a separate `symlink_metadata` call. This is the split-check refactor a later maintainer could plausibly introduce. Confirm `a_root_owned_link_to_a_foreign_owned_target_is_still_refused` FAILS in the container. Restore, confirm green.
+
+Note that `a_symlink_resolves_its_type_and_mode_through_the_link` stays green through the second break — by design. Its fixture has identical link and target owners, so it cannot see that defect, which is exactly why the root-only test exists.
+
+Paste all four transcripts. A security test that has never been seen failing is not evidence.
 
 - [ ] **Step 6: Commit**
 
