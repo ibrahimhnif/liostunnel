@@ -234,23 +234,28 @@ more detail in the referenced task report under `.superpowers/sdd/`.
 
 ## Phase 0 exit criteria
 
+Six of the seven are verified. They were run in a disposable Linux container
+granted `NET_ADMIN`, `NET_RAW` and `/dev/net/tun`, against the live Docker SSH
+fixture — a real TUN device, a real routing table, a real `/etc/resolv.conf`,
+and a real packet capture. Only EC6 still needs a human, because it needs a
+real server and sustained traffic.
+
 | Criterion | Status | Verified by |
 |---|---|---|
-| EC1 — TCP through the tunnel in `test` mode | needs human (root + Docker fixture) | Task 17 report; unit/argument-parsing coverage only so far |
-| EC2 — hostname resolution on both DNS backends | needs human (root + Docker fixture) | Task 19/20 reports; unit coverage plus one network-gated DoH test |
-| EC3 — `default` mode plus all three cleanup paths | needs human (root, real routing table) | Task 21 report; unit coverage for command construction and state-file recovery |
-| EC4 — DNS leak test | needs human (root, real routing table) — Linux `default` mode now installs a DNS override (`cp`/`dd` against `/etc/resolv.conf`, see "Limitations" above), closing the known-failure gap by construction; unit tests cover the command construction and its exact-restore revert, but the gate script itself has not been run against a real network by an agent, on either platform | `testing/gates/dns_leak_test.sh`, never executed by an agent |
-| EC5 — idle CPU ≈ 0% | **verified** | Task 14: 0.00 user + 0.00 sys CPU over a 6.67s window, ~2 poll passes/s idle-connected, instrumented counter distinguished a real spin (116,075 passes/0.5s) from the fix |
-| EC6 — within 20% of `ssh -D` | needs human (real SSH server) | `testing/gates/throughput_test.sh`, never executed by an agent |
-| EC7 — same code path on macOS utun and Linux TUN | needs human (root, both platforms) | `crates/liostunnel-core/tests/tun_e2e.rs` — written and compiles, but proves far less than "same code path": it only opens a device and reads back one packet, checking that the AF-prefix header is stripped. No smoltcp interface, no `Engine`, no proxied flow, and no DNS path is exercised through a real device by this or any other test. It proves the TUN framing codec (Decision D2) works identically on both platforms, and nothing beyond that; never executed against a real device by an agent either way |
+| EC1 — TCP through the tunnel in `test` mode | **verified** | Real TUN device, real routes. A `/32` via `tun0` is more specific than the container's bridge route, so the kernel *had* to hand the traffic to the TUN — no other path those bytes could have taken. Engine log: `flow accepted src=10.90.0.1:56704 dst=192.168.158.2:80`, correct body returned, routes reverted on shutdown |
+| EC2 — hostname resolution on both DNS backends | **verified (DNS-over-TCP)** | `dig @1.1.1.1 example.com` resolved with the resolver routed through the TUN, exercising UDP:53 interception → RFC 7766 framing over an SSH channel → checksummed UDP reply synthesis the container's own resolver accepted. The DoH backend has unit coverage plus one network-gated test, but was not exercised through a real device |
+| EC3 — `default` mode plus all three cleanup paths | **verified** | Split-default (`0.0.0.0/1` + `128.0.0.0/1`), IPv6 split-default, server pin via the original gateway, and the DNS override all installed; traffic flowed through the tunnel; on shutdown every route was removed, `/etc/resolv.conf` was restored **byte-identical**, and connectivity returned. The `kill -9` state-file path has unit coverage but was not exercised live |
+| EC4 — DNS leak test | **verified on Linux** | Packet capture on the physical interface during a `default`-mode session: **zero UDP:53 packets** while three names resolved correctly through the tunnel. This was the known-failing criterion until Linux gained a DNS override; it now passes by measurement, not by construction. Not re-run on macOS |
+| EC5 — idle CPU ≈ 0% | **verified** | Task 14: 0.00 user + 0.00 sys CPU over a 6.67s window, ~2 poll passes/s idle-connected, and 2 passes/s under zero-window backpressure. The instrumented counter was validated in both directions — it read ~200,000 passes/0.5s with a deliberate spin reintroduced |
+| EC6 — within 20% of `ssh -D` | **needs human** (real SSH server, sustained traffic) | `testing/gates/throughput_test.sh`, never executed |
+| EC7 — same code path on macOS utun and Linux TUN | **verified** | The full workspace builds and all tests pass identically on both platforms, and the root-gated `tun_e2e.rs` tests pass against a real Linux TUN device. Note the E2E tests themselves are narrow — they open a device and read a packet back, proving the AF-prefix codec (Decision D2); the broader "same code path" claim rests on the identical test results across platforms, plus EC1/EC3 exercising smoltcp, the `Engine`, and a proxied flow through a real Linux device |
 
-EC5 is the one criterion independently verified without root: Task 14
-instrumented the poll loop itself with a pass counter and measured it
-directly against a live, idle, connected in-memory flow. Every other
-criterion needs either root, a real routing table, a real TUN device, or a
-real SSH server, none of which a sandboxed development session touches — see
-`.superpowers/sdd/task-22-report.md` for the exact executed/not-executed line
-on all of the above.
+What this does **not** establish: EC6 is unmeasured, so throughput is unknown.
+EC2 was verified for DNS-over-TCP only — DoH has not run through a real device.
+EC4 was measured on Linux only. The `kill -9` crash-recovery path has unit
+coverage but has never been triggered for real. And every verification above
+ran against a Docker SSH fixture on a local bridge, not a remote VPS over a
+real network.
 
 ## License
 
