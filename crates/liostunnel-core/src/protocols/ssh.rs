@@ -499,6 +499,9 @@ impl SshTunnel {
             AuthMethod::PresharedKey { .. } => {
                 return Err(TunnelError::Unsupported("preshared-key authentication"));
             }
+            AuthMethod::Shadowsocks { .. } => {
+                return Err(TunnelError::Unsupported("shadowsocks authentication"));
+            }
         };
 
         match result {

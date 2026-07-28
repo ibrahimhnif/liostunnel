@@ -21,7 +21,7 @@ pub struct ProfileDto {
     pub protocol: String,
     pub host: String,
     pub port: u16,
-    /// `"password"`, `"private_key"` or `"preshared_key"`.
+    /// `"password"`, `"private_key"`, `"preshared_key"` or `"shadowsocks"`.
     pub auth_kind: String,
     /// Where the material lives — `"file:/path"` or `"env:NAME"` — never the
     /// material itself.
@@ -98,6 +98,13 @@ impl From<ServerProfile> for ProfileDto {
                 None,
                 Some(peer_public_key.clone()),
             ),
+            // The cipher name (`method`) has nowhere to land in this DTO yet —
+            // that lands with the Phase 1b config surface (cipher field on
+            // `ProfileDto`). Until then this loses the cipher on the way to
+            // Dart; it does not lose or expose the secret.
+            AuthMethod::Shadowsocks { password, .. } => {
+                ("shadowsocks", describe(password), None, None)
+            }
         };
 
         let (split_tunnel, split_tunnel_apps) = match &p.split_tunnel {

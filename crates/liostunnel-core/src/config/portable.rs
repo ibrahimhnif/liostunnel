@@ -148,6 +148,13 @@ impl PortableProfile {
                 private_key: store.resolve(private_key)?.into_inner(),
                 peer_public_key: peer_public_key.clone(),
             },
+            AuthMethod::Shadowsocks { .. } => {
+                // `PortableAuth` gains its own variant with the Phase 1b config
+                // surface (Task 5/6); until then there is nowhere to put the
+                // inlined secret, so export is refused rather than silently
+                // dropping it.
+                return Err(TunnelError::Unsupported("exporting a shadowsocks profile"));
+            }
         };
 
         Ok(Self {
