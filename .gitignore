@@ -11,3 +11,15 @@ known_hosts
 testing/docker/sshd/keys/
 
 .DS_Store
+
+# Flutter
+/app/build/
+/app/.dart_tool/
+/app/.flutter-plugins*
+/app/linux/flutter/ephemeral/
+/app/macos/Flutter/ephemeral/
+/app/macos/Pods/
+
+# Where the FRB-generated loader expects the cdylib. The workspace builds into
+# a shared /target, so this is a staged copy, not a source of truth.
+/crates/*/target/
