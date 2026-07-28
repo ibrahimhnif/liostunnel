@@ -157,6 +157,7 @@ pub async fn run(
     //    step 1, from the SSH connection itself, not re-resolved here.
     let manager = platform_manager();
     let gateway = manager.detect_gateway()?;
+    let ipv6_available = manager.ipv6_available();
 
     let plan = RoutePlan {
         interface,
@@ -164,7 +165,15 @@ pub async fn run(
         server_ip,
         original_gateway: gateway,
         dns_servers: profile.dns.servers.clone(),
+        ipv6_available,
     };
+
+    // Gap 2: be loud about IPv6 rather than let an operator discover it only
+    // when their v6 connectivity silently stops working. `None` in `test`
+    // mode, which never claimed to capture "everything" in the first place.
+    if let Some(notice) = ipv6_notice(&plan.mode, plan.ipv6_available) {
+        eprintln!("  !!  {notice}");
+    }
 
     // Third cleanup path: a state file that survives `kill -9`, which neither
     // `RouteGuard`'s `Drop` nor a signal handler can. Recover anything a
@@ -302,6 +311,38 @@ pub async fn run(
 enum Stop {
     Signal(std::io::Result<()>),
     EngineExited(Result<Result<(), TunnelError>, tokio::task::JoinError>),
+}
+
+/// What to tell the operator about IPv6 handling in `default` mode -- Gap 2's
+/// "be deliberate and loud" requirement: an operator who needs working IPv6
+/// must not discover its absence only when their connectivity silently
+/// breaks. Pure -- a match on already-computed values, no I/O -- so every
+/// branch is covered by a test with no TUN device, no routes, and no root,
+/// matching this module's own testing convention (see `describe_engine_exit`
+/// just below).
+///
+/// `None` in `test` mode: that mode only ever routes the CIDRs the operator
+/// explicitly listed and never claims to capture "everything", so there is
+/// nothing new to warn about there -- IPv6 was already outside its scope.
+fn ipv6_notice(mode: &RouteMode, ipv6_available: bool) -> Option<String> {
+    match mode {
+        RouteMode::Default if ipv6_available => Some(
+            "IPv6 traffic is being captured and DROPPED, not tunnelled. Phase 0's packet \
+             engine only parses IPv4 (net/smoltcp_stack/inspect.rs), so the IPv6 \
+             split-default this mode installs (::/1 + 8000::/1) routes v6 traffic into the \
+             TUN device only to blackhole it there. This is deliberate -- failing closed \
+             beats leaking in cleartext -- but if you need working IPv6 connectivity, this \
+             tool does not provide it yet."
+                .to_string(),
+        ),
+        RouteMode::Default => Some(
+            "This host has no working IPv6 stack, so `default` mode is not installing any \
+             IPv6 routes; there is no IPv6 traffic to misdirect, so there is nothing to \
+             blackhole."
+                .to_string(),
+        ),
+        RouteMode::Test { .. } => None,
+    }
 }
 
 /// Describes why the engine's task ended, for the log line and non-zero
@@ -494,5 +535,35 @@ mod tests {
             !msg.contains("panicked"),
             "a cancelled task must not be described as a panic: {msg}"
         );
+    }
+
+    // --- Gap 2: `ipv6_notice` ------------------------------------------------
+    //
+    // Pure, so every branch is covered without a TUN device, routes, or
+    // root -- this is the message an operator actually sees (via `eprintln!`
+    // at the call site in `run`) before their v6 traffic silently starts
+    // getting dropped instead of leaking.
+
+    #[test]
+    fn default_mode_with_ipv6_warns_that_v6_is_dropped_not_tunnelled() {
+        let msg = ipv6_notice(&RouteMode::Default, true).expect("must warn in this case");
+        assert!(msg.contains("DROPPED"), "{msg}");
+        assert!(msg.contains("::/1") && msg.contains("8000::/1"), "{msg}");
+    }
+
+    #[test]
+    fn default_mode_without_ipv6_explains_nothing_was_installed() {
+        let msg = ipv6_notice(&RouteMode::Default, false).expect("must warn in this case too");
+        assert!(msg.to_lowercase().contains("no working ipv6"), "{msg}");
+    }
+
+    #[test]
+    fn test_mode_gets_no_ipv6_notice() {
+        let mode = RouteMode::Test {
+            cidrs: vec!["93.184.216.0/24".parse().unwrap()],
+            capture_dns: false,
+        };
+        assert!(ipv6_notice(&mode, true).is_none());
+        assert!(ipv6_notice(&mode, false).is_none());
     }
 }

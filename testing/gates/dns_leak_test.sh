@@ -27,19 +27,21 @@
 #     this script was written could reopen a leak this exact command list
 #     does not happen to trigger.
 #
-# KNOWN, EXPECTED-TO-FAIL GAPS as of Task 22 (see README.md's Limitations
-# section and the Task 22 report for detail — do not treat either as a bug in
-# THIS script):
-#   - Linux `default` route mode installs no DNS override at all today.
-#     `/etc/resolv.conf` still points at the LAN resolver, reachable via a
-#     route more specific than the tunnel's split-default halves, so DNS
-#     genuinely leaves the machine outside the tunnel. Running this gate on
-#     Linux today is expected to FAIL, loudly, for exactly that reason.
-#   - IPv6 is not covered by routing in either platform's `default` mode
-#     (only `0.0.0.0/1` + `128.0.0.0/1` are installed; `::/0` is untouched).
-#     Any IPv6-only DNS traffic bypasses the tunnel entirely and this script
-#     WILL catch it (the capture filter below is address-family-agnostic),
-#     which is correct — it is not a false positive.
+# KNOWN GAPS as of the DNS/IPv6 fix pass (see README.md's Limitations section
+# and .superpowers/sdd/dns-ipv6-fixes-report.md for detail — do not treat
+# either as a bug in THIS script):
+#   - Linux `default` route mode now backs up and overwrites `/etc/resolv.conf`
+#     directly (`cp`/`dd` in `route/linux.rs`), closing what used to be a
+#     known, unconditional failure here. This has not yet been run against a
+#     real routing table by an agent, so treat it as newly-expected-to-PASS,
+#     not as independently verified.
+#   - IPv6 is now routed into the TUN device in both platforms' `default`
+#     mode (`::/1` + `8000::/1`, skipped only when the host has no working
+#     IPv6 stack at all) rather than left untouched — but the packet engine
+#     cannot carry IPv6 (`net/smoltcp_stack/inspect.rs` parses IPv4 only), so
+#     that traffic is blackholed, not tunnelled. Either way, no IPv6-only DNS
+#     traffic should reach the physical interface any more; if this script
+#     still observes any, that is a real FAIL, not a known/expected one.
 set -euo pipefail
 
 IFACE="${1:?usage: dns_leak_test.sh <physical-interface> [window-seconds]}"
@@ -71,10 +73,10 @@ fi
 
 case "$(uname -s)" in
   Linux)
-    echo "NOTE: running on Linux. As of Task 22, Linux's \`default\` route mode" >&2
-    echo "      installs no DNS override — this gate is EXPECTED TO FAIL on" >&2
-    echo "      Linux today. See README.md Limitations. A FAIL here is not a" >&2
-    echo "      bug in this script; it is this script doing its job." >&2
+    echo "NOTE: running on Linux. Linux's \`default\` route mode now backs up" >&2
+    echo "      and overwrites /etc/resolv.conf directly (see README.md" >&2
+    echo "      Limitations); this gate is expected to PASS here, but that has" >&2
+    echo "      not yet been confirmed against a real routing table." >&2
     ;;
 esac
 

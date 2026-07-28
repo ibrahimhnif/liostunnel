@@ -16,6 +16,35 @@ fn parse_gateway(text: &str) -> Option<IpAddr> {
         .and_then(|v| v.trim().parse().ok())
 }
 
+/// BSD `route`'s address-family flag, needed explicitly for IPv6
+/// destinations: unlike Linux's `ip`, macOS's `route` does not reliably infer
+/// family from a bare `::`-containing argument for `-host`/`-net` routes.
+fn family_flag(addr: &IpAddr) -> Option<&'static str> {
+    if addr.is_ipv6() { Some("-inet6") } else { None }
+}
+
+/// Builds the server-pin route command (`add` or `delete`), matching
+/// `route`'s family-flag requirement for whichever family `server_ip`
+/// actually is. Not reachable from `connect` today -- `SshTunnel::pick_ipv4`
+/// (`protocols/ssh.rs`) already refuses to resolve to an IPv6-only server
+/// address -- but Gap 2 asks route construction itself to handle the case
+/// correctly regardless, the same defence-in-depth `reject_full_default_prefixes`
+/// already gets both at CLI parse time and unconditionally again here.
+fn pin_command(verb: &str, server_ip: &IpAddr, original_gateway: &IpAddr) -> RouteCommand {
+    let mut args = vec!["-n".to_string(), verb.to_string()];
+    if let Some(flag) = family_flag(server_ip) {
+        args.push(flag.to_string());
+    }
+    args.push("-host".to_string());
+    args.push(server_ip.to_string());
+    args.push(original_gateway.to_string());
+    RouteCommand {
+        program: "route".into(),
+        args,
+        stdin: None,
+    }
+}
+
 impl RouteManager for MacOsRoutes {
     fn apply_commands(&self, plan: &RoutePlan) -> Result<Vec<RouteCommand>, TunnelError> {
         let mut cmds = Vec::new();
@@ -54,16 +83,7 @@ impl RouteManager for MacOsRoutes {
             RouteMode::Default => {
                 // The server pin comes first: install it after 0.0.0.0/1 and the
                 // SSH connection can be cut before its own escape route exists.
-                cmds.push(RouteCommand::new(
-                    "route",
-                    &[
-                        "-n",
-                        "add",
-                        "-host",
-                        &plan.server_ip.to_string(),
-                        &plan.original_gateway.to_string(),
-                    ],
-                ));
+                cmds.push(pin_command("add", &plan.server_ip, &plan.original_gateway));
                 // Two /1 routes beat 0.0.0.0/0 by being more specific, so the
                 // real default route is never deleted and restoring is exact.
                 for half in ["0.0.0.0/1", "128.0.0.0/1"] {
@@ -72,11 +92,38 @@ impl RouteManager for MacOsRoutes {
                         &["-n", "add", "-net", half, "-interface", &plan.interface],
                     ));
                 }
+                if plan.ipv6_available {
+                    // Gap 2: the packet engine only parses IPv4
+                    // (`net/smoltcp_stack/inspect.rs`'s `inspect` returns
+                    // `Ignored` for anything else), so routing v6 into the TUN
+                    // does not tunnel it -- it blackholes it. That is still
+                    // strictly better than leaving `::/0` untouched, which
+                    // lets v6 traffic (including v6-only DNS) bypass the
+                    // tunnel in cleartext. Skipped entirely when the host has
+                    // no IPv6 stack (`RoutePlan::ipv6_available`), because a
+                    // route command that fails there would abort this whole
+                    // apply partway through and strand the routes above.
+                    for half in ["::/1", "8000::/1"] {
+                        cmds.push(RouteCommand::new(
+                            "route",
+                            &[
+                                "-n",
+                                "add",
+                                "-inet6",
+                                "-net",
+                                half,
+                                "-interface",
+                                &plan.interface,
+                            ],
+                        ));
+                    }
+                }
                 let mut args = vec!["-setdnsservers".to_string(), "Wi-Fi".to_string()];
                 args.extend(plan.dns_servers.iter().map(|d| d.to_string()));
                 cmds.push(RouteCommand {
                     program: "networksetup".into(),
                     args,
+                    stdin: None,
                 });
             }
         }
@@ -118,21 +165,32 @@ impl RouteManager for MacOsRoutes {
                 }
             }
             RouteMode::Default => {
+                if plan.ipv6_available {
+                    for half in ["::/1", "8000::/1"] {
+                        cmds.push(RouteCommand::new(
+                            "route",
+                            &[
+                                "-n",
+                                "delete",
+                                "-inet6",
+                                "-net",
+                                half,
+                                "-interface",
+                                &plan.interface,
+                            ],
+                        ));
+                    }
+                }
                 for half in ["0.0.0.0/1", "128.0.0.0/1"] {
                     cmds.push(RouteCommand::new(
                         "route",
                         &["-n", "delete", "-net", half, "-interface", &plan.interface],
                     ));
                 }
-                cmds.push(RouteCommand::new(
-                    "route",
-                    &[
-                        "-n",
-                        "delete",
-                        "-host",
-                        &plan.server_ip.to_string(),
-                        &plan.original_gateway.to_string(),
-                    ],
+                cmds.push(pin_command(
+                    "delete",
+                    &plan.server_ip,
+                    &plan.original_gateway,
                 ));
                 cmds.push(RouteCommand::new(
                     "networksetup",

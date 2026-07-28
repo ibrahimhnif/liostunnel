@@ -29,12 +29,32 @@ pub struct RoutePlan {
     pub server_ip: IpAddr,
     pub original_gateway: IpAddr,
     pub dns_servers: Vec<IpAddr>,
+    /// Whether this host has a working IPv6 stack at all. Set once, before
+    /// construction, via [`RouteManager::ipv6_available`] (impure -- it opens
+    /// a socket) -- `apply_commands`/`revert_commands` only ever read this
+    /// flag, never probe for it themselves, exactly like `server_ip`,
+    /// `original_gateway`, and `dns_servers` above. Gates whether `Default`
+    /// mode's IPv6 split-default (`::/1` + `8000::/1`) is emitted at all: a
+    /// route command that fails on a v6-less host would abort the apply
+    /// mid-way and strand whatever was already installed, so a host with no
+    /// IPv6 support gets no IPv6 commands rather than a failing one.
+    pub ipv6_available: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RouteCommand {
     pub program: String,
     pub args: Vec<String>,
+    /// Content piped to the child process's stdin before it runs. `None` for
+    /// every ordinary route/DNS command, which take no input. The only user
+    /// today is Linux `Default` mode's DNS override (Gap 1): the replacement
+    /// `/etc/resolv.conf` body is textual and small (a handful of
+    /// `nameserver` lines), so a plain `String` -- not raw bytes, and not a
+    /// filesystem path -- keeps the value trivially part of the pure
+    /// construction path and trivially serializable into the crash-recovery
+    /// state file (`route/state.rs`) alongside `program`/`args`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdin: Option<String>,
 }
 
 impl RouteCommand {
@@ -42,13 +62,59 @@ impl RouteCommand {
         Self {
             program: program.to_string(),
             args: args.iter().map(|s| s.to_string()).collect(),
+            stdin: None,
+        }
+    }
+
+    /// Like [`Self::new`], but pipes `stdin` to the child process rather than
+    /// leaving it closed. Used to install new file content (e.g. a
+    /// replacement `/etc/resolv.conf`) without a shell: the destination path
+    /// is a literal argument, never interpolated, and the content travels
+    /// over a pipe rather than through anything a shell would parse.
+    pub fn with_stdin(program: &str, args: &[&str], stdin: impl Into<String>) -> Self {
+        Self {
+            program: program.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            stdin: Some(stdin.into()),
         }
     }
 
     pub fn run(&self) -> Result<(), TunnelError> {
-        let out = std::process::Command::new(&self.program)
-            .args(&self.args)
-            .output()
+        use std::io::Write;
+        use std::process::Stdio;
+
+        let mut command = std::process::Command::new(&self.program);
+        command.args(&self.args);
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        command.stdin(if self.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+
+        let mut child = command
+            .spawn()
+            .map_err(|e| TunnelError::Route(format!("cannot execute `{}`: {e}", self.program)))?;
+
+        if let Some(data) = &self.stdin {
+            // Written and dropped (closing the write end, so the child sees
+            // EOF) before `wait_with_output` reads anything back. Every
+            // caller today (`dd of=<path>`) writes a resolv.conf-sized body
+            // -- well under a pipe buffer -- so there is no reader/writer
+            // deadlock risk between this write and the child's own stdout;
+            // this is not a general-purpose subprocess I/O primitive.
+            let mut stdin = child
+                .stdin
+                .take()
+                .expect("stdin was requested as piped above");
+            stdin.write_all(data.as_bytes()).map_err(|e| {
+                TunnelError::Route(format!("cannot write to `{}`'s stdin: {e}", self.program))
+            })?;
+        }
+
+        let out = child
+            .wait_with_output()
             .map_err(|e| TunnelError::Route(format!("cannot execute `{}`: {e}", self.program)))?;
         if !out.status.success() {
             return Err(TunnelError::Route(format!(
@@ -118,11 +184,33 @@ pub fn dns_servers_needing_host_routes<'a>(
 }
 
 /// Command construction is pure so it can be unit-tested without privileges;
-/// only [`RouteCommand::run`] needs root. Spec §10.
+/// only [`RouteCommand::run`], `detect_gateway`, and `ipv6_available` touch
+/// the system. Spec §10.
 pub trait RouteManager: Send + Sync {
     fn apply_commands(&self, plan: &RoutePlan) -> Result<Vec<RouteCommand>, TunnelError>;
     fn revert_commands(&self, plan: &RoutePlan) -> Result<Vec<RouteCommand>, TunnelError>;
     fn detect_gateway(&self) -> Result<IpAddr, TunnelError>;
+
+    /// Whether this host has a working IPv6 stack at all -- not merely
+    /// "configured with a routable address", but able to create an `AF_INET6`
+    /// socket and bind it to `::1` in the first place. That is exactly the
+    /// condition under which `ip -6 route add`/`route -inet6 add` can
+    /// succeed, so it is the right gate for Gap 2's IPv6 split-default: a
+    /// host with IPv6 disabled at the kernel level (common in minimal
+    /// containers, e.g. `net.ipv6.conf.all.disable_ipv6=1`) would otherwise
+    /// have those route commands fail and abort `apply_commands` partway
+    /// through, stranding whatever was already installed.
+    ///
+    /// Identical on every platform, so it is a provided method rather than
+    /// something each `impl RouteManager` repeats. Deliberately outside
+    /// `apply_commands`/`revert_commands`: those stay pure and only ever read
+    /// [`RoutePlan::ipv6_available`], which callers (e.g. `connect.rs`) are
+    /// expected to fill in from this method before building the plan --
+    /// exactly the same pattern `detect_gateway` already established for
+    /// `original_gateway`.
+    fn ipv6_available(&self) -> bool {
+        std::net::UdpSocket::bind("[::1]:0").is_ok()
+    }
 }
 
 pub fn platform_manager() -> Box<dyn RouteManager> {
@@ -194,6 +282,20 @@ mod tests {
             server_ip: "198.51.100.7".parse().unwrap(),
             original_gateway: "192.168.1.1".parse().unwrap(),
             dns_servers: vec!["1.1.1.1".parse().unwrap()],
+            // The common case for existing tests below, which predate Gap 2
+            // and are not about IPv6 availability at all: a host with a
+            // working IPv6 stack. Tests that care about the `false` case use
+            // `plan_ipv6` directly instead of this default.
+            ipv6_available: true,
+        }
+    }
+
+    /// Like `plan`, but with an explicit IPv6-availability flag, for tests
+    /// that specifically exercise Gap 2's host-has-no-IPv6 gate.
+    fn plan_ipv6(mode: RouteMode, ipv6_available: bool) -> RoutePlan {
+        RoutePlan {
+            ipv6_available,
+            ..plan(mode)
         }
     }
 
@@ -258,6 +360,7 @@ mod tests {
             server_ip: "198.51.100.7".parse().unwrap(),
             original_gateway: "192.168.1.1".parse().unwrap(),
             dns_servers: vec!["1.1.1.1".parse().unwrap()],
+            ipv6_available: true,
         };
 
         for (name, cmds) in [
@@ -290,6 +393,7 @@ mod tests {
                 "1.1.1.1".parse().unwrap(), // covered by the /24
                 "9.9.9.9".parse().unwrap(), // not covered, still needs its route
             ],
+            ipv6_available: true,
         };
 
         for (name, cmds) in [
@@ -324,8 +428,10 @@ mod tests {
             ),
         ] {
             assert!(
-                !r.iter()
-                    .any(|c| c.contains("0.0.0.0/1") || c.contains("128.0.0.0/1")),
+                !r.iter().any(|c| c.contains("0.0.0.0/1")
+                    || c.contains("128.0.0.0/1")
+                    || c.contains("::/1")
+                    || c.contains("8000::/1")),
                 "test mode must not install default-beating routes: {r:?}"
             );
         }
@@ -592,8 +698,21 @@ mod tests {
         // only means this test asserts the property that actually matters --
         // every network/host we add is removed, nothing extra is removed --
         // without assuming a syntax both platforms don't share.
+        //
+        // DNS-management commands (macOS's `networksetup`, Linux's `cp`/`dd`
+        // backup-and-write pair for `/etc/resolv.conf`) are excluded from this
+        // destination comparison entirely: they carry file paths, not
+        // route/host destinations, and `/etc/resolv.conf` appears as *both*
+        // source and destination arguments across the backup/write/restore
+        // trio, which would make a naive "first arg containing '/'" match
+        // compare the wrong tokens. Their own apply/revert correctness is
+        // covered by dedicated tests below instead.
+        fn is_dns_command(program: &str) -> bool {
+            matches!(program, "networksetup" | "cp" | "dd")
+        }
+
         fn destination(cmd: &RouteCommand) -> Option<String> {
-            if cmd.program == "networksetup" {
+            if is_dns_command(&cmd.program) {
                 return None;
             }
             cmd.args
@@ -628,7 +747,7 @@ mod tests {
             // then survive teardown, wedging the operator's network for exactly
             // as long as the interface outlives the process.
             for cmd in &reverted {
-                if cmd.program == "networksetup" {
+                if is_dns_command(&cmd.program) {
                     continue;
                 }
                 assert!(
@@ -637,7 +756,7 @@ mod tests {
                 );
             }
             for cmd in &applied {
-                if cmd.program == "networksetup" {
+                if is_dns_command(&cmd.program) {
                     continue;
                 }
                 assert!(
@@ -659,5 +778,213 @@ mod tests {
     // would need `apply_commands` to read current system state, which would
     // break the "construction stays pure, no fs/process access" contract
     // Task 16 established -- so this is left as a known Phase 0 limitation
-    // rather than "fixed" here.
+    // rather than "fixed" here. Linux's own DNS override (`route/linux.rs`,
+    // Gap 2 report) does not share this limitation: it backs up and restores
+    // the exact original file rather than resetting to some other state, and
+    // that exactness is covered directly by linux.rs's own tests.
+
+    // --- Gap 2: IPv6 split-default -----------------------------------------
+    //
+    // `rendered()` strings are space-joined, and IPv6 CIDRs collide under a
+    // plain substring search in a way IPv4's `"0.0.0.0/1"`/`"128.0.0.0/1"`
+    // never do: `"8000::/1"` itself contains the substring `"::/1"`. Every
+    // v6-specific assertion below matches a whole whitespace-delimited token
+    // instead of using `str::contains`, to avoid the false positive that
+    // substring search would produce between the two halves.
+    fn has_token(line: &str, token: &str) -> bool {
+        line.split_whitespace().any(|t| t == token)
+    }
+
+    #[test]
+    fn default_mode_installs_the_v6_split_default_when_the_host_has_ipv6() {
+        // A/B'd against the pre-fix code: before this change, neither
+        // platform's `Default` arm emitted `::/1`/`8000::/1` at all, so
+        // `::/0` stayed untouched and every v6 packet left the machine
+        // outside the tunnel in cleartext -- this test failed on both
+        // `any(...)` assertions below. The packet engine cannot carry IPv6
+        // (`net::smoltcp_stack::inspect::inspect` parses IPv4 only and
+        // reports `Ignored` for anything else), so routing v6 into the TUN
+        // does not tunnel it -- it blackholes it, which is still the right
+        // trade for a privacy tool: failing closed beats leaking in
+        // cleartext.
+        for (name, cmds) in [
+            (
+                "macos",
+                macos::MacOsRoutes.apply_commands(&default_plan()).unwrap(),
+            ),
+            (
+                "linux",
+                linux::LinuxRoutes.apply_commands(&default_plan()).unwrap(),
+            ),
+        ] {
+            let r = rendered(&cmds);
+            assert!(r.iter().any(|c| has_token(c, "::/1")), "{name}: {r:?}");
+            assert!(r.iter().any(|c| has_token(c, "8000::/1")), "{name}: {r:?}");
+            assert_no_default_route_deletion(name, &r);
+        }
+    }
+
+    #[test]
+    fn reverting_default_mode_removes_the_v6_split_default_symmetrically() {
+        for (name, cmds) in [
+            (
+                "macos",
+                macos::MacOsRoutes.revert_commands(&default_plan()).unwrap(),
+            ),
+            (
+                "linux",
+                linux::LinuxRoutes.revert_commands(&default_plan()).unwrap(),
+            ),
+        ] {
+            let r = rendered(&cmds);
+            for half in ["::/1", "8000::/1"] {
+                let line = r
+                    .iter()
+                    .find(|c| has_token(c, half))
+                    .unwrap_or_else(|| panic!("{name}: no revert command found for {half}: {r:?}"));
+                assert!(
+                    line.contains("delete") || line.contains(" del "),
+                    "{name}: {half}'s revert must actually delete it: {line}"
+                );
+            }
+            assert_no_default_route_deletion(name, &r);
+        }
+    }
+
+    #[test]
+    fn default_mode_skips_the_v6_split_default_when_the_host_has_no_ipv6() {
+        // Gap 2's explicit failure-mode guard: a route command that fails on
+        // a v6-less host (IPv6 disabled at the kernel level, which is common
+        // in minimal containers) would abort `apply_commands` partway
+        // through and strand whatever was already installed. A host with no
+        // IPv6 stack must get no IPv6 route commands in either direction --
+        // not just skipped on apply, but not referenced on revert either,
+        // since nothing was ever installed to remove.
+        let p = plan_ipv6(RouteMode::Default, false);
+        for (name, mgr) in [
+            (
+                "macos",
+                Box::new(macos::MacOsRoutes) as Box<dyn RouteManager>,
+            ),
+            ("linux", Box::new(linux::LinuxRoutes)),
+        ] {
+            let r_apply = rendered(&mgr.apply_commands(&p).unwrap());
+            let r_revert = rendered(&mgr.revert_commands(&p).unwrap());
+            for r in [&r_apply, &r_revert] {
+                assert!(
+                    !r.iter()
+                        .any(|c| has_token(c, "::/1") || has_token(c, "8000::/1")),
+                    "{name}: a v6-less host must get no IPv6 route commands: {r:?}"
+                );
+            }
+            // The rest of `Default` mode -- pin, v4 halves, DNS override --
+            // must still be installed; the flag gates IPv6 alone.
+            assert!(
+                r_apply.iter().any(|c| c.contains("0.0.0.0/1")),
+                "{name}: {r_apply:?}"
+            );
+            assert!(
+                r_apply.iter().any(|c| c.contains("128.0.0.0/1")),
+                "{name}: {r_apply:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_server_pin_precedes_the_v6_split_default_too() {
+        // Same reasoning as `assert_pin_precedes_both_halves`: the pin must
+        // exist before *any* default-beating route, v4 or v6, or the SSH
+        // connection could be cut before its own escape route does.
+        for (name, cmds) in [
+            (
+                "macos",
+                rendered(&macos::MacOsRoutes.apply_commands(&default_plan()).unwrap()),
+            ),
+            (
+                "linux",
+                rendered(&linux::LinuxRoutes.apply_commands(&default_plan()).unwrap()),
+            ),
+        ] {
+            let pin = cmds
+                .iter()
+                .position(|c| c.contains("198.51.100.7"))
+                .unwrap_or_else(|| panic!("{name}: no server pin found: {cmds:?}"));
+            for half in ["::/1", "8000::/1"] {
+                let at = cmds
+                    .iter()
+                    .position(|c| has_token(c, half))
+                    .unwrap_or_else(|| panic!("{name}: no {half} route found: {cmds:?}"));
+                assert!(pin < at, "{name}: server pin must precede {half}: {cmds:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn default_mode_pins_an_ipv6_ssh_server_correctly() {
+        // Not reachable from `connect` today: `SshTunnel::pick_ipv4`
+        // (`protocols/ssh.rs`) already refuses to resolve to an IPv6-only
+        // server address, specifically because route construction used to
+        // hardcode a `/32` and an IPv4-shaped command. This test exists so
+        // route construction is correct in its own right -- defence in
+        // depth, the same reasoning `reject_full_default_prefixes` already
+        // gets both at CLI parse time and unconditionally again inside
+        // `apply_commands`/`revert_commands` -- not because this is a live
+        // production path yet.
+        let p = RoutePlan {
+            interface: "utun7".into(),
+            mode: RouteMode::Default,
+            server_ip: "2001:db8::7".parse().unwrap(),
+            original_gateway: "2001:db8::1".parse().unwrap(),
+            dns_servers: vec!["1.1.1.1".parse().unwrap()],
+            ipv6_available: true,
+        };
+
+        let linux_cmds = rendered(&linux::LinuxRoutes.apply_commands(&p).unwrap());
+        assert!(
+            linux_cmds
+                .iter()
+                .any(|c| c.contains("2001:db8::7/128") && c.contains("2001:db8::1")),
+            "linux must pin an IPv6 server with a /128, not a /32: {linux_cmds:?}"
+        );
+        assert!(
+            !linux_cmds.iter().any(|c| c.contains("2001:db8::7/32")),
+            "linux must never emit a /32 for an IPv6 address: {linux_cmds:?}"
+        );
+
+        let macos_cmds = rendered(&macos::MacOsRoutes.apply_commands(&p).unwrap());
+        assert!(
+            macos_cmds.iter().any(|c| c.contains("-inet6")
+                && c.contains("2001:db8::7")
+                && c.contains("2001:db8::1")),
+            "macos must pin an IPv6 server with -inet6: {macos_cmds:?}"
+        );
+
+        let linux_revert = rendered(&linux::LinuxRoutes.revert_commands(&p).unwrap());
+        assert!(
+            linux_revert
+                .iter()
+                .any(|c| c.contains("2001:db8::7/128") && (c.contains("del"))),
+            "linux revert must remove the /128 pin: {linux_revert:?}"
+        );
+        let macos_revert = rendered(&macos::MacOsRoutes.revert_commands(&p).unwrap());
+        assert!(
+            macos_revert
+                .iter()
+                .any(|c| c.contains("-inet6") && c.contains("2001:db8::7")),
+            "macos revert must remove the -inet6 pin: {macos_revert:?}"
+        );
+    }
+
+    #[test]
+    fn default_mode_overrides_dns_on_linux_too() {
+        // A/B'd against the pre-fix code: before this change, Linux's
+        // `Default` arm emitted no DNS-related command at all, so this
+        // `any(...)` found nothing and failed. `linux.rs`'s own tests cover
+        // the `cp`/`dd` mechanism in detail; this is the cross-platform
+        // sanity check that both platforms' `Default` mode do *something*
+        // to override DNS, mirroring `default_mode_overrides_dns` above.
+        let r = rendered(&linux::LinuxRoutes.apply_commands(&default_plan()).unwrap());
+        assert!(r.iter().any(|c| c.starts_with("cp ")), "{r:?}");
+        assert!(r.iter().any(|c| c.starts_with("dd ")), "{r:?}");
+    }
 }

@@ -121,35 +121,69 @@ are never logged — only counts, IP addresses, and error shapes are.
 These are current, real gaps — not aspirational TODOs. Each is discussed in
 more detail in the referenced task report under `.superpowers/sdd/`.
 
-- **Linux's `default` route mode does not override DNS at all.**
-  `/etc/resolv.conf` keeps pointing at whatever resolver was configured
-  before `connect` ran, and it stays reachable via a route more specific
-  than the split-default halves the tunnel installs — so on Linux, DNS
-  genuinely leaves the machine outside the tunnel today. macOS's `default`
-  mode does override DNS (`networksetup -setdnsservers`). This is expected
-  to make `testing/gates/dns_leak_test.sh` fail on Linux; see that script's
-  own header and `testing/gates/README.md`.
-- **IPv6 is entirely uncovered.** Only the IPv4 split-default
-  (`0.0.0.0/1` + `128.0.0.0/1`) is installed; `::/0` is untouched on both
-  platforms, so all IPv6 traffic — including IPv6-only DNS — bypasses the
-  tunnel entirely.
+- **Linux's `default` route mode now overrides DNS by backing up and
+  overwriting `/etc/resolv.conf` directly**, rather than doing nothing (the
+  prior gap). `apply_commands` emits `cp /etc/resolv.conf
+  /etc/resolv.conf.liostunnel-backup` followed by a `dd of=/etc/resolv.conf`
+  whose new body travels over `RouteCommand`'s stdin, never through a shell
+  or an interpolated string — the same injection surface `printf > file`
+  would have opened. Revert restores the exact original file with
+  `cp /etc/resolv.conf.liostunnel-backup /etc/resolv.conf` (an exact restore,
+  not macOS's "reset to automatic"), and that revert command lives in the
+  crash-recovery state file exactly like every route command, so a `kill -9`
+  mid-session still gets DNS back on the next start. `resolvectl dns`
+  (systemd-resolved) was considered and rejected: it is absent on many
+  systems, including the plain Debian container this fix is verified
+  against, and detecting its presence is itself impure. Two residual gaps
+  from this approach: if `/etc/resolv.conf` is a symlink (e.g.
+  systemd-resolved's `stub-resolv.conf`), the backup/restore preserves the
+  *content* it points at but not the symlink structure itself, since both
+  `cp` directions dereference; and the backup file
+  (`/etc/resolv.conf.liostunnel-backup`) is left in place after a clean
+  revert rather than removed, though it is simply overwritten by the next
+  `connect`. This is expected to flip `testing/gates/dns_leak_test.sh` from
+  a known failure to a real pass on Linux; see that script's own header and
+  `testing/gates/README.md` — still unverified by an agent, since it needs a
+  real routing table.
+- **IPv6 is now captured and dropped, not left to leak — but the packet
+  engine still cannot carry it.** `default` mode installs an IPv6
+  split-default (`::/1` + `8000::/1`) via the TUN device on both platforms,
+  alongside the existing IPv4 halves, so v6 traffic no longer bypasses the
+  tunnel in cleartext. But `net/smoltcp_stack/inspect.rs`'s `inspect` parses
+  IPv4 only and reports `Ignored` for anything else, so routing v6 into the
+  TUN does not tunnel it — it blackholes it. That is a deliberate trade
+  (failing closed beats leaking), and `connect` says so loudly at startup
+  before routes go in. The IPv6 split-default is skipped entirely — with no
+  error — on a host with no working IPv6 stack at all (`RouteManager::
+  ipv6_available` probes this by binding a UDP socket to `[::1]:0`), because
+  a route command that failed on such a host would abort `apply_commands`
+  partway through and strand the routes already installed; `connect` says
+  which case applies. The server-pin route is now family-correct too (a
+  `/128`, and macOS's `-inet6`, for an IPv6 server address) as defence in
+  depth, though this is not reachable from `connect` today —
+  `SshTunnel::pick_ipv4` (`protocols/ssh.rs`) already refuses to resolve to
+  an IPv6-only server, and `detect_gateway` on both platforms only ever
+  detects the IPv4 default gateway, so a real dual-stack-gateway story for
+  an IPv6 SSH server remains unimplemented, not just untested.
 - **macOS's DNS-override revert does not restore a pre-existing manual DNS
   configuration.** It resets to "automatic" (DHCP-assigned) DNS, which is a
   no-op for the common case (no manual override already in place) but is not
-  an exact restore for an operator who had one.
+  an exact restore for an operator who had one. (Linux's own DNS override,
+  above, does not share this limitation.)
 - **macOS's DNS override hardcodes the `"Wi-Fi"` network service**
   (`route/macos.rs`). `networksetup -setdnsservers Wi-Fi ...` silently
   targets the wrong (or a nonexistent) service on any machine connected via
   Ethernet, Thunderbolt, or a `Wi-Fi` service renamed or localised to
   something else — the DNS override simply does not take effect, with no
   error surfaced to the operator. Worse, because this `networksetup` command
-  is the *last* command in `default` mode's apply list, a failure there
+  is the *last* command in `default` mode's apply list (matched, on Linux,
+  by the `cp`/`dd` DNS-override pair also being last), a failure there
   (e.g. the service genuinely doesn't exist, so the command itself errors)
   means `RouteGuard::apply` returns `Err` *before* the `RouteGuard` is ever
   constructed — so its `Drop`-based revert never runs, and the server pin
-  plus both `/1` split-default halves are left installed with no in-process
-  path to remove them (only the crash-recovery state file, on the *next*
-  `connect` run, cleans them up).
+  plus both `/1` split-default halves (and, when installed, the IPv6 pair)
+  are left installed with no in-process path to remove them (only the
+  crash-recovery state file, on the *next* `connect` run, cleans them up).
 - **Windows has no TUN implementation and no descriptor-based wakeup path.**
   The PRD lists Windows as a target platform; Phase 0 is macOS/Linux only.
 - **No kill switch and no split-tunnel enforcement.** Both fields parse and
@@ -205,7 +239,7 @@ more detail in the referenced task report under `.superpowers/sdd/`.
 | EC1 — TCP through the tunnel in `test` mode | needs human (root + Docker fixture) | Task 17 report; unit/argument-parsing coverage only so far |
 | EC2 — hostname resolution on both DNS backends | needs human (root + Docker fixture) | Task 19/20 reports; unit coverage plus one network-gated DoH test |
 | EC3 — `default` mode plus all three cleanup paths | needs human (root, real routing table) | Task 21 report; unit coverage for command construction and state-file recovery |
-| EC4 — DNS leak test | **known failure on Linux** (not merely unverified — Linux `default` mode installs no DNS override at all, so DNS provably leaves the tunnel there by construction, not by an untested edge case); macOS still needs human verification | `testing/gates/dns_leak_test.sh`, never executed by an agent |
+| EC4 — DNS leak test | needs human (root, real routing table) — Linux `default` mode now installs a DNS override (`cp`/`dd` against `/etc/resolv.conf`, see "Limitations" above), closing the known-failure gap by construction; unit tests cover the command construction and its exact-restore revert, but the gate script itself has not been run against a real network by an agent, on either platform | `testing/gates/dns_leak_test.sh`, never executed by an agent |
 | EC5 — idle CPU ≈ 0% | **verified** | Task 14: 0.00 user + 0.00 sys CPU over a 6.67s window, ~2 poll passes/s idle-connected, instrumented counter distinguished a real spin (116,075 passes/0.5s) from the fix |
 | EC6 — within 20% of `ssh -D` | needs human (real SSH server) | `testing/gates/throughput_test.sh`, never executed by an agent |
 | EC7 — same code path on macOS utun and Linux TUN | needs human (root, both platforms) | `crates/liostunnel-core/tests/tun_e2e.rs` — written and compiles, but proves far less than "same code path": it only opens a device and reads back one packet, checking that the AF-prefix header is stripped. No smoltcp interface, no `Engine`, no proxied flow, and no DNS path is exercised through a real device by this or any other test. It proves the TUN framing codec (Decision D2) works identically on both platforms, and nothing beyond that; never executed against a real device by an agent either way |

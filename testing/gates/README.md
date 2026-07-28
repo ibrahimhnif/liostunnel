@@ -63,23 +63,34 @@ These are properties of the tunnel itself, not of the script — recorded here
 so a FAIL is legible instead of mysterious, and in `README.md`'s own
 Limitations section at the repository root:
 
-- **Linux's `default` route mode installs no DNS override at all.**
-  `/etc/resolv.conf` still points at whatever LAN resolver was configured
-  before `connect` ran, and that resolver is reachable via a connected route
-  more specific than either `0.0.0.0/1` half the tunnel installs — so DNS
-  genuinely leaves the machine outside the tunnel on Linux today. Running
-  `dns_leak_test.sh` on Linux is **expected to FAIL** for exactly this
-  reason; the script prints an explicit note about this before it starts
-  capturing, so the failure isn't mistaken for a bug in the gate itself.
-- **IPv6 is entirely uncovered.** Only the IPv4 split-default
-  (`0.0.0.0/1` + `128.0.0.0/1`) is installed in `default` mode; `::/0` is
-  untouched, so all IPv6 traffic — including IPv6-only DNS — bypasses the
-  tunnel. `dns_leak_test.sh`'s capture filter (`port 53`) is
-  address-family-agnostic, so it **will** catch an IPv6 leak; that's the
-  gate doing its job, not a false positive.
+- **Linux's `default` route mode now backs up and overwrites
+  `/etc/resolv.conf` directly** (`cp` for the backup, then a `dd` write over
+  stdin — no shell, no interpolated resolver strings) rather than doing
+  nothing, closing what used to be an unconditional failure here. Revert
+  restores the exact original file, and that revert command rides in the
+  crash-recovery state file like any route command, so a `kill -9` still
+  restores DNS on the next start. `dns_leak_test.sh` prints a note on Linux
+  reflecting this; running it is now expected to **PASS**, but that has not
+  yet been confirmed against a real routing table by an agent — see
+  `README.md`'s Limitations section and
+  `.superpowers/sdd/dns-ipv6-fixes-report.md` for the mechanism and its
+  residual edge cases (a symlinked `/etc/resolv.conf`, and the leftover
+  backup file after a clean revert).
+- **IPv6 is now routed into the TUN device in `default` mode on both
+  platforms** (`::/1` + `8000::/1`, skipped only when the host has no
+  working IPv6 stack), rather than left completely untouched — but the
+  packet engine still cannot carry IPv6 (`net/smoltcp_stack/inspect.rs`
+  parses IPv4 only), so that traffic is blackholed, not tunnelled.
+  `dns_leak_test.sh`'s capture filter (`port 53`) is address-family-agnostic,
+  so it will still catch an IPv6 DNS leak if the blackhole ever fails to
+  apply (e.g. the host-has-no-IPv6 skip guessed wrong) — that would now be a
+  real FAIL, not an expected one.
 
-Both gaps are current, real limitations of Phase 0 as implemented through
-Task 21, not something introduced by this task's gate scripts.
+Both gaps are current, real properties of Phase 0 as implemented, not
+something introduced by this task's gate scripts. The fixes above have only
+been verified through pure unit tests (command construction, not real routes
+or a real network); running these gates against a live system is still
+unverified by an agent.
 
 ## What was and was not run when these gates were written
 
