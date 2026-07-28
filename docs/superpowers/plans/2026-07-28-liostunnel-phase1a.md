@@ -1242,16 +1242,64 @@ mod tests {
 
     #[test]
     fn a_malformed_line_does_not_carry_its_contents_back() {
-        // serde_json's Display echoes the offending input. Phase 0 shipped
-        // exactly this leak in profile_io::load, where a misplaced secret came
-        // back in the error text. The same rule crosses the socket.
+        // serde_json's Display echoes parts of the input, and Phase 0 shipped
+        // exactly that leak in profile_io::load. The same rule crosses the
+        // socket.
+        //
+        // Measured which shapes actually echo, because guessing produced a
+        // test that could not fail: serde_json quotes KEYS and ENUM TAGS,
+        // never values.
+        //
+        //   {"type":"X"}             -> unknown variant `X`, expected …   LEAKS
+        //   {…,"params":{"X":…}}     -> unknown field `X`, expected …     LEAKS
+        //   {…,"profile_json":"X"}   -> missing field `user`              no echo
+        //   {…,"profile_json":X}     -> expected value at line 1 col 51   no echo
+        //
+        // Put the marker in a value and the test passes against a
+        // deliberately echoing implementation, proving nothing.
+        let leaky = [
+            r#"{"type":"hunter2-SECRET","id":1}"#,
+            r#"{"type":"connect","id":1,"params":{"hunter2-SECRET":"x"}}"#,
+        ];
+        for line in leaky {
+            let mut s = Session::new();
+            let joined = s.handle(line).join(" ");
+            assert!(
+                !joined.contains("hunter2-SECRET"),
+                "the error must not echo request content.\n  input: {line}\n  reply: {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_hello_does_not_leave_the_session_greeted() {
+        // Otherwise the version gate is decorative: a mismatched client is
+        // told to reinstall and then served anyway.
         let mut s = Session::new();
-        let out = s.handle(r#"{"type":"connect","id":1,"params":{"profile_json":"hunter2-SECRET"}}"#);
-        let joined = out.join(" ");
-        assert!(
-            !joined.contains("hunter2-SECRET"),
-            "the error must not echo request content: {joined}"
-        );
+        s.handle(&serde_json::to_string(&Request::Hello {
+            id: 1, protocol_version: PROTOCOL_VERSION + 1,
+        }).unwrap());
+        let v = parse_one(&s.handle(&serde_json::to_string(&Request::GetStatus { id: 2 }).unwrap()));
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["kind"], "bad_request");
+    }
+
+    #[test]
+    fn every_reply_is_a_single_line() {
+        // The framing is newline-delimited JSON, so an embedded newline in a
+        // reply desynchronises the client for the rest of the connection.
+        // Cheap to pin, impossible to notice by eye.
+        let mut s = Session::new();
+        let mut all: Vec<String> = vec![];
+        all.extend(s.handle("{not json"));
+        all.extend(s.handle(&serde_json::to_string(&Request::Hello {
+            id: 1, protocol_version: PROTOCOL_VERSION,
+        }).unwrap()));
+        all.extend(s.handle(&serde_json::to_string(&Request::GetStatus { id: 2 }).unwrap()));
+        for line in &all {
+            assert!(!line.contains('\n'), "reply must be one line: {line:?}");
+        }
+        assert!(!all.is_empty());
     }
 
     #[test]
@@ -1407,15 +1455,15 @@ Add `mod dispatch;` to `main.rs`.
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p liostunnel-helper dispatch`
-Expected: PASS — 7 passed.
+Expected: PASS — 10 passed.
 
 - [ ] **Step 5: A/B the secret-echo test**
 
 Temporarily change the malformed-JSON arm to include the serde error:
 `&format!("malformed request: {e}")`. Run the tests. Confirm
-`a_malformed_line_does_not_carry_its_contents_back` FAILS. Restore and confirm it passes.
+`a_malformed_line_does_not_carry_its_contents_back` FAILS with the unknown-variant message quoting the marker. Restore and confirm it passes.
 
-Paste both. This is the same leak Phase 0 shipped and had to fix in Task 8; the test only means something if it has been seen catching it.
+Paste both. This is the same leak Phase 0 shipped and had to fix in Task 8; the test only means something if it has been seen catching it. **If it does not go red, the test is wrong, not the implementation** — check the marker is in a key or tag position, since serde_json never quotes values.
 
 - [ ] **Step 6: Commit**
 
