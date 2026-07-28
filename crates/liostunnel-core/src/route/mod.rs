@@ -92,6 +92,31 @@ pub fn reject_full_default_prefixes(cidrs: &[IpNet]) -> Result<(), TunnelError> 
     Ok(())
 }
 
+/// Which resolver addresses still need their own host route in `test` mode.
+///
+/// `--capture-dns` adds a host route per resolver so DNS reaches the TUN. If
+/// the operator also listed a prefix that already covers that resolver, the
+/// two collide: the kernel rejects the duplicate with `RTNETLINK answers: File
+/// exists` (Linux) and the whole apply fails partway, leaving earlier routes
+/// installed with no guard to remove them.
+///
+/// Found by running `--cidr 1.1.1.1/32 --capture-dns` against a real routing
+/// table with `dns.servers = ["1.1.1.1"]` — a natural thing for an operator to
+/// type, and it made `connect` fail outright.
+///
+/// Containment rather than equality: a listed `1.1.1.0/24` covers `1.1.1.1`
+/// just as surely as `1.1.1.1/32` does, and the kernel would reject that
+/// duplicate too.
+pub fn dns_servers_needing_host_routes<'a>(
+    cidrs: &[IpNet],
+    dns_servers: &'a [IpAddr],
+) -> Vec<&'a IpAddr> {
+    dns_servers
+        .iter()
+        .filter(|dns| !cidrs.iter().any(|c| c.contains(*dns)))
+        .collect()
+}
+
 /// Command construction is pure so it can be unit-tested without privileges;
 /// only [`RouteCommand::run`] needs root. Spec §10.
 pub trait RouteManager: Send + Sync {
@@ -214,6 +239,74 @@ mod tests {
             .apply_commands(&plan(test_mode(false)))
             .unwrap();
         assert_eq!(rendered(&cmds)[0], "ip route add 93.184.216.0/24 dev utun7");
+    }
+
+    #[test]
+    fn capture_dns_does_not_duplicate_a_route_the_operator_already_listed() {
+        // Regression: `--cidr 1.1.1.1/32 --capture-dns` with dns.servers =
+        // ["1.1.1.1"] emitted the same route twice. Against a real routing
+        // table the second one fails -- Linux answers `RTNETLINK answers: File
+        // exists` -- and because that happens mid-apply, `RouteGuard::apply`
+        // returns Err before the guard exists, stranding the routes already
+        // installed. Found by running `connect` for real, not by inspection.
+        let p = RoutePlan {
+            interface: "utun7".into(),
+            mode: RouteMode::Test {
+                cidrs: vec!["1.1.1.1/32".parse().unwrap()],
+                capture_dns: true,
+            },
+            server_ip: "198.51.100.7".parse().unwrap(),
+            original_gateway: "192.168.1.1".parse().unwrap(),
+            dns_servers: vec!["1.1.1.1".parse().unwrap()],
+        };
+
+        for (name, cmds) in [
+            ("macos", macos::MacOsRoutes.apply_commands(&p).unwrap()),
+            ("linux", linux::LinuxRoutes.apply_commands(&p).unwrap()),
+        ] {
+            let r = rendered(&cmds);
+            assert_eq!(
+                r.len(),
+                1,
+                "{name}: the resolver is already covered by a listed CIDR, so it \
+                 must not also get its own host route: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_dns_skips_a_resolver_covered_by_a_wider_listed_prefix() {
+        // Containment, not just equality: a listed /24 covers the resolver too,
+        // and the kernel rejects that duplicate exactly the same way.
+        let p = RoutePlan {
+            interface: "utun7".into(),
+            mode: RouteMode::Test {
+                cidrs: vec!["1.1.1.0/24".parse().unwrap()],
+                capture_dns: true,
+            },
+            server_ip: "198.51.100.7".parse().unwrap(),
+            original_gateway: "192.168.1.1".parse().unwrap(),
+            dns_servers: vec![
+                "1.1.1.1".parse().unwrap(), // covered by the /24
+                "9.9.9.9".parse().unwrap(), // not covered, still needs its route
+            ],
+        };
+
+        for (name, cmds) in [
+            ("macos", macos::MacOsRoutes.apply_commands(&p).unwrap()),
+            ("linux", linux::LinuxRoutes.apply_commands(&p).unwrap()),
+        ] {
+            let r = rendered(&cmds);
+            assert_eq!(r.len(), 2, "{name}: expected the /24 plus 9.9.9.9: {r:?}");
+            assert!(
+                r.iter().any(|c| c.contains("9.9.9.9")),
+                "{name}: an uncovered resolver still needs its host route: {r:?}"
+            );
+            assert!(
+                !r.iter().any(|c| c.contains("1.1.1.1")),
+                "{name}: 1.1.1.1 is inside the listed /24: {r:?}"
+            );
+        }
     }
 
     #[test]

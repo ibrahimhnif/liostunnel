@@ -2,7 +2,8 @@ use std::net::IpAddr;
 
 use crate::error::TunnelError;
 use crate::route::{
-    RouteCommand, RouteManager, RouteMode, RoutePlan, reject_full_default_prefixes,
+    RouteCommand, RouteManager, RouteMode, RoutePlan, dns_servers_needing_host_routes,
+    reject_full_default_prefixes,
 };
 
 pub struct MacOsRoutes;
@@ -35,7 +36,7 @@ impl RouteManager for MacOsRoutes {
                     ));
                 }
                 if *capture_dns {
-                    for dns in &plan.dns_servers {
+                    for dns in dns_servers_needing_host_routes(cidrs, &plan.dns_servers) {
                         cmds.push(RouteCommand::new(
                             "route",
                             &[
@@ -101,7 +102,7 @@ impl RouteManager for MacOsRoutes {
                     ));
                 }
                 if *capture_dns {
-                    for dns in &plan.dns_servers {
+                    for dns in dns_servers_needing_host_routes(cidrs, &plan.dns_servers) {
                         cmds.push(RouteCommand::new(
                             "route",
                             &[
