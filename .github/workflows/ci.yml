@@ -1,0 +1,119 @@
+name: CI
+
+# Spec §12's test layers, mapped to jobs:
+#   T1-T3 (config/packet-engine/DNS unit tests, no privilege, no network) -> `unit`
+#   T4 (real sshd in Docker, no TUN, no root)                             -> `integration`
+#   the ignored DoH network test (needs outbound internet, not privilege) -> `doh-network`
+#   T5 (real TUN device, root)                                           -> `tun-e2e`
+# T6 (the DNS leak test) and the throughput/idle-CPU gates are release
+# gates for a human to run on real hardware against a real server —
+# `testing/gates/README.md` — not something this workflow runs, ever.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Everything that needs neither root nor a TUN device nor a network peer.
+  # Runs on every push/PR, on both target platforms (spec §12: D2 forces
+  # macOS utun and Linux TUN to diverge as little as possible, so CI covers
+  # both from the first commit rather than discovering a gap in Phase 1).
+  unit:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --all-targets --workspace -- -D warnings
+
+      # The 204 hermetic tests: no root, no TUN, no routing table, no
+      # network, and no test may touch a real ~/.liostunnel — see the
+      # project's test-hygiene rule in README.md.
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      # The lean build (DoH's hyper/rustls/tokio-rustls/webpki-roots stack is
+      # feature-gated behind `doh`, default-on) must keep compiling with it
+      # off — this is the PRD §8 mobile-binary-size lean path.
+      - name: lean build (--no-default-features)
+        run: cargo build -p liostunnel-core --no-default-features
+
+  # T4: a real sshd + target HTTP server in Docker. No TUN, no privileges —
+  # only Docker, which the runner already has.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+      - uses: Swatinem/rust-cache@v2
+      - run: make -C testing/docker up
+      - run: cargo test -p liostunnel-core --test ssh_integration -- --ignored
+      - if: always()
+        run: make -C testing/docker down
+
+  # The one ignored test that needs outbound internet (a real DoH round trip
+  # to 1.1.1.1:443) but no privilege. GitHub-hosted runners generally have
+  # outbound internet access, so this is run rather than skipped — but it
+  # depends on a third party's service being reachable from the runner at
+  # the moment CI executes, which nothing in this repo controls, so a
+  # failure here does not block the job or the PR.
+  doh-network:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p liostunnel-core --lib dns::over_https -- --ignored --nocapture
+
+  # T5 (EC7's Linux half): the real device. GitHub's ubuntu-latest runners
+  # are full VMs with genuine root (via sudo) and a real kernel, so this is
+  # something CI can actually exercise — unlike a sandboxed dev session,
+  # which must not create a TUN device or touch routing at all (see
+  # testing/gates/README.md and the Task 22 report for that line). macOS's
+  # utun half of EC7 is verified locally, per crates/liostunnel-core/tests/
+  # tun_e2e.rs's own doc comment, not in CI, since GitHub's hosted macOS
+  # runners do not reliably support NET_ADMIN-equivalent TUN creation.
+  tun-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+      - uses: Swatinem/rust-cache@v2
+      - name: preflight — /dev/net/tun must exist
+        run: |
+          sudo modprobe tun || true
+          test -c /dev/net/tun || { echo "::error::/dev/net/tun is missing on this runner"; exit 1; }
+      - run: cargo build -p liostunnel-core --tests
+      - name: run TUN e2e tests as root
+        run: sudo -E env "PATH=$PATH" cargo test -p liostunnel-core --test tun_e2e -- --ignored
