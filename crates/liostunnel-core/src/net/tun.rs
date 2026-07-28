@@ -3,13 +3,6 @@ use std::net::Ipv4Addr;
 
 use crate::error::TunnelError;
 
-/// Reads and writes bare IP packets on every platform.
-///
-/// The macOS utun address-family header is handled inside `tun-rs`, which
-/// constructs its `Tun` with `ignore_packet_information: true` — `recv`
-/// returns `len - 4` with the head read into a scratch buffer, and `send`
-/// prepends it. This crate deliberately knows nothing about that framing;
-/// duplicating it here is what broke macOS entirely.
 /// Reads and writes **bare IP packets**. Implementations hide any platform framing.
 pub trait PacketIo: Send {
     /// Returns 0 when nothing is currently available.
@@ -132,6 +125,12 @@ impl TunDevice {
     pub fn open(cfg: TunConfig) -> Result<Self, TunnelError> {
         let mut builder = tun_rs::DeviceBuilder::new()
             .ipv4(cfg.address, cfg.netmask, None)
+            // Stated, not inherited. macOS correctness rests on tun-rs
+            // stripping the utun address-family header itself; it does that by
+            // default today, but a default is not a contract. Saying so here
+            // means a change upstream breaks the build's intent visibly
+            // instead of silently returning framed packets.
+            .packet_information(false)
             .mtu(cfg.mtu);
         if let Some(name) = &cfg.name {
             builder = builder.name(name);
@@ -171,13 +170,30 @@ impl std::os::fd::AsRawFd for TunDevice {
 
 impl PacketIo for TunDevice {
     fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize, TunnelError> {
-        // Bare IP on every platform: tun-rs has already removed the utun
-        // address-family header on macOS, and Linux never had one.
-        match self.inner.recv(buf) {
-            Ok(n) => Ok(n),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
-            Err(e) => Err(TunnelError::Tun(format!("read failed: {e}"))),
+        // Bare IP on every platform: tun-rs removes the utun address-family
+        // header on macOS, and Linux never had one.
+        let n = match self.inner.recv(buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(0),
+            Err(e) => return Err(TunnelError::Tun(format!("read failed: {e}"))),
+        };
+
+        // A framed packet begins with the address family (`\0\0\0\x02`), so
+        // its first nibble is 0 rather than 4 or 6. Rejecting that here is the
+        // difference between a loud error and the failure this whole layer was
+        // rewritten for: double-framing made every packet unparseable, smoltcp
+        // dropped it into `malformed_dropped` — the one `Inspected` arm that
+        // logs nothing, read by nobody — and macOS carried no traffic at all
+        // while every counter read zero and no line appeared anywhere.
+        if n > 0 && !matches!(buf[0] >> 4, 4 | 6) {
+            return Err(TunnelError::Tun(format!(
+                "read a packet whose first nibble is {} — not IPv4 or IPv6. \
+                 The device is delivering framed packets; tun-rs is expected \
+                 to strip the utun address-family header itself",
+                buf[0] >> 4
+            )));
         }
+        Ok(n)
     }
 
     fn write_packet(&mut self, packet: &[u8]) -> Result<(), TunnelError> {
@@ -239,24 +255,26 @@ mod tests {
         assert!(io.read_packet(&mut out).is_err());
     }
 
-    /// A packet handed to `write_packet` must reach the device unchanged.
+    /// The framing guard rejects what a double-framed device would deliver.
     ///
-    /// This crate adds no framing of its own. It used to add the macOS utun
-    /// address-family header, which `tun-rs` already adds — the resulting
-    /// double header was rejected, and the matching double strip on read ate
-    /// the first four bytes of every inbound IP header, so macOS carried no
-    /// traffic at all while every counter read zero.
+    /// This is deliberately a unit test of the *classification*, not of
+    /// `TunDevice` — opening a real device needs root. It exists because the
+    /// test that previously carried this name exercised `FakePacketIo`, whose
+    /// `write_packet` is a passthrough that structurally cannot prepend
+    /// anything: restoring the double-framing bug left it green, wearing the
+    /// defect's name.
     #[test]
-    fn nothing_is_prepended_to_an_outgoing_packet() {
-        let mut io = FakePacketIo::new(1500);
-        io.write_packet(&ipv4()).unwrap();
-        let out = io.take_outbound();
-        assert_eq!(out, vec![ipv4()], "the packet must go out byte-identical");
-        assert_ne!(
-            &out[0][..4],
-            &[0, 0, 0, 2],
-            "an address-family header here means it is being applied twice"
+    fn a_framed_packet_is_not_mistaken_for_bare_ip() {
+        // What a utun device delivers when nobody strips the header.
+        let mut framed = vec![0u8, 0, 0, 2];
+        framed.extend_from_slice(&ipv4());
+        assert!(
+            !matches!(framed[0] >> 4, 4 | 6),
+            "an address-family header must not read as an IP version"
         );
+        // And what it delivers when somebody does.
+        assert!(matches!(ipv4()[0] >> 4, 4 | 6));
+        assert!(matches!(ipv6()[0] >> 4, 4 | 6));
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use liostunnel_core::TunnelError;
 use liostunnel_core::config::profile::{DnsMode, ServerProfile};
-use liostunnel_core::config::secret::{FileSecretStore, SecretRef};
+use liostunnel_core::config::secret::{Redacted, SecretRef};
 use liostunnel_core::dns::Resolver;
 use liostunnel_core::dns::over_https::DohResolver;
 use liostunnel_core::dns::over_tcp::TcpResolver;
@@ -49,6 +49,40 @@ pub struct Authorized {
     pub user: String,
     pub route_mode: RouteMode,
     pub tun_address: Ipv4Addr,
+    /// Every secret this profile needs, already read under the gate.
+    ///
+    /// The connect path is handed these rather than the paths they came
+    /// from. Checking a path and letting something else re-open it later is
+    /// check-then-use, and the gap here is not a race to be won by luck: a
+    /// DNS lookup and an SSH handshake against a server the caller chose sit
+    /// between the two, so the caller decides how long the window stays open.
+    pub secrets: ResolvedSecrets,
+}
+
+/// Secrets read from the descriptors the gate authorized.
+///
+/// Serves `SshTunnel::connect` from memory so it never re-opens a path. The
+/// alternative — handing it `FileSecretStore` and the profile — opens each
+/// file a second time and checks only its mode, not its owner, which lets a
+/// caller swap their own file for a symlink to one root can read but they
+/// cannot. That is the exact escalation the gate exists to stop.
+#[derive(Default)]
+pub struct ResolvedSecrets(Vec<(SecretRef, Redacted<String>)>);
+
+impl liostunnel_core::config::secret::SecretStore for ResolvedSecrets {
+    fn resolve(&self, r: &SecretRef) -> Result<Redacted<String>, TunnelError> {
+        self.0
+            .iter()
+            .find(|(k, _)| k == r)
+            .map(|(_, v)| Redacted::new(v.expose().clone()))
+            .ok_or_else(|| {
+                // Unreachable unless a ref appears at connect time that
+                // `secret_refs()` did not report at authorization time. Fail
+                // closed rather than fall back to reading it: an unresolved
+                // ref is one the gate never saw.
+                TunnelError::config("secret", "not resolved under the authorization gate")
+            })
+    }
 }
 
 /// Hand-written rather than derived. A derived impl would render the whole
@@ -141,7 +175,8 @@ impl Tunnel {
         describe_connect_attempt(&auth.user, &auth.profile);
 
         let mut ssh = SshTunnel::new(auth.user, policy);
-        ssh.connect(&auth.profile, &FileSecretStore).await?;
+        // The secrets, not the paths. See `ResolvedSecrets`.
+        ssh.connect(&auth.profile, &auth.secrets).await?;
 
         // The address the SSH session actually reached, not a second
         // independent lookup — a multi-A-record host could otherwise have the
@@ -315,10 +350,17 @@ impl Tunnel {
 
         // THE ESCALATION GATE. The helper runs as root and could read any of
         // these; this is what stops the caller borrowing that power.
+        //
+        // Each secret is read HERE, from the descriptor that was checked, and
+        // carried forward. Nothing downstream re-opens a path.
+        let mut resolved = Vec::new();
         for r in profile.auth.secret_refs() {
             match r {
-                SecretRef::File { path } => auth::secret_readable_by(path, caller_uid)
-                    .map_err(StartError::SecretNotPermitted)?,
+                SecretRef::File { path } => {
+                    let body = auth::read_secret_owned_by(path, caller_uid)
+                        .map_err(StartError::SecretNotPermitted)?;
+                    resolved.push((r.clone(), Redacted::new(body)));
+                }
                 // Refused outright rather than checked. SecretRef::Env
                 // resolves against the *process* environment, and this
                 // process is root — so an env ref can only ever name
@@ -337,6 +379,7 @@ impl Tunnel {
             user: params.user.clone(),
             route_mode,
             tun_address,
+            secrets: ResolvedSecrets(resolved),
         })
     }
 }

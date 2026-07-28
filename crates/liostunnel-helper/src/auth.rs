@@ -69,6 +69,87 @@ pub fn authorize(fd: RawFd, expected: u32) -> Result<(), AuthError> {
     Ok(())
 }
 
+/// The largest secret this will read.
+///
+/// A caller names the path, so without a bound the root daemon allocates
+/// whatever size they point it at.
+const MAX_SECRET_BYTES: u64 = 64 * 1024;
+
+/// Reads a secret file **and** authorizes it, from a single descriptor.
+///
+/// This is the only correct shape for the gate. Checking a *path* and then
+/// letting something else open it again is check-then-use: the caller keeps
+/// write access to the directory, and between the two opens they can replace
+/// the file with a symlink to one they could never read. The window is not
+/// theoretical — `Tunnel::start` performs a DNS lookup and an SSH handshake
+/// against a server the caller chose, so they can hold it open as long as
+/// they like.
+///
+/// `File::metadata` is `fstat` on the descriptor already opened, and the read
+/// comes from that same descriptor, so the inode authorized is the inode
+/// read. Nothing in between can substitute another file.
+pub fn read_secret_owned_by(path: &Path, uid: u32) -> Result<String, AuthError> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut file = std::fs::File::open(path).map_err(|e| AuthError::SecretRejected {
+        path: path.display().to_string(),
+        reason: format!("cannot open: {e}"),
+    })?;
+
+    // fstat on the descriptor above, not a fresh stat of the name.
+    let meta = file.metadata().map_err(|e| AuthError::SecretRejected {
+        path: path.display().to_string(),
+        reason: format!("cannot stat: {e}"),
+    })?;
+
+    if !meta.is_file() {
+        return Err(AuthError::SecretRejected {
+            path: path.display().to_string(),
+            reason: "not a regular file".into(),
+        });
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(AuthError::SecretRejected {
+            path: path.display().to_string(),
+            reason: format!("mode {mode:o} grants access beyond the owner"),
+        });
+    }
+    if meta.uid() != uid {
+        return Err(AuthError::SecretNotOwned {
+            path: path.display().to_string(),
+            uid,
+        });
+    }
+    if meta.len() > MAX_SECRET_BYTES {
+        return Err(AuthError::SecretRejected {
+            path: path.display().to_string(),
+            reason: format!(
+                "{} bytes exceeds the {MAX_SECRET_BYTES}-byte limit",
+                meta.len()
+            ),
+        });
+    }
+
+    let mut body = String::new();
+    file.read_to_string(&mut body)
+        .map_err(|e| AuthError::SecretRejected {
+            path: path.display().to_string(),
+            reason: format!("cannot read: {e}"),
+        })?;
+
+    // Matches `FileSecretStore`: at most ONE trailing line ending, so a key
+    // whose final byte is meaningful is not corrupted and a CRLF file does
+    // not leave a stray `\r` glued to the secret.
+    let trimmed = body
+        .strip_suffix("\r\n")
+        .or_else(|| body.strip_suffix('\n'))
+        .unwrap_or(&body);
+    Ok(trimmed.to_string())
+}
+
 /// Whether `uid` may have this file used as a secret.
 ///
 /// The helper runs as root and can read anything; this is what stops a
@@ -168,6 +249,95 @@ mod tests {
             result.is_err(),
             "a non-socket fd must surface an error, not silently succeed with a zeroed uid: got {result:?}"
         );
+    }
+
+    /// The gate must read the file it checked, not the name it checked.
+    ///
+    /// `secret_readable_by` validated a PATH, and the connect path then
+    /// re-opened that path minutes later — with a caller-controlled DNS
+    /// lookup and SSH handshake in between, so the caller chose how long the
+    /// window stayed open. Swapping the file for a symlink to a root-owned
+    /// key in that window had root read it and send it to a server the caller
+    /// picked. This is the attack P1a-6 exists to stop, and the check-then-use
+    /// shape let it through.
+    ///
+    /// Simulated by swapping the path after the read: a function that returns
+    /// the bytes it authorized is unaffected, one that returns a path for
+    /// somebody else to open is not.
+    #[test]
+    fn the_bytes_returned_are_the_ones_that_were_authorized() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("toctou");
+        let p = d.join("secret");
+        std::fs::write(&p, b"mine").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let body = read_secret_owned_by(&p, unsafe { libc::getuid() }).expect("our own 0600 file");
+        assert_eq!(body, "mine");
+
+        // The swap the old design lost to.
+        let elsewhere = d.join("elsewhere");
+        std::fs::write(&elsewhere, b"someone else's key").unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::remove_file(&p).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &p).unwrap();
+
+        // The value already read is unaffected — it came from the descriptor,
+        // not from a path anybody can re-point.
+        assert_eq!(
+            body, "mine",
+            "the authorized bytes must not be re-resolvable"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_secret_larger_than_the_limit_is_refused_before_it_is_read() {
+        use std::os::unix::fs::PermissionsExt;
+        // The caller names the path, so an unbounded read is a caller-chosen
+        // allocation inside a root daemon.
+        let d = scratch("huge");
+        let p = d.join("big");
+        std::fs::write(&p, vec![b'x'; (MAX_SECRET_BYTES + 1) as usize]).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_secret_owned_by(&p, unsafe { libc::getuid() }).is_err());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn reading_a_secret_refuses_a_file_we_do_not_own() {
+        // Same rule as secret_readable_by, now enforced on the descriptor the
+        // bytes actually come from.
+        let d = scratch("read-foreign");
+        let p = write_owned(&d, 0o600);
+        assert!(matches!(
+            read_secret_owned_by(&p, unsafe { libc::getuid() }.wrapping_add(1)),
+            Err(AuthError::SecretNotOwned { .. })
+        ));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn reading_a_secret_strips_at_most_one_trailing_newline() {
+        use std::os::unix::fs::PermissionsExt;
+        // Matching FileSecretStore exactly: a key whose last byte is
+        // meaningful must survive, and a CRLF file must not leave a stray CR.
+        let d = scratch("trailing");
+        for (raw, want) in [
+            (&b"pw"[..], "pw"),
+            (&b"pw\n"[..], "pw"),
+            (&b"pw\r\n"[..], "pw"),
+            (&b"pw\n\n"[..], "pw\n"),
+        ] {
+            let p = d.join("k");
+            std::fs::write(&p, raw).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(
+                read_secret_owned_by(&p, unsafe { libc::getuid() }).unwrap(),
+                want
+            );
+        }
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
