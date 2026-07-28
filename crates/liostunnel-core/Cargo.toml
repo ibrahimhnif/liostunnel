@@ -29,6 +29,9 @@ tokio-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 shadowsocks = { version = "1.24", default-features = false, features = ["aead-cipher"] }
+# `ss://` links are base64. Already in the lock file as a `shadowsocks`
+# dependency, so this pulls in nothing new.
+base64 = "0.22"
 
 [features]
 default = ["doh"]
