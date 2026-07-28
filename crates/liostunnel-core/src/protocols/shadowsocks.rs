@@ -30,7 +30,7 @@ use crate::config::profile::{
 use crate::config::secret::{Redacted, SecretRef, SecretStore};
 use crate::error::TunnelError;
 use crate::protocols::counting::CountingStream;
-use crate::protocols::{Protocol, TunnelStream};
+use crate::protocols::{Protocol, TunnelStream, pick_ipv4};
 use crate::stats::{ConnectionState, ConnectionStats};
 
 /// Ciphers this build offers.
@@ -102,6 +102,7 @@ pub struct ShadowsocksTunnel {
     /// the call site (`.expose()`), of which there is one.
     server: Option<Redacted<ServerConfig>>,
     context: Option<Arc<Context>>,
+    peer: Option<SocketAddr>,
     state: ConnectionState,
     counters: Counters,
     flow_limit: Arc<tokio::sync::Semaphore>,
@@ -145,6 +146,7 @@ impl ShadowsocksTunnel {
         Self {
             server: None,
             context: None,
+            peer: None,
             state: ConnectionState::Disconnected,
             counters: Counters::default(),
             flow_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FLOWS)),
@@ -153,20 +155,34 @@ impl ShadowsocksTunnel {
         }
     }
 
+    /// The concrete address the last successful `connect` resolved and
+    /// relayed through. `None` before the first successful connect and after
+    /// a failed one, exactly like `SshTunnel::peer_addr`.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer
+    }
+
+    /// Neither error below quotes `name` (fix wave 1, finding 4). It is
+    /// caller-supplied profile content, and this `Display` reaches the
+    /// root-owned helper log via `tracing::warn!(error = %e, "connect failed")`
+    /// and the wire via `dispatch::connect_failed` — the same rule
+    /// `authorize_params` follows when it discards serde's message. The
+    /// actionable half is the field name, which `TunnelError::Config` carries,
+    /// and the list of ciphers that do work; the string the user typed is
+    /// already in front of them, in their own profile.
     fn cipher(name: &str) -> Result<CipherKind, TunnelError> {
         if !OFFERED.contains(&name) {
             return Err(TunnelError::config(
                 "auth.method",
                 format!(
-                    "`{name}` is not a cipher this build offers; one of: {}",
+                    "not a cipher this build offers; use one of: {}",
                     OFFERED.join(", ")
                 ),
             ));
         }
         // The crate owns the mapping. We only decide what to offer.
-        CipherKind::from_str(name).map_err(|_| {
-            TunnelError::config("auth.method", format!("`{name}` is not a known cipher"))
-        })
+        CipherKind::from_str(name)
+            .map_err(|_| TunnelError::config("auth.method", "not a known cipher"))
     }
 
     /// The fallible body of [`Protocol::connect`], factored out so that every
@@ -179,10 +195,15 @@ impl ShadowsocksTunnel {
     /// Takes no `&self` precisely so it *cannot* leave `self` half-updated on
     /// the way out: the caller assigns the retained state only once, from the
     /// `Ok` arm.
-    fn prepare(
+    ///
+    /// Async since fix wave 1, finding 1: `profile.host` is resolved here,
+    /// exactly once, and the concrete [`SocketAddr`] is what both
+    /// `ServerConfig` and [`Self::peer_addr`] are built from. See the
+    /// resolution site below for what that buys.
+    async fn prepare(
         profile: &ServerProfile,
         store: &dyn SecretStore,
-    ) -> Result<(Redacted<ServerConfig>, Arc<Context>), TunnelError> {
+    ) -> Result<(Redacted<ServerConfig>, Arc<Context>, SocketAddr), TunnelError> {
         // `SshTunnel::connect` has refused a profile of the wrong kind since
         // Phase 0; without the same guard here a profile saying
         // `"protocol": "ssh"` with shadowsocks credentials was accepted and
@@ -216,35 +237,68 @@ impl ShadowsocksTunnel {
         let cipher = Self::cipher(method)?;
         let password = store.resolve(password_ref)?;
 
+        // ONE resolution, here, and a concrete address from here on.
+        //
+        // `ServerConfig::new((host, port), ..)` goes through
+        // `From<(I, u16)> for ServerAddr`, which *always* yields
+        // `ServerAddr::DomainName` -- and the crate's own
+        // `TcpStream::connect_server_with_opts` sends that variant through
+        // `lookup_then_connect!`, one OS-resolver lookup per flow, every
+        // flow. Two ways that ends badly in `default` route mode: a multi-A
+        // host has flows land on addresses the route layer never pinned (and
+        // the engine's attempt to relay those opens another flow, which
+        // resolves again, until the flow semaphore is exhausted); and every
+        // lookup goes to the profile's resolvers, which `default` mode has
+        // just pointed *into the tunnel*, so resolving the server's own name
+        // needs a relayed flow that needs the server's name resolved. It
+        // works only while the OS DNS cache holds the pre-route answer, and
+        // at TTL expiry the machine has no default route of its own left.
+        //
+        // Resolved after the local config checks above so a typo'd cipher
+        // still costs no lookup, and through the shared `pick_ipv4` for the
+        // same reason `SshTunnel` does: the route pin this address feeds is
+        // IPv4-only. The error deliberately carries the io error alone --
+        // interpolating `profile.host` would echo caller-supplied profile
+        // content into a root-owned log.
+        let addr = pick_ipv4(
+            tokio::net::lookup_host((profile.host.as_str(), profile.port))
+                .await
+                .map_err(TunnelError::Transport)?,
+        )?;
+
         // `expose` is the only place the password is read. The bare `String`
         // it produces is consumed by `ServerConfig::new` on the same
         // expression and the result is wrapped in `Redacted` immediately, so
         // no plaintext copy outlives this function. It is never formatted,
         // logged or put in an error.
-        let cfg = ServerConfig::new(
-            (profile.host.clone(), profile.port),
-            password.expose().clone(),
-            cipher,
-        )
-        // Deliberately discards the underlying error: `ServerConfigError`'s
-        // variants quote the offending key material. Nothing has been sent to
-        // any server at this point -- this is local key derivation from the
-        // configured cipher and password, and nothing else.
         //
-        // Unreachable for every cipher in `OFFERED` as this build is
-        // configured: key derivation for the AEAD ciphers is
-        // `openssl_bytes_to_key`, which is infallible. The only fallible path
-        // is AEAD-2022's base64 key decoding, which needs the
-        // `aead-cipher-2022` feature this build does not enable. Kept because
-        // the crate's signature is fallible and that can change under us.
-        .map_err(|_| {
-            TunnelError::config(
-                "auth",
-                "cannot derive an encryption key from this cipher and password",
-            )
-        })?;
+        // `addr` is a `SocketAddr`, so `From<SocketAddr> for ServerAddr`
+        // gives `ServerAddr::SocketAddr` and the crate connects to it
+        // directly, without a lookup, for the life of the tunnel.
+        let cfg = ServerConfig::new(addr, password.expose().clone(), cipher)
+            // Deliberately discards the underlying error: `ServerConfigError`'s
+            // variants quote the offending key material. Nothing has been sent to
+            // any server at this point -- this is local key derivation from the
+            // configured cipher and password, and nothing else.
+            //
+            // Unreachable for every cipher in `OFFERED` as this build is
+            // configured: key derivation for the AEAD ciphers is
+            // `openssl_bytes_to_key`, which is infallible. The only fallible path
+            // is AEAD-2022's base64 key decoding, which needs the
+            // `aead-cipher-2022` feature this build does not enable. Kept because
+            // the crate's signature is fallible and that can change under us.
+            .map_err(|_| {
+                TunnelError::config(
+                    "auth",
+                    "cannot derive an encryption key from this cipher and password",
+                )
+            })?;
 
-        Ok((Redacted::new(cfg), Context::new_shared(ServerType::Local)))
+        Ok((
+            Redacted::new(cfg),
+            Context::new_shared(ServerType::Local),
+            addr,
+        ))
     }
 
     /// How long the probe waits, in production. A server that cannot answer
@@ -471,10 +525,11 @@ impl Protocol for ShadowsocksTunnel {
     ) -> Result<(), TunnelError> {
         self.state = ConnectionState::Connecting;
 
-        match Self::prepare(profile, store) {
-            Ok((server, context)) => {
+        match Self::prepare(profile, store).await {
+            Ok((server, context, peer)) => {
                 self.server = Some(server);
                 self.context = Some(context);
+                self.peer = Some(peer);
 
                 // The profile's own resolver, asked over the tunnel just
                 // built, in whichever way the profile says that resolver is
@@ -486,9 +541,13 @@ impl Protocol for ShadowsocksTunnel {
                     // Same failure-state contract as the `Err` arm below: a
                     // tunnel whose credentials fail the probe must not be
                     // left `Connected`, or half-built with a server config
-                    // that was never actually proven to work, either.
+                    // that was never actually proven to work, either. `peer`
+                    // goes with them: a route pin aimed at a server this
+                    // tunnel never proved it can relay through is worse than
+                    // no pin at all.
                     self.server = None;
                     self.context = None;
+                    self.peer = None;
                     self.state = ConnectionState::Failed;
                     return Err(e);
                 }
@@ -512,6 +571,7 @@ impl Protocol for ShadowsocksTunnel {
             Err(e) => {
                 self.server = None;
                 self.context = None;
+                self.peer = None;
                 self.state = ConnectionState::Failed;
                 Err(e)
             }
@@ -547,6 +607,7 @@ impl Protocol for ShadowsocksTunnel {
     async fn disconnect(&mut self) -> Result<(), TunnelError> {
         self.server = None;
         self.context = None;
+        self.peer = None;
         self.state = ConnectionState::Disconnected;
         Ok(())
     }
@@ -697,7 +758,7 @@ mod tests {
     /// them and leaves the resolved password retained, same as before.
     async fn connected_to_a_refusing_server() -> (ShadowsocksTunnel, SocketAddr) {
         let server = a_closed_loopback_port().await;
-        let (server_cfg, context) = ShadowsocksTunnel::prepare(
+        let (server_cfg, context, peer) = ShadowsocksTunnel::prepare(
             &profile_at(
                 "chacha20-ietf-poly1305",
                 &server.ip().to_string(),
@@ -705,10 +766,12 @@ mod tests {
             ),
             &FixedSecret(PW),
         )
+        .await
         .expect("an offered cipher must prepare");
         let mut t = ShadowsocksTunnel::new();
         t.server = Some(server_cfg);
         t.context = Some(context);
+        t.peer = Some(peer);
         t.state = ConnectionState::Connected;
         (t, server)
     }
@@ -754,10 +817,17 @@ mod tests {
     }
 
     /// Finding 2. The allow-list branch and the crate's own `from_str`
-    /// fallback both interpolate the offending name, so asserting only on the
-    /// name would still pass with the allow-list deleted outright. The
+    /// fallback both used to interpolate the offending name, so asserting only
+    /// on the name would still pass with the allow-list deleted outright. The
     /// distinguishing text -- "this build offers", plus the list of what does
     /// work -- is produced by the allow-list branch and nothing else.
+    ///
+    /// Fix wave 1, finding 4: the name itself is no longer echoed, and this
+    /// asserts that too. `auth.method` is caller-supplied profile content, and
+    /// this message reaches the root-owned helper log
+    /// (`tracing::warn!(error = %e, "connect failed")`) and the wire
+    /// (`dispatch::connect_failed`). Naming the field and listing what does
+    /// work is the actionable half; quoting the string back is not.
     #[tokio::test]
     async fn an_unknown_cipher_is_refused_by_our_allow_list_not_by_the_crate() {
         let mut t = ShadowsocksTunnel::new();
@@ -766,7 +836,14 @@ mod tests {
             .await
             .expect_err("an unknown cipher must be refused");
         let msg = format!("{err}");
-        assert!(msg.contains("rot13"), "name the offending cipher: {msg}");
+        assert!(
+            !msg.contains("rot13"),
+            "the message must not echo caller-supplied profile content: {msg}"
+        );
+        assert!(
+            msg.contains("auth.method"),
+            "it must still say which field is wrong: {msg}"
+        );
         assert!(
             msg.contains("this build offers"),
             "the allow-list, not the crate's fallback, must be what refused it: {msg}"
@@ -778,13 +855,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stream_cipher_is_refused_by_name_before_the_crate_sees_it() {
+    async fn a_stream_cipher_is_refused_by_our_allow_list_before_the_crate_sees_it() {
         // rc4-md5 does not parse here at all: `CipherKind::from_str`'s arm for
         // it is `#[cfg(feature = "v1-stream")]`, a feature this build does not
-        // enable. Refusing it by name up front is still what we want, because
-        // the user gets the list of ciphers that do work instead of a bare
-        // "not a known cipher" -- so assert on the allow-list's own message,
-        // not merely that something failed.
+        // enable. Refusing it up front is still what we want, because the user
+        // gets the list of ciphers that do work instead of a bare "not a known
+        // cipher" -- so assert on the allow-list's own message, not merely
+        // that something failed.
         assert!(
             CipherKind::from_str("rc4-md5").is_err(),
             "this build must not be able to build a stream cipher either"
@@ -794,9 +871,15 @@ mod tests {
             .connect(&profile("rc4-md5"), &FixedSecret("pw"))
             .await
             .expect_err("a stream cipher must be refused");
+        let msg = format!("{err}");
         assert!(
-            format!("{err}").contains("this build offers"),
-            "the allow-list must refuse it by name, not the crate: {err}"
+            msg.contains("this build offers"),
+            "the allow-list must refuse it, not the crate: {msg}"
+        );
+        // Fix wave 1, finding 4, on the other error path a caller can steer.
+        assert!(
+            !msg.contains("rc4-md5"),
+            "the message must not echo caller-supplied profile content: {msg}"
         );
     }
 
@@ -1218,6 +1301,96 @@ mod tests {
             parse_dns_question(&seen.payload).map(|(t, _)| t),
             Ok(1),
             "precondition: the server answered because the question parsed"
+        );
+    }
+
+    /// Fix wave 1, finding 1. `ServerConfig::new((host, port), ..)` takes
+    /// `From<(I, u16)> for ServerAddr`, which *always* yields
+    /// `ServerAddr::DomainName` (`shadowsocks-1.24.0/src/config.rs:1174`) --
+    /// and the crate's own `TcpStream::connect_server_with_opts`
+    /// (`src/net/tcp.rs:49`) sends that variant through `lookup_then_connect!`,
+    /// i.e. one OS-resolver lookup *per flow, every flow*.
+    ///
+    /// Two ways that ends badly, both in `default` route mode: a multi-A host
+    /// has flows land on addresses the route layer never pinned, and every
+    /// lookup goes to the profile's resolvers, which `default` mode has just
+    /// pointed *into the tunnel* -- so resolving the server's own name needs a
+    /// relayed flow that needs the server's name resolved. It survives only as
+    /// long as the OS DNS cache holds the pre-route answer.
+    ///
+    /// A *name* is used here, not a literal, because the name is the whole
+    /// finding: the address the config ends up holding must be the one
+    /// `connect` resolved once, not the string it was given.
+    #[tokio::test]
+    async fn the_server_config_is_built_from_one_resolved_address_not_a_name() {
+        let (server, _probed) = a_shadowsocks_server_keyed_with("aes-256-gcm", PW).await;
+        let p = profile_at("aes-256-gcm", "localhost", server.port());
+
+        let mut t = ShadowsocksTunnel::new();
+        t.connect(&p, &FixedSecret(PW))
+            .await
+            .expect("the loopback server relays for these credentials");
+
+        match t.server.as_ref().expect("connected").expose().addr() {
+            shadowsocks::config::ServerAddr::SocketAddr(a) => assert_eq!(
+                *a, server,
+                "the config must hold the address `connect` actually resolved"
+            ),
+            other => panic!(
+                "the crate re-resolves this on every single flow \
+                 (net/tcp.rs's lookup_then_connect!): {other:?}"
+            ),
+        }
+    }
+
+    /// Fix wave 1, finding 1. The address the route layer pins must be the
+    /// one the session actually reached, and `Protocol` cannot say -- so this
+    /// type has to, exactly as `SshTunnel::peer_addr` already does. Without
+    /// it the helper had to look the host up a second time, independently,
+    /// and a multi-A host lets the two answers disagree.
+    #[tokio::test]
+    async fn a_connected_tunnel_reports_the_address_it_actually_reached() {
+        let (server, _probed) = a_shadowsocks_server_keyed_with("aes-256-gcm", PW).await;
+        let p = profile_at("aes-256-gcm", "localhost", server.port());
+
+        let mut t = ShadowsocksTunnel::new();
+        assert_eq!(
+            t.peer_addr(),
+            None,
+            "nothing has been reached before connect"
+        );
+        t.connect(&p, &FixedSecret(PW))
+            .await
+            .expect("the loopback server relays for these credentials");
+        assert_eq!(
+            t.peer_addr(),
+            Some(server),
+            "the reported peer must be the resolved v4 address of `localhost`"
+        );
+    }
+
+    /// Fix wave 1, finding 1. `pick_ipv4` is not SSH policy, it is the packet
+    /// stack's and the route layer's IPv4-only constraint, and resolving here
+    /// is what puts a concrete address in front of the crate. A v6-only host
+    /// must therefore be refused with that constraint named -- before a
+    /// socket, not after a relayed flow fails for some unrelated-looking
+    /// reason.
+    #[tokio::test]
+    async fn an_ipv6_only_host_is_refused_by_the_ipv4_only_constraint() {
+        let p = profile_at("aes-256-gcm", "::1", 8388);
+        let mut t = ShadowsocksTunnel::new();
+        let err = t
+            .connect(&p, &FixedSecret(PW))
+            .await
+            .expect_err("the route pin and packet stack are IPv4-only");
+        assert!(
+            format!("{err}").contains("IPv4-only"),
+            "the IPv4-only constraint must be what refused it: {err}"
+        );
+        assert_eq!(t.stats().state, ConnectionState::Failed);
+        assert!(
+            t.peer_addr().is_none(),
+            "a failed connect reached nothing, so it must report no peer"
         );
     }
 

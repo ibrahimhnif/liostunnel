@@ -87,6 +87,17 @@ impl Session {
             // problem. Everything else is Internal, whose wording points at
             // the helper log, which does name the cause.
             StartError::Tunnel(liostunnel_core::TunnelError::Auth(_)) => ErrorKind::AuthFailed,
+            // A profile the user can fix, not a helper fault. `Internal`'s
+            // wording points at the helper log, which is the wrong place to
+            // send someone who typed a cipher name wrong, gave a shadowsocks
+            // profile ssh credentials, or left `dns.https` out of a `https`
+            // profile — all `Config`, all newly reachable through the helper
+            // now that it can dial Shadowsocks, and all five-second fixes in
+            // their own file. `SshTunnel` essentially never produced `Config`,
+            // which is why this never mattered before.
+            StartError::Tunnel(liostunnel_core::TunnelError::Config { .. }) => {
+                ErrorKind::BadRequest
+            }
             StartError::Tunnel(_) => ErrorKind::Internal,
         };
         // `e`'s Display is safe to send: every variant either carries no
@@ -534,20 +545,78 @@ mod tests {
         // is `Transport`; a DoH resolver whose TLS failed through a
         // proven-good relay is `Dns`. Neither means the password was wrong,
         // and saying so sends the user to change a credential that works.
+        //
+        // Fix wave 1, finding 6: the last row is the direction nothing
+        // guarded. Only `Tunnel(_) => Internal` was pinned, so mutating the
+        // `Auth` arm to `Internal` left the suite green and silently stopped
+        // ever telling a user their password was wrong — the exact failure
+        // this test's first two rows exist to prevent, in reverse.
         use liostunnel_core::TunnelError;
         let mut s = sess();
-        let probe_failures = [
-            StartError::Tunnel(TunnelError::Transport(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "probe",
-            ))),
-            StartError::Tunnel(TunnelError::Dns("resolver refused the handshake".into())),
+        let failures = [
+            (
+                StartError::Tunnel(TunnelError::Transport(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "probe",
+                ))),
+                "internal",
+            ),
+            (
+                StartError::Tunnel(TunnelError::Dns("resolver refused the handshake".into())),
+                "internal",
+            ),
+            (
+                StartError::Tunnel(TunnelError::Auth("server rejected credentials".into())),
+                "auth_failed",
+            ),
         ];
-        for e in &probe_failures {
+        for (e, expected) in &failures {
             let out = s.connect_failed(3, e);
             let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
-            assert_eq!(v["kind"], "internal", "{e} was reported as {v}");
+            assert_eq!(v["kind"], *expected, "{e} was reported as {v}");
         }
+    }
+
+    /// Fix wave 1, finding 3. `dispatch` mapped every non-`Auth` `TunnelError`
+    /// to `Internal`, whose wording sends the user to the helper's log.
+    /// `SshTunnel` essentially never produced `Config`, so that never
+    /// mattered — but the Shadowsocks arm reaches the helper now, and it
+    /// returns `Config` for an unoffered cipher name, wrong-kind credentials
+    /// and a missing `dns.https`: all things the user fixes in their own
+    /// profile in five seconds, none of them a helper fault.
+    ///
+    /// The error is produced by the real code path rather than hand-built, so
+    /// this cannot pass against a `Config` shape the tunnel never actually
+    /// returns. No network: the cipher allow-list refuses before anything is
+    /// resolved, opened or read.
+    #[tokio::test]
+    async fn a_cipher_this_build_does_not_offer_is_the_users_mistake_not_an_internal_error() {
+        use liostunnel_core::protocols::Protocol;
+        use liostunnel_core::protocols::shadowsocks::ShadowsocksTunnel;
+
+        let profile = serde_json::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000000","name":"t",
+                "protocol":"shadowsocks","host":"127.0.0.1","port":8388,
+                "auth":{"type":"shadowsocks","method":"rot13",
+                        "password":{"source":"file","path":"/tmp/lios-absent"}},
+                "dns":["1.1.1.1"],"split_tunnel":{"type":"all_traffic"},
+                "kill_switch":false}"#,
+        )
+        .unwrap();
+        let mut t = ShadowsocksTunnel::new();
+        let e = StartError::Tunnel(
+            t.connect(&profile, &crate::session::ResolvedSecrets::default())
+                .await
+                .expect_err("`rot13` is not a cipher this build offers"),
+        );
+
+        let mut s = sess();
+        let out = s.connect_failed(9, &e);
+        let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        assert_eq!(
+            v["kind"], "bad_request",
+            "a cipher name the user typed is theirs to fix, not a helper fault: {v}"
+        );
     }
 
     #[test]

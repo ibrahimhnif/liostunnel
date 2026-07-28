@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,7 +14,7 @@ use liostunnel_core::net::tun::{TunConfig, TunDevice};
 use liostunnel_core::net::{NetStack, ShutdownHandle, StackConfig};
 use liostunnel_core::protocols::Protocol;
 use liostunnel_core::protocols::shadowsocks::ShadowsocksTunnel;
-use liostunnel_core::protocols::ssh::{HostKeyPolicy, SshTunnel, pick_ipv4};
+use liostunnel_core::protocols::ssh::{HostKeyPolicy, SshTunnel};
 use liostunnel_core::route::{
     RouteGuard, RouteMode, RoutePlan, platform_manager, reject_full_default_prefixes,
 };
@@ -173,17 +173,13 @@ impl Tunnel {
         // backed up. `RUST_LOG=liostunnel_helper=debug` turns it on.
         describe_connect_attempt(&auth.user, &auth.profile);
 
+        // The address the *session* actually reached, from the protocol that
+        // reached it — never a second, independent lookup. A multi-A-record
+        // host lets two lookups legally disagree, and the route pin must name
+        // the peer that is actually carrying the traffic or the tunnel's own
+        // packets route into the tunnel.
         let (protocol, peer_addr) = connect_protocol(&auth, paths).await?;
-
-        // The address the *session* actually reached where the protocol can
-        // say so, and only otherwise a second independent lookup — a
-        // multi-A-record host could have the route pin a different peer than
-        // the one carrying the traffic. See `connect_protocol`'s doc: that
-        // `Option` is the P1b-6 finding, not an oversight.
-        let server_ip = match peer_addr {
-            Some(addr) => addr.ip(),
-            None => resolve_server_ip(&auth.profile).await?,
-        };
+        let server_ip = peer_addr.ip();
 
         // 2. TUN device.
         let tun = TunDevice::open(TunConfig {
@@ -386,21 +382,23 @@ impl Tunnel {
     }
 }
 
-/// Builds and connects whichever protocol the profile names.
+/// Builds and connects whichever protocol the profile names, and reports the
+/// address its session actually reached.
 ///
 /// THE ABSTRACTION TEST (spec §13, P1b-6). Everything protocol-specific lives
 /// inside an arm; anything that had to sit outside would be an SSH-shaped hole
 /// in `Protocol`, and is reported as such.
 ///
-/// The `Option<SocketAddr>` in the return type is that hole, made explicit.
-/// `Protocol` exposes no peer address, so only a concrete `SshTunnel` can say
-/// which of a multi-A-record host's addresses its session actually reached —
-/// and the route that pins the server through the original gateway needs
-/// exactly that address. Returning `None` from an arm means "ask DNS again and
-/// hope it agrees", which is the dual-stack disagreement Phase 0's own comment
-/// warns about. It is expressed here rather than papered over by resolving for
-/// everyone, because resolving for everyone would silently give SSH the weaker
-/// guarantee too.
+/// The `SocketAddr` used to be an `Option`, and that `Option` was the hole:
+/// `Protocol` exposes no peer address, so only a concrete tunnel type can say
+/// which of a multi-A-record host's addresses its session reached, and the
+/// route that pins the server through the original gateway needs exactly that
+/// address. `SshTunnel` could say; `ShadowsocksTunnel` could not, and `None`
+/// meant "ask DNS again and hope it agrees" — the dual-stack disagreement
+/// Phase 0's own comment warns about. It is closed rather than documented now
+/// (fix wave 1, finding 1): `ShadowsocksTunnel` resolves once in `connect` and
+/// exposes `peer_addr` too, so every arm returns the address its own session
+/// used and no second lookup exists anywhere on this path.
 ///
 /// A free function rather than a method on `Tunnel` so the dispatch is
 /// reachable from a test: `Tunnel::start` needs a TUN device and root, this
@@ -408,7 +406,7 @@ impl Tunnel {
 async fn connect_protocol(
     auth: &Authorized,
     paths: &HelperPaths,
-) -> Result<(Arc<dyn Protocol>, Option<SocketAddr>), StartError> {
+) -> Result<(Arc<dyn Protocol>, SocketAddr), StartError> {
     match auth.profile.protocol {
         ProtocolKind::Ssh => {
             // `HostKeyPolicy` lives in here, not in `start`'s body: it is
@@ -429,7 +427,7 @@ async fn connect_protocol(
             let peer = ssh.peer_addr().ok_or_else(|| {
                 TunnelError::Route("ssh session reports no peer address after connecting".into())
             })?;
-            Ok((Arc::new(ssh), Some(peer)))
+            Ok((Arc::new(ssh), peer))
         }
         ProtocolKind::Shadowsocks => {
             let mut ss = ShadowsocksTunnel::new();
@@ -440,7 +438,17 @@ async fn connect_protocol(
             // not `TunnelError::Auth` to `Internal`, so a probe timeout is
             // never reported as a wrong password.
             ss.connect(&auth.profile, &auth.secrets).await?;
-            Ok((Arc::new(ss), None))
+            // The same guarantee the SSH arm gives, for the same reason: this
+            // is the address `connect` resolved once and handed to
+            // `ServerConfig`, so the route pin and every relayed flow name the
+            // same peer. Before fix wave 1 this arm returned `None` and the
+            // caller looked the host up a second time.
+            let peer = ss.peer_addr().ok_or_else(|| {
+                TunnelError::Route(
+                    "shadowsocks session reports no peer address after connecting".into(),
+                )
+            })?;
+            Ok((Arc::new(ss), peer))
         }
         // Unreachable through the daemon: `authorize_params` refuses this
         // before any privileged work. Kept because `start` is `pub` and the
@@ -452,20 +460,12 @@ async fn connect_protocol(
     }
 }
 
-/// Resolves the address to pin, for a protocol that cannot report the one it
-/// used.
-///
-/// `pick_ipv4` comes from `protocols::ssh` — the second half of the same
-/// finding. It is not SSH policy, it is the packet stack's IPv4-only
-/// constraint, and pinning an AAAA record the relay never used would send the
-/// tunnel's own traffic into the tunnel. Reused rather than re-implemented so
-/// the two paths cannot disagree about what "the server's address" means.
-async fn resolve_server_ip(profile: &ServerProfile) -> Result<IpAddr, StartError> {
-    let candidates = tokio::net::lookup_host((profile.host.as_str(), profile.port))
-        .await
-        .map_err(TunnelError::Transport)?;
-    Ok(pick_ipv4(candidates)?.ip())
-}
+// `resolve_server_ip` used to live here: a second, independent
+// `lookup_host` + `pick_ipv4` for protocols that could not report the address
+// they reached. It is gone, not moved (fix wave 1, findings 1 and 5). Both
+// arms of `connect_protocol` now report their own peer, so there is nothing
+// left to look up — and nothing left to run in `RouteMode::Test`, where the
+// plan installs no server pin and the answer was discarded.
 
 /// Logs what a connection attempt is about to use.
 ///
@@ -728,6 +728,41 @@ mod tests {
         );
     }
 
+    /// Fix wave 1, finding 4, and the sibling of the test above: the profile
+    /// does not have to be malformed to come back. A Shadowsocks profile
+    /// parses fine with any string in `auth.method`, and the cipher allow-list
+    /// used to quote that string verbatim — into
+    /// `tracing::warn!(error = %e, "connect failed")` in a root-owned log that
+    /// persists and gets backed up, and back over the wire through
+    /// `dispatch::connect_failed`.
+    ///
+    /// The marker sits in `auth.method` because that is where this path
+    /// echoes; a marker anywhere else would pass against an implementation
+    /// that leaks and prove nothing. No network: the allow-list refuses before
+    /// anything is resolved, opened or read.
+    #[tokio::test]
+    async fn a_shadowsocks_cipher_name_is_never_echoed_back_either() {
+        let auth = authorized(&profile_json(
+            "shadowsocks",
+            "127.0.0.1",
+            r#"{"type":"shadowsocks","method":"SECRET-VALUE-HERE",
+                "password":{"source":"file","path":"/tmp/lios-absent"}}"#,
+        ));
+        let Err(err) = connect_protocol(&auth, &paths()).await else {
+            panic!("`SECRET-VALUE-HERE` is not a cipher this build offers");
+        };
+        let text = format!("{err}");
+        assert!(
+            !text.contains("SECRET-VALUE-HERE"),
+            "error echoed profile content: {text}"
+        );
+        let debug = format!("{err:?}");
+        assert!(
+            !debug.contains("SECRET-VALUE-HERE"),
+            "Debug echoed profile content: {debug}"
+        );
+    }
+
     #[test]
     fn an_unknown_route_mode_is_refused() {
         let d = scratch("bad-mode");
@@ -911,6 +946,63 @@ mod tests {
             matches!(err, StartError::BadProfile(_)) && format!("{err}").contains("wireguard"),
             "got {err:?}"
         );
+    }
+
+    /// Fix wave 1, finding 2. Every other factory test binds
+    /// `let Err(err) = … else { panic }`, so the `Ok` tuple — the address the
+    /// whole `server_ip` deviation exists to produce — was observed by
+    /// nothing: mutating the SSH arm to return `None` (as it then was) left
+    /// all 57 helper tests green while SSH silently regressed to the
+    /// second-independent-lookup behaviour a prior review had fixed.
+    ///
+    /// `localhost`, not `127.0.0.1`: a name is what makes the guarantee
+    /// non-trivial. What is asserted is that the factory reports the concrete
+    /// v4 address the SSH session actually reached, which is what the route
+    /// layer pins through the original gateway.
+    ///
+    /// `#[ignore]`d because it needs the live fixture server, in the same
+    /// style and for the same reason as `liostunnel-core`'s `ssh_integration`
+    /// suite. It opens no TUN device, installs no route and needs no
+    /// privilege — `connect_protocol` is factored out of `Tunnel::start`
+    /// precisely so this is reachable without either.
+    #[tokio::test]
+    #[ignore = "requires docker fixture: make -C testing/docker up"]
+    async fn the_ssh_arm_reports_the_address_its_session_actually_reached() {
+        // Served from memory, exactly as the gate serves them: no file is
+        // opened, so the path names nothing that has to exist.
+        let secret = SecretRef::File {
+            path: "/tmp/lios-fixture-password".into(),
+        };
+        let auth = Authorized {
+            profile: serde_json::from_str(
+                r#"{"id":"00000000-0000-0000-0000-000000000000","name":"fixture",
+                    "protocol":"ssh","host":"localhost","port":22022,
+                    "auth":{"type":"password","password":{"source":"file",
+                            "path":"/tmp/lios-fixture-password"}},
+                    "dns":["1.1.1.1"],"split_tunnel":{"type":"all_traffic"},
+                    "kill_switch":false}"#,
+            )
+            .expect("the fixture profile must parse"),
+            user: "tunneluser".into(),
+            route_mode: RouteMode::Default,
+            tun_address: "10.90.0.1".parse().unwrap(),
+            secrets: ResolvedSecrets(vec![(secret, Redacted::new("tunnelpass".into()))]),
+        };
+        // A known_hosts of this test's own, learned on first use, under the
+        // temp dir — never the daemon's real one.
+        let dir = scratch("ssh-arm-peer");
+        let paths = HelperPaths::beside_socket(&dir.join("s.sock"));
+
+        let Ok((_protocol, peer)) = connect_protocol(&auth, &paths).await else {
+            panic!("the fixture server must accept tunneluser/tunnelpass on 22022");
+        };
+        assert_eq!(
+            peer,
+            "127.0.0.1:22022".parse::<SocketAddr>().unwrap(),
+            "the factory must report the concrete address the session reached, \
+             which is what `default` mode pins through the original gateway"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
