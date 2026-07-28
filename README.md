@@ -2,13 +2,21 @@
 
 Cross-platform tunnel client with one shared Rust core. **Phase 0: CLI only.**
 
-Routes TCP traffic from a TUN device through an SSH tunnel on macOS and
-Linux, with DNS resolved over the tunnel via one of two backends
+Routes TCP traffic from a TUN device through an SSH tunnel on **Linux**, with
+DNS resolved over the tunnel via one of two backends
 (DNS-over-TCP or DNS-over-HTTPS). No UI, no mobile, no WireGuard or
 Shadowsocks yet — profiles for those protocols parse, but connecting with
 one is rejected. See [`PRD.md`](PRD.md) for the full roadmap and
 [`docs/superpowers/specs/2026-07-27-liostunnel-phase0-design.md`](docs/superpowers/specs/2026-07-27-liostunnel-phase0-design.md)
 for exactly what Phase 0 does and does not include.
+
+> **macOS does not carry traffic today.** The engine reads nothing from the
+> TUN device there: packets reach the interface and the stack thread is alive,
+> but no byte is ever read, so connections time out. This affects the CLI and
+> the Phase 1a helper equally. Phase 0's exit criteria were all verified in a
+> Linux container (see the table below, which says so), so this path was never
+> exercised. Reproduce with `sudo ./testing/diagnose-p1a3.sh`; tracked in
+> `docs/superpowers/phase1a-verification.md`.
 
 ## Build
 
