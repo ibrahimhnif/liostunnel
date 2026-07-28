@@ -275,11 +275,26 @@ pub async fn run(
 
     println!("\nshutting down");
 
-    shutdown.shutdown();
+    // ROUTES FIRST, then the stack. Shutting the stack down destroys the TUN
+    // device, and `route delete -net CIDR -interface utunN` then fails on
+    // macOS with "bad address: utunN" because no such interface exists any
+    // more -- measured, 23ms after "stack closed", on every single
+    // disconnect. Cleanup happened only as a side effect of macOS reclaiming
+    // an interface's routes when it disappears, and any route that did NOT
+    // vanish with the interface would have been left behind.
+    //
+    // Reverting first is better on its own terms too: it restores ordinary
+    // routing while the tunnel is still up, rather than briefly leaving
+    // routes pointing at a device that is already gone.
+    //
+    // Phase 0 never saw this because its exit criteria all ran in a Linux
+    // container, where `ip route del` does not name the interface the same
+    // way. Fixed in the helper first (ca200d6); this is the same bug.
     guard.revert_now();
-    // A clean shutdown reverted the routes above, so the state file describing
-    // them would be stale as soon as this process exits; clear it now so the
-    // next start does not mistake a normal exit for a crash to recover from.
+    shutdown.shutdown();
+    // The routes are gone, so the state file describing them would be stale
+    // as soon as this process exits; clear it now so the next start does not
+    // mistake a normal exit for a crash to recover from.
     liostunnel_core::route::state::AppliedState::clear(&state_path);
     // A no-op if `stop` is already `EngineExited` (the task has already
     // finished); still required on the signal path, where the engine is very
