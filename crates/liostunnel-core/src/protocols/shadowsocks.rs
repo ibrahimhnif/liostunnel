@@ -228,6 +228,68 @@ impl ShadowsocksTunnel {
 
         Ok((Redacted::new(cfg), Context::new_shared(ServerType::Local)))
     }
+
+    /// How long the probe waits. A server that cannot answer a DNS query in
+    /// this long is not one worth installing routes for.
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+    /// Proves the credentials work, because the protocol will not.
+    ///
+    /// Shadowsocks has no handshake: a server given the wrong key accepts
+    /// the TCP connection and drops it silently. Without this, `connect`
+    /// returning `Ok` would mean "a socket opened" -- the UI would report
+    /// Connected, routes would be installed, and nothing would carry.
+    ///
+    /// One DNS query over a relayed stream, using the profile's own
+    /// resolver. If bytes come back, the cipher and password are right AND
+    /// the server relays traffic.
+    ///
+    /// Drawn from the reserved DNS flow allowance (`dns_flow_limit`), not
+    /// the general one (`open_tcp_stream`/`flow_limit`): this genuinely is a
+    /// DNS query, and reconnecting a tunnel that already has a busy
+    /// session's worth of ordinary flows holding the general permits would
+    /// otherwise queue the probe behind them and risk it timing out for a
+    /// reason that has nothing to do with whether the credentials work --
+    /// precisely the starvation `MAX_CONCURRENT_DNS_FLOWS` exists to prevent
+    /// for ordinary DNS traffic.
+    ///
+    /// This is not authentication in the SSH sense. It proves the server
+    /// relays for these credentials; it does not identify the server.
+    /// Shadowsocks offers no server identity at all.
+    async fn probe(&self, dns: SocketAddr) -> Result<(), TunnelError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A minimal A query for "." -- the smallest well-formed thing a
+        // resolver will answer. RFC 7766 framing: two-byte length prefix.
+        let query: [u8; 17] = [
+            0x00, 0x0f, // length
+            0xAB, 0xCD, // id
+            0x01, 0x00, // standard query, recursion desired
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // root name
+            0x00, 0x01, // A
+        ];
+
+        let fut = async {
+            let mut s = self.open_dns_stream(dns).await?;
+            s.write_all(&query).await?;
+            let mut len = [0u8; 2];
+            s.read_exact(&mut len).await.map_err(|_| {
+                TunnelError::Auth(
+                    "the server accepted the connection but returned nothing; \
+                     the cipher or password is probably wrong"
+                        .into(),
+                )
+            })?;
+            Ok::<(), TunnelError>(())
+        };
+
+        match tokio::time::timeout(Self::PROBE_TIMEOUT, fut).await {
+            Ok(r) => r,
+            Err(_) => Err(TunnelError::Auth(
+                "the server did not answer a probe query in time".into(),
+            )),
+        }
+    }
 }
 
 #[async_trait]
@@ -243,6 +305,27 @@ impl Protocol for ShadowsocksTunnel {
             Ok((server, context)) => {
                 self.server = Some(server);
                 self.context = Some(context);
+
+                // The profile's first DNS server, asked over the tunnel
+                // just built. See `probe`'s doc for why this one round trip
+                // is load-bearing: Shadowsocks has no handshake, so without
+                // it `Ok` here would mean nothing more than "a socket
+                // opened".
+                let probed = match profile.dns.servers.first() {
+                    Some(dns) => self.probe(SocketAddr::new(*dns, 53)).await,
+                    None => Err(TunnelError::config("dns.servers", "must not be empty")),
+                };
+                if let Err(e) = probed {
+                    // Same failure-state contract as the `Err` arm below: a
+                    // tunnel whose credentials fail the probe must not be
+                    // left `Connected`, or half-built with a server config
+                    // that was never actually proven to work, either.
+                    self.server = None;
+                    self.context = None;
+                    self.state = ConnectionState::Failed;
+                    return Err(e);
+                }
+
                 self.state = ConnectionState::Connected;
                 Ok(())
             }
@@ -411,13 +494,19 @@ mod tests {
     }
 
     /// A tunnel already `Connected`, pointed at a server address that refuses
-    /// instantly. `connect` does not contact the server (Task 3 adds the
-    /// probe), so this succeeds and leaves the resolved password retained --
-    /// which is precisely the state the leak and failure-state tests need.
+    /// instantly -- built by calling `prepare` directly and assigning state
+    /// by hand instead of going through `connect`. `connect`'s probe (Task
+    /// 3) dials this same address before reporting success, and a server
+    /// that refuses every connection refuses the probe's connection too, so
+    /// a real `connect` call against one can never reach `Connected` in the
+    /// first place. What the tests using this helper exercise -- the
+    /// failure-state contract on reconnect, the no-leak invariants on flow
+    /// errors, the flow semaphores -- all sit downstream of `Connected`, not
+    /// the probe, so building the state directly is the accurate setup for
+    /// them and leaves the resolved password retained, same as before.
     async fn connected_to_a_refusing_server() -> (ShadowsocksTunnel, SocketAddr) {
         let server = a_closed_loopback_port().await;
-        let mut t = ShadowsocksTunnel::new();
-        t.connect(
+        let (server_cfg, context) = ShadowsocksTunnel::prepare(
             &profile_at(
                 "chacha20-ietf-poly1305",
                 &server.ip().to_string(),
@@ -425,8 +514,11 @@ mod tests {
             ),
             &FixedSecret(PW),
         )
-        .await
-        .expect("an offered cipher must connect");
+        .expect("an offered cipher must prepare");
+        let mut t = ShadowsocksTunnel::new();
+        t.server = Some(server_cfg);
+        t.context = Some(context);
+        t.state = ConnectionState::Connected;
         (t, server)
     }
 
@@ -700,5 +792,59 @@ mod tests {
         let s = t.stats();
         assert_eq!(s.state, ConnectionState::Disconnected);
         assert_eq!(s.bytes_up, 0);
+    }
+
+    /// A loopback listener that accepts a connection and then answers
+    /// nothing, standing in for a Shadowsocks server given the wrong key:
+    /// the spec's own behaviour is to accept the TCP connection and
+    /// silently discard it, never refusing it outright. Held open with a
+    /// long sleep rather than dropped -- dropping would surface as a clean
+    /// EOF, not the genuine, silent hang this simulates -- matching
+    /// `dns::over_tcp`'s `HostileDnsProtocol::hold_open`. The test that uses
+    /// this drops its own runtime long before the sleep fires.
+    async fn a_server_that_accepts_and_answers_nothing() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((_sock, _)) = listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        addr
+    }
+
+    /// Task 3 (`task-3-brief.md`), Step 1: the failing test this task
+    /// exists to fix. Before the probe, `connect` built a `ServerConfig` and
+    /// never spoke to anything, so a connection to a server that accepts
+    /// and never answers -- exactly what happens when the password is wrong
+    /// -- reported `Ok`.
+    ///
+    /// The brief's own version of this test pointed `host` at 192.0.2.1
+    /// (TEST-NET-1, RFC 5737) to get an address nothing can reach. Dropped
+    /// in favour of the listener above: TEST-NET-1 is black-holed by some
+    /// network stacks and refused outright by others, so a test built on it
+    /// would depend on the machine it runs on rather than on the probe --
+    /// the exact "reaches a timeout arm and asserts nothing reliable" shape
+    /// this module's other tests already avoid (see the removed 192.0.2.1
+    /// flow test above). A listener that genuinely accepts and stays silent
+    /// is deterministic on every machine and is what the bug looks like.
+    #[tokio::test]
+    async fn connect_fails_when_the_server_does_not_answer() {
+        let server = a_server_that_accepts_and_answers_nothing().await;
+        let p = profile_at("aes-256-gcm", &server.ip().to_string(), server.port());
+        let mut t = ShadowsocksTunnel::new();
+        let err = t
+            .connect(&p, &FixedSecret("pw"))
+            .await
+            .expect_err("a server that never answers is not a connection");
+        assert!(
+            matches!(err, TunnelError::Auth(_) | TunnelError::Transport(_)),
+            "got {err:?}"
+        );
+        assert_eq!(
+            t.stats().state,
+            ConnectionState::Failed,
+            "a failed probe must not leave the tunnel looking Connected"
+        );
     }
 }
