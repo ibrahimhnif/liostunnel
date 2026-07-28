@@ -329,9 +329,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs root: chowns a file to a non-root uid to make link-owner != target-owner; \
-                run with `cargo test -p liostunnel-helper auth -- --include-ignored` as root \
-                (see the Linux/Docker invocation in task-3-report.md)"]
+    #[ignore = "needs root: chowns a file to a non-root uid to make link-owner != target-owner. \
+                Run as root with: docker run --rm -v \"$PWD\":/w -w /w \
+                -e CARGO_TARGET_DIR=/w/target-linux rust:1.93-slim \
+                cargo test -p liostunnel-helper auth -- --include-ignored"]
     fn a_root_owned_link_to_a_foreign_owned_target_is_still_refused() {
         // The property `a_symlink_resolves_its_type_and_mode_through_the_link`
         // above cannot pin: whether *ownership* is read from the target or
@@ -349,8 +350,8 @@ mod tests {
         assert_eq!(
             me, 0,
             "this test requires root to chown a file to a foreign uid; got uid {me}. \
-             Run it deliberately (see the Docker invocation in task-3-report.md) — \
-             do not let it report a pass for an assertion it never ran."
+             Run it deliberately as root via --include-ignored (see the #[ignore] \
+             reason above) — do not let it report a pass for an assertion it never ran."
         );
 
         let d = scratch("symlink-foreign-owner");
