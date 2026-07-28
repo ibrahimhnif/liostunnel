@@ -25,15 +25,22 @@ PROFILE=${LIOS_PROFILE:-/tmp/lios-verify/profile.json}
 SSH_HOST=${LIOS_SSH_HOST:-127.0.0.1}
 SSH_PORT=${LIOS_SSH_PORT:-22022}
 
-# The target must be one the host cannot reach except through the tunnel.
-# A /32 always beats a /24 or a default route by longest-prefix match, so the
-# kernel has no other path for it.
+# The fixture's own nginx, routed as a /32.
 #
-# Do NOT point this at a network the host already has a route for at the same
-# prefix length: the first attempt used the Docker network, macOS already had
-# a route for it via its own bridge, ours never won, and the curl still
-# succeeded — a green result proving nothing.
-TARGET=${LIOS_TARGET:-1.1.1.1}
+# The target must be one the host cannot reach except through the tunnel. A
+# /32 beats a /24 or a default route by longest-prefix match, so the kernel
+# has no other path for it. Routing the whole /24 does NOT work: the first
+# attempt did that, tied with Docker's own bridge route, and the fetch
+# succeeded around the tunnel entirely — a green result proving nothing.
+#
+# NEVER point this at a public DNS resolver. 1.1.1.1 was the default here
+# once, and on a machine that uses 1.1.1.1 as its nameserver it routes every
+# DNS query on the box into a tunnel whose own resolver is that same address.
+# That produced 83 stalled flows from four fetches, nothing returning, and a
+# criterion that passed anyway.
+TARGET=${LIOS_TARGET:-$(docker inspect docker-target-1 \
+  --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)}
+[ -n "$TARGET" ] || { echo "fixture not up — run: make -C testing/docker up"; exit 1; }
 FIXTURE_CIDR=${LIOS_CIDR:-$TARGET/32}
 HELPER=${LIOS_HELPER:-$repo/target/release/liostunnel-helper}
 
@@ -220,18 +227,27 @@ print("  stats before traffic:", before)
 
 open("/tmp/lios-fetching", "w").write("go")   # arms the capture
 time.sleep(1.5)                                       # let tcpdump attach
+fetched = 0
 for _ in range(4):
-    try: urllib.request.urlopen(f"http://{target}/", timeout=8).read()
-    except Exception as e: print("  fetch:", e)
+    try:
+        urllib.request.urlopen(f"http://{target}/", timeout=8).read()
+        fetched += 1
+    except Exception as e:
+        print("  fetch:", e)
 for _ in range(6):
     m=read(1, t=5)
     if m and m[0].get("type")=="stats": after=m[0]["snapshot"]
 print("  stats after traffic :", after)
 
-if before and after and (after["bytes_up"]>before["bytes_up"] or after["bytes_down"]>before["bytes_down"]):
-    print("  PASS  P1a-3: stats moved in response to traffic — the bytes went through the engine")
+# Bytes DOWN and a fetch that actually returned. Bytes up alone only prove
+# we pushed data at the tunnel — an earlier version passed on that and
+# reported success over four timed-out fetches and bytes_down=0.
+moved_down = bool(before and after and after["bytes_down"] > before["bytes_down"])
+if fetched and moved_down:
+    print(f"  PASS  P1a-3: {fetched}/4 fetches returned and bytes came back through the engine")
 else:
-    print("  FAIL  P1a-3: stats did not move; the fetches did not go through the engine")
+    print(f"  FAIL  P1a-3: {fetched}/4 fetches returned, bytes_down moved: {moved_down}")
+    print("        traffic did not complete a round trip through the tunnel")
     sys.exit(2)          # scored by the shell — a printed FAIL must not tally as a pass
 PY
 RC=$?

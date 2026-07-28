@@ -45,8 +45,8 @@ docker run --rm \
   --cap-add NET_ADMIN --cap-add NET_RAW \
   --device /dev/net/tun \
   -v "$repo":/w -w /w \
-  -e LIOS_TARGET="$TARGET_IP" \
-  -e LIOS_CIDR="$TARGET_IP/32" \
+  -e LIOS_TARGET="${LIOS_TARGET:-$TARGET_IP}" \
+  -e LIOS_CIDR="${LIOS_CIDR:-$TARGET_IP/32}" \
   -e LIOS_SSH_HOST="$SSH_IP" \
   -e LIOS_SSH_PORT=22 \
   -e LIOS_SSH_USER=tunneluser \
