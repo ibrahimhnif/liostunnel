@@ -150,7 +150,7 @@ which is a property of the protocol and is recorded here so nobody later reads
 ```rust
 AuthMethod::Shadowsocks {
     /// A cipher name as Shadowsocks spells it, e.g. `aes-256-gcm`
-    /// or `2022-blake3-aes-256-gcm`.
+    /// or `chacha20-ietf-poly1305`.
     method: String,
     password: SecretRef,
 }
@@ -160,16 +160,29 @@ AuthMethod::Shadowsocks {
 with no new code: a Shadowsocks profile naming a key file the caller does not
 own is refused exactly as an SSH one is.
 
-Supported ciphers, taken from what the crate actually exposes:
+Supported ciphers:
 
 | family | names |
 |---|---|
 | AEAD | `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305` |
-| AEAD-2022 | `2022-blake3-aes-128-gcm`, `2022-blake3-aes-256-gcm`, `2022-blake3-chacha20-poly1305` |
+
+`shadowsocks.rs`'s `OFFERED` constant is the authority; this table follows it.
 
 Stream ciphers (`rc4-md5`, `aes-256-cfb`) are **not** offered. They are broken,
 the crate gates them behind a separate feature, and offering a cipher we would
 have to warn about is worse than not offering it.
+
+**AEAD-2022 is not offered either** — corrected 2026-07-29, after the Task 2
+review. This table originally carried a `2022-blake3-*` row, read from the
+names present in `shadowsocks-crypto`'s `kind.rs`. Those names are there, but
+their `FromStr` arms are `#[cfg(feature = "v2")]`, reachable only through
+`shadowsocks/aead-cipher-2022` — which D2 forbids. Building against D2's exact
+dependency line and calling `CipherKind::from_str` on all three returns
+`Err(ParseCipherKindError)`. So the row described what the source spells, not
+what this build can construct, and the offered list it produced recommended
+three ciphers to a user who had just typo'd one — each of which then failed as
+unknown. D2 governs. Supporting AEAD-2022 later is a feature-flag decision
+with its own dependency cost, not a table edit.
 
 Ripples: core `AuthMethod` → `secret_refs()` → `ProfileDto` (`auth_kind:
 "shadowsocks"`, plus a `cipher` field) → the editor's dropdown.

@@ -613,32 +613,13 @@ mod tests {
         assert!(!format!("{err:?}").contains(PW), "Debug leaks it: {err:?}");
     }
 
-    /// Finding 3, the unroutable half. 192.0.2.1 is TEST-NET-1 (RFC 5737):
-    /// reserved, never a real host. A reserved address may be *refused*
-    /// quickly or may black-hole the SYN entirely depending on the local
-    /// routing table, so this is bounded by a timeout -- and a black hole is
-    /// tolerated, because no error object is constructed on that path and
-    /// therefore none can leak. The refused-loopback test above is the one
-    /// that guarantees the assertions actually execute.
-    #[tokio::test]
-    async fn an_unreachable_server_never_reports_the_password_either() {
-        let mut t = ShadowsocksTunnel::new();
-        t.connect(
-            &profile_at("chacha20-ietf-poly1305", "192.0.2.1", 8388),
-            &FixedSecret(PW),
-        )
-        .await
-        .unwrap();
-
-        match tokio::time::timeout(Duration::from_secs(2), t.open_tcp_stream(dest())).await {
-            Ok(Ok(_)) => panic!("TEST-NET-1 must never accept a connection"),
-            Ok(Err(err)) => {
-                assert!(!format!("{err}").contains(PW), "Display leaks it: {err}");
-                assert!(!format!("{err:?}").contains(PW), "Debug leaks it: {err:?}");
-            }
-            Err(_elapsed) => { /* black-holed: no error was built, so none leaked */ }
-        }
-    }
+    // There was a second test here using 192.0.2.1 (TEST-NET-1) as the
+    // unreachable server. It is gone: TEST-NET-1 black-holes the SYN rather
+    // than refusing it on at least this machine, so the test spent 2s
+    // reaching its timeout arm and executed no assertions at all -- green,
+    // named after a behaviour, proving nothing. That is the exact shape this
+    // module's other tests exist to avoid. The refused-loopback test above
+    // covers the same leak site with assertions that always run.
 
     /// Finding 4. The plaintext password and the derived key used to sit in a
     /// `#[derive(Debug)]` type held on the struct for the tunnel's whole
