@@ -452,12 +452,17 @@ impl SshTunnel {
             policy: self.policy.clone(),
         };
 
+        // Fix wave 2, finding 2: `profile.host` does not appear in this
+        // message. It is caller-supplied profile content, and this
+        // `Display` reaches the same two sinks `shadowsocks.rs`'s
+        // `prepare` already refuses to feed it to (the root-owned helper
+        // log via `tracing::warn!(error = %e, "connect failed")`, and the
+        // wire via `dispatch::connect_failed`). The io error alone is the
+        // actionable part; the host is already in the caller's own profile.
         let candidates: Vec<SocketAddr> =
             tokio::net::lookup_host((profile.host.as_str(), profile.port))
                 .await
-                .map_err(|e| {
-                    TunnelError::Protocol(format!("cannot resolve {}: {e}", profile.host))
-                })?
+                .map_err(|e| TunnelError::Protocol(format!("cannot resolve host: {e}")))?
                 .collect();
         let addr = pick_ipv4(candidates)?;
 
@@ -765,5 +770,58 @@ mod tests {
             None,
             "peer_addr must be None before any successful connect"
         );
+    }
+
+    /// Fix wave 2, finding 2. `connect_inner`'s resolve failure used to echo
+    /// `profile.host` verbatim -- exactly what `shadowsocks.rs:260-262`
+    /// documents refusing to do for the identical failure mode, and for the
+    /// identical reason: this `Display` reaches the root-owned helper log
+    /// (`tracing::warn!(error = %e, "connect failed")`) and the wire
+    /// (`dispatch::connect_failed`), and `profile.host` is caller-supplied
+    /// profile content that nothing validates before `connect` runs.
+    ///
+    /// A NUL byte embedded in the host string (via the JSON escape
+    /// `\u0000`) makes `tokio::net::lookup_host` fail synchronously, in
+    /// process -- `CString::new` refuses interior NULs before any syscall,
+    /// let alone a DNS query -- so this is reachable with no network at all,
+    /// same as every other test in this module.
+    #[tokio::test]
+    async fn a_resolve_failure_never_echoes_the_host() {
+        struct NoSecret;
+        impl crate::config::secret::SecretStore for NoSecret {
+            fn resolve(
+                &self,
+                _r: &crate::config::secret::SecretRef,
+            ) -> Result<crate::config::secret::Redacted<String>, TunnelError> {
+                unreachable!("a resolve failure happens before any secret is ever read")
+            }
+        }
+
+        let profile: ServerProfile = serde_json::from_str(
+            r#"{"id":"b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f","name":"t",
+                "protocol":"ssh","host":"SECRET-VALUE-HERE\u0000","port":22,
+                "auth":{"type":"password","password":{"source":"file","path":"/tmp/k"}},
+                "dns":["1.1.1.1"],"split_tunnel":{"type":"all_traffic"},
+                "kill_switch":false}"#,
+        )
+        .unwrap();
+
+        let dir = scratch("resolve-failure");
+        let mut t = SshTunnel::new(
+            "me".into(),
+            HostKeyPolicy::Verify {
+                known_hosts: dir.join("known_hosts"),
+            },
+        );
+        let err = t
+            .connect(&profile, &NoSecret)
+            .await
+            .expect_err("a NUL byte cannot be resolved");
+        let text = format!("{err}");
+        assert!(
+            !text.contains("SECRET-VALUE-HERE"),
+            "the message must not echo caller-supplied profile content: {text}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

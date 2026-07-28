@@ -450,11 +450,19 @@ impl ShadowsocksTunnel {
                 "required when dns.mode is `https`",
             ));
         };
+        // Fix wave 2, finding 1: `doh.sni` does not appear in this message.
+        // `authorize_params` never calls `ServerProfile::validate`, so this
+        // is reachable with no network at all -- an unprivileged caller
+        // sends a `dns.https.sni` that fails to parse as a server name, and
+        // this `Display` reaches the same two sinks `cipher`'s doc names:
+        // the root-owned helper log (`tracing::warn!(error = %e, "connect
+        // failed")`) and the wire (`dispatch::connect_failed`). Because the
+        // helper logs with plain-text `tracing_subscriber::fmt()`, an SNI
+        // containing a newline would forge lines in that log. The field
+        // name already says which value is wrong; the string itself is
+        // already in the caller's own profile.
         let name = rustls::pki_types::ServerName::try_from(doh.sni.clone()).map_err(|e| {
-            TunnelError::config(
-                "dns.https.sni",
-                format!("`{}` is not a server name: {e}", doh.sni),
-            )
+            TunnelError::config("dns.https.sni", format!("is not a valid server name: {e}"))
         })?;
 
         let stream = self
@@ -487,9 +495,12 @@ impl ShadowsocksTunnel {
                     .and_then(|inner| inner.downcast_ref::<rustls::Error>())
                     .is_some()
                 {
+                    // Fix wave 2, finding 1, the sibling leak: this used to
+                    // quote `doh.sni` too. Naming the resolver and the
+                    // rustls error is the actionable half; the SNI is
+                    // caller-supplied profile content the caller already has.
                     TunnelError::Dns(format!(
-                        "TLS handshake with the resolver {server} (SNI `{}`) failed: {e}",
-                        doh.sni
+                        "TLS handshake with the resolver {server} failed: {e}"
                     ))
                 } else {
                     TunnelError::Auth(format!(
@@ -1422,9 +1433,16 @@ mod tests {
         // other combination -- so the assertion below is the only thing that
         // actually distinguishes "both cleared" from "half-built with a
         // server config the probe just disproved".
+        //
+        // Fix wave 2, finding 3: `t.peer.is_none()` joins the other two.
+        // Nothing here asserted on `peer` before, so the `self.peer = None`
+        // line in the probe-failure branch could be deleted outright and
+        // this whole suite stayed green -- a route pin aimed at a server
+        // this tunnel never proved it can relay through is worse than no
+        // pin at all, and that regression was invisible.
         assert!(
-            t.server.is_none() && t.context.is_none(),
-            "a probe-refused connect must retain neither field"
+            t.server.is_none() && t.context.is_none() && t.peer.is_none(),
+            "a probe-refused connect must retain neither field, nor the peer it never proved"
         );
         let flow = flow_error(
             t.open_tcp_stream(dest()).await,
@@ -1588,9 +1606,13 @@ mod tests {
         // the contract is `Failed`, the other half is that nothing is
         // retained -- both fields, not just one, mirroring the
         // failed-reconnect test.
+        //
+        // Fix wave 2, finding 3: `t.peer.is_none()` joins the other two, for
+        // the same reason as the sibling assertion in
+        // `connect_fails_when_the_password_is_wrong` above.
         assert!(
-            t.server.is_none() && t.context.is_none(),
-            "a timed-out probe must retain neither field"
+            t.server.is_none() && t.context.is_none() && t.peer.is_none(),
+            "a timed-out probe must retain neither field, nor the peer it never proved"
         );
         let flow = flow_error(
             t.open_tcp_stream(dest()).await,
@@ -1680,9 +1702,20 @@ mod tests {
         );
         let msg = format!("{err}");
         assert!(msg.contains("127.0.0.1"), "name the resolver: {msg}");
+        // Fix wave 2, finding 1. This used to assert `msg.contains("cloudflare-dns.com")`
+        // -- pinning the leak in place, since `doh.sni` is caller-supplied
+        // profile content that reaches the same two sinks `cipher`'s doc
+        // names (the root-owned helper log and the wire). Asserting on the
+        // rustls failure text instead keeps the test discriminating: it can
+        // still fail if the `Dns` arm stops naming what actually went wrong,
+        // it just no longer requires the SNI to do it.
         assert!(
-            msg.contains("cloudflare-dns.com"),
-            "name the SNI the handshake was attempted against: {msg}"
+            msg.contains("HandshakeFailure"),
+            "name the rustls failure that actually occurred: {msg}"
+        );
+        assert!(
+            !msg.contains("cloudflare-dns.com"),
+            "dns.https.sni is caller-supplied profile content and must not be echoed: {msg}"
         );
     }
 

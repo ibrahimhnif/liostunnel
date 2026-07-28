@@ -100,11 +100,27 @@ impl Session {
             }
             StartError::Tunnel(_) => ErrorKind::Internal,
         };
-        // `e`'s Display is safe to send: every variant either carries no
-        // input at all or carries a path and uid. `BadProfile` now carries a
-        // reason, but it is `&'static str` — a literal in `session.rs`, which
-        // no request can influence — and Task 6's echo tests still pin that
-        // the profile itself never comes back.
+        // `e`'s Display is safe to send back over the wire. Every variant
+        // except `BadRouteMode` carries no input at all, or carries only a
+        // path and uid; `BadProfile` carries a reason too, but it is
+        // `&'static str` -- a literal in `session.rs`, which no request can
+        // influence -- and Task 6's echo tests still pin that the profile
+        // itself never comes back.
+        //
+        // `BadRouteMode(String)` is the one exception, and does carry a
+        // caller string verbatim, at two sites: `session.rs:568`
+        // ("cidr is not valid: {c}") and `session.rs:596-598` ("expected
+        // `test` or `default`, got `{other}`"). Echoing there is fine, but
+        // for a narrower reason than "no input" -- a gate failure (this
+        // whole `Connect` arm, from `Tunnel::authorize_params`) never
+        // reaches `tracing::warn!(error = %e, "connect failed")`: that only
+        // fires in `main.rs` for a `StartError` from `Tunnel::start`, which
+        // runs strictly after the gate has already returned `Ok`, so it
+        // can never itself produce `BadRouteMode`. The only sink left is
+        // the wire, back to the same caller who supplied the string in the
+        // first place -- there is nothing in it they did not already have.
+        // That reasoning does not extend to a message that also reaches the
+        // helper log; do not copy this pattern for one that does.
         vec![err(id, kind, &e.to_string())]
     }
 

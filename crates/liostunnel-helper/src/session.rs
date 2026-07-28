@@ -763,6 +763,74 @@ mod tests {
         );
     }
 
+    /// Fix wave 2, finding 1. `dns.https.sni` is caller-supplied profile
+    /// content too, and `ServerProfile::validate` -- which does check it is
+    /// non-empty -- is never called by `authorize_params`, so nothing
+    /// validates it is even a legal server name before
+    /// `ShadowsocksTunnel::probe_over_tls` tries to build one from it. That
+    /// failure used to quote the value verbatim into the same two sinks the
+    /// cipher-name test above covers: the root-owned helper log
+    /// (`tracing::warn!(error = %e, "connect failed")`) and the wire
+    /// (`dispatch::connect_failed`). Because the helper logs with
+    /// `tracing_subscriber::fmt()` -- plain text, no field escaping -- an
+    /// embedded newline in the SNI would have forged lines in that log; the
+    /// marker carries one for exactly that reason.
+    ///
+    /// Unlike the cipher-name case, this failure sits downstream of
+    /// `prepare` succeeding, so the password must actually resolve: built
+    /// through the real gate (`Tunnel::authorize_params`) with an owned
+    /// secret file, rather than `authorized()`'s bypass with no secrets at
+    /// all. No network: `ServerName::try_from` fails before any socket
+    /// opens.
+    #[tokio::test]
+    async fn a_shadowsocks_dns_sni_is_never_echoed_back_either() {
+        let d = scratch("ss-sni-marker");
+        let p = owned_secret(&d);
+        let marker = "SECRET-VALUE-HERE\ninjected-line";
+        // JSON-encoded so the embedded newline survives as a valid document
+        // rather than breaking `profile_json` parsing outright.
+        let sni_json = serde_json::to_string(marker).unwrap();
+        let params = ConnectParams {
+            profile_json: format!(
+                r#"{{"id":"00000000-0000-0000-0000-000000000000","name":"t",
+                    "protocol":"shadowsocks","host":"127.0.0.1","port":8388,
+                    "auth":{{"type":"shadowsocks","method":"aes-256-gcm",
+                            "password":{{"source":"file","path":"{}"}}}},
+                    "dns":{{"mode":"https","servers":["127.0.0.1"],
+                            "https":{{"sni":{sni_json},"path":"/dns-query"}}}},
+                    "split_tunnel":{{"type":"all_traffic"}},
+                    "kill_switch":false}}"#,
+                p.display(),
+            ),
+            user: "someone".into(),
+            route_mode: "test".into(),
+            cidrs: vec!["93.184.216.0/24".into()],
+            capture_dns: false,
+            tun_address: "10.90.0.1".into(),
+        };
+        let auth = Tunnel::authorize_params(&params, me())
+            .expect("an owned password and a well-formed https dns block must pass the gate");
+
+        let Err(err) = connect_protocol(&auth, &paths()).await else {
+            panic!("a newline cannot appear in a server name");
+        };
+        let text = format!("{err}");
+        assert!(
+            !text.contains("SECRET-VALUE-HERE"),
+            "error echoed profile content: {text}"
+        );
+        assert!(
+            !text.contains('\n'),
+            "an embedded newline in the SNI must not reach the error text: {text:?}"
+        );
+        let debug = format!("{err:?}");
+        assert!(
+            !debug.contains("SECRET-VALUE-HERE"),
+            "Debug echoed profile content: {debug}"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
     #[test]
     fn an_unknown_route_mode_is_refused() {
         let d = scratch("bad-mode");
