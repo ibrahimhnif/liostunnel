@@ -16,18 +16,26 @@
 #
 set -uo pipefail
 
-SOCK=/tmp/lios-verify/helper.sock
-PROFILE=/tmp/lios-verify/profile.json
-# A public /32 with no competing host route. Longest-prefix match means it
-# beats the default route, so traffic to it can only go through the tunnel.
-# The docker network is NOT usable as the target: Docker Desktop already
-# installs a route for it via its own bridge, so ours never wins, traffic
-# bypasses the engine entirely, and the curl still succeeds — which looks
-# like a working tunnel while proving nothing.
-FIXTURE_CIDR=1.1.1.1/32
-TARGET=1.1.1.1
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-HELPER="$repo/target/release/liostunnel-helper"
+# shellcheck source=testing/lib-verify.sh
+. "$repo/testing/lib-verify.sh"
+
+SOCK=/tmp/lios-verify/helper.sock
+PROFILE=${LIOS_PROFILE:-/tmp/lios-verify/profile.json}
+SSH_HOST=${LIOS_SSH_HOST:-127.0.0.1}
+SSH_PORT=${LIOS_SSH_PORT:-22022}
+
+# The target must be one the host cannot reach except through the tunnel.
+# A /32 always beats a /24 or a default route by longest-prefix match, so the
+# kernel has no other path for it.
+#
+# Do NOT point this at a network the host already has a route for at the same
+# prefix length: the first attempt used the Docker network, macOS already had
+# a route for it via its own bridge, ours never won, and the curl still
+# succeeded — a green result proving nothing.
+TARGET=${LIOS_TARGET:-1.1.1.1}
+FIXTURE_CIDR=${LIOS_CIDR:-$TARGET/32}
+HELPER=${LIOS_HELPER:-$repo/target/release/liostunnel-helper}
 
 pass=0; fail=0
 ok()   { echo "  PASS  $*"; pass=$((pass+1)); }
@@ -40,13 +48,19 @@ CLIENT_UID="${SUDO_UID:-}"
 [ -f "$HELPER" ] || { echo "no release helper; run: cargo build --release -p liostunnel-helper"; exit 1; }
 [ -f "$PROFILE" ] || { echo "no profile at $PROFILE"; exit 1; }
 
+# Fills the fixture details into an embedded python client.
+subst() {
+  sed -e "s|__HOST__|$SSH_HOST|g" -e "s|__PORT__|$SSH_PORT|g" \
+      -e "s|__CIDR__|$FIXTURE_CIDR|g" -e "s|__SSHUSER__|${LIOS_SSH_USER:-tunneluser}|g"
+}
+
 echo "helper : $HELPER"
 echo "client : uid $CLIENT_UID"
 echo "target : $TARGET via $FIXTURE_CIDR"
 
 # ---------------------------------------------------------------- baseline
-DEFAULT_BEFORE="$(netstat -rn -f inet 2>/dev/null | grep '^default' || ip route show default 2>/dev/null)"
-IFACES_BEFORE="$(ifconfig -l 2>/dev/null || ip -br link | awk '{print $1}' | tr '\n' ' ')"
+DEFAULT_BEFORE="$(default_route)"
+IFACES_BEFORE="$(iface_list)"
 
 rm -f "$SOCK" "$SOCK.lock" "$SOCK.routes.json"
 "$HELPER" --socket "$SOCK" --uid "$CLIENT_UID" > /tmp/lios-verify/helper.log 2>&1 &
@@ -56,15 +70,15 @@ for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 0.25; done
 [ -S "$SOCK" ] || { echo "helper never bound; log:"; cat /tmp/lios-verify/helper.log; exit 1; }
 
 hdr "socket ownership (spec §7.1 — both platforms enforce mode bits on connect)"
-stat -f '  socket: mode=%Lp owner=%u' "$SOCK" 2>/dev/null || stat -c '  socket: mode=%a owner=%u' "$SOCK"
-SOCK_OWNER="$(stat -f '%u' "$SOCK" 2>/dev/null || stat -c '%u' "$SOCK")"
+echo "  socket: mode=$(file_mode "$SOCK") owner=$(file_owner "$SOCK")"
+SOCK_OWNER="$(file_owner "$SOCK")"
 [ "$SOCK_OWNER" = "$CLIENT_UID" ] \
   && ok "socket belongs to the uid it serves, not root" \
   || bad "socket owner is $SOCK_OWNER, expected $CLIENT_UID — the app could never open it"
 
 # ------------------------------------------------------------------ P1a-7
 hdr "P1a-7 — a version-mismatched client fails cleanly"
-OUT=$(sudo -u "#$CLIENT_UID" python3 - "$SOCK" <<'PY'
+OUT=$(subst <<'PY' | sudo -u "#$CLIENT_UID" python3 - "$SOCK"
 import socket,sys,json,time
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(sys.argv[1])
 s.sendall(b'{"type":"hello","id":1,"protocol_version":99}\n'); time.sleep(0.4)
@@ -93,54 +107,62 @@ except Exception as e:
 PYEOF
 chmod 755 /tmp/lios-verify
 chmod 644 /tmp/lios-verify/asnobody.py
-OUT=$(cd /tmp && sudo -u nobody python3 /tmp/lios-verify/asnobody.py "$SOCK" 2>&1)
+OUT=$(cd /tmp && sudo -u "$(other_user)" python3 /tmp/lios-verify/asnobody.py "$SOCK" 2>&1)
 echo "  $OUT"
 case "$OUT" in
-  REFUSED:*)        ok "nobody could not even open the socket (mode bits)";;
-  "REPLY:b''")      ok "nobody was authenticated and dropped without a reply";;
-  *)                bad "nobody got served: $OUT";;
+  REFUSED:*)        ok "$(other_user) could not even open the socket (mode bits)";;
+  "REPLY:b''")      ok "$(other_user) was authenticated and dropped without a reply";;
+  *)                bad "$(other_user) got served: $OUT";;
 esac
 grep -c "refused a connection" /tmp/lios-verify/helper.log >/dev/null 2>&1 \
   && echo "  helper log: $(grep 'refused a connection' /tmp/lios-verify/helper.log | tail -1)"
 
 # ------------------------------------------------------------------ P1a-6
 hdr "P1a-6 — a secret the caller does not own is refused, with nothing created"
-IF_PRE="$(ifconfig -l 2>/dev/null || ip -br link | awk '{print $1}' | tr '\n' ' ')"
-RT_PRE="$(netstat -rn -f inet 2>/dev/null | wc -l | tr -d ' ')"
-OUT=$(sudo -u "#$CLIENT_UID" python3 - "$SOCK" <<'PY'
+# A root-owned 0600 file made here, rather than a system file. /etc/shadow is
+# absent on macOS and mode 0640 on Debian, and /etc/master.passwd is absent on
+# Linux — each of which makes the refusal happen for the WRONG reason (missing
+# file, or loose mode) without ever reaching the ownership check. This one can
+# only be refused for the reason the criterion is about.
+install -o 0 -g 0 -m 600 /dev/null /tmp/lios-verify/rootkey 2>/dev/null || {
+  : > /tmp/lios-verify/rootkey; chown 0 /tmp/lios-verify/rootkey; chmod 600 /tmp/lios-verify/rootkey; }
+echo "  bait: $(file_mode /tmp/lios-verify/rootkey) owned by uid $(file_owner /tmp/lios-verify/rootkey)"
+IF_PRE="$(iface_list)"
+RT_PRE="$(routes | wc -l | tr -d ' ')"
+OUT=$(subst <<'PY' | sudo -u "#$CLIENT_UID" python3 - "$SOCK"
 import socket,sys,json,time
 prof=json.dumps({"id":"b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f","name":"evil","protocol":"ssh",
-  "host":"127.0.0.1","port":22022,
-  "auth":{"type":"private_key","private_key":{"source":"file","path":"/etc/master.passwd"}},
+  "host":"__HOST__","port":__PORT__,
+  "auth":{"type":"private_key","private_key":{"source":"file","path":"/tmp/lios-verify/rootkey"}},
   "dns":["1.1.1.1"],"split_tunnel":{"type":"all_traffic"},"kill_switch":False})
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(sys.argv[1])
 s.sendall(b'{"type":"hello","id":1,"protocol_version":1}\n')
-s.sendall((json.dumps({"type":"connect","id":2,"params":{"profile_json":prof,"user":"tunneluser",
-  "route_mode":"test","cidrs":["1.1.1.1/32"],"capture_dns":False,
+s.sendall((json.dumps({"type":"connect","id":2,"params":{"profile_json":prof,"user":"__SSHUSER__",
+  "route_mode":"test","cidrs":["__CIDR__"],"capture_dns":False,
   "tun_address":"10.90.0.1"}})+"\n").encode())
 time.sleep(1.0)
 print(s.recv(65536).decode().strip())
 PY
 )
 echo "$OUT" | sed 's/^/  /'
-IF_POST="$(ifconfig -l 2>/dev/null || ip -br link | awk '{print $1}' | tr '\n' ' ')"
-RT_POST="$(netstat -rn -f inet 2>/dev/null | wc -l | tr -d ' ')"
+IF_POST="$(iface_list)"
+RT_POST="$(routes | wc -l | tr -d ' ')"
 echo "$OUT" | grep -q '"kind":"secret_not_permitted"' \
-  && ok "root-owned secret refused" || bad "expected secret_not_permitted"
+  && ok "root-owned secret refused" || bad "expected secret_not_permitted (check it is the OWNERSHIP branch, not a stat or mode failure)"
 [ "$IF_PRE" = "$IF_POST" ] && ok "no TUN device created" || bad "interfaces changed: $IF_PRE -> $IF_POST"
 [ "$RT_PRE" = "$RT_POST" ] && ok "no route installed" || bad "route count $RT_PRE -> $RT_POST"
 
 hdr "P1a-6b — an env-var secret is refused (it would read ROOT's environment)"
-OUT=$(sudo -u "#$CLIENT_UID" python3 - "$SOCK" <<'PY'
+OUT=$(subst <<'PY' | sudo -u "#$CLIENT_UID" python3 - "$SOCK"
 import socket,sys,json,time
 prof=json.dumps({"id":"b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f","name":"evil2","protocol":"ssh",
-  "host":"127.0.0.1","port":22022,
+  "host":"__HOST__","port":__PORT__,
   "auth":{"type":"password","password":{"source":"env","var":"HOME"}},
   "dns":["1.1.1.1"],"split_tunnel":{"type":"all_traffic"},"kill_switch":False})
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(sys.argv[1])
 s.sendall(b'{"type":"hello","id":1,"protocol_version":1}\n')
-s.sendall((json.dumps({"type":"connect","id":2,"params":{"profile_json":prof,"user":"tunneluser",
-  "route_mode":"test","cidrs":["1.1.1.1/32"],"capture_dns":False,
+s.sendall((json.dumps({"type":"connect","id":2,"params":{"profile_json":prof,"user":"__SSHUSER__",
+  "route_mode":"test","cidrs":["__CIDR__"],"capture_dns":False,
   "tun_address":"10.90.0.1"}})+"\n").encode())
 time.sleep(1.0)
 print(s.recv(65536).decode().strip())
@@ -152,10 +174,22 @@ echo "$OUT" | grep -q 'env-var secrets are not available' \
 
 # --------------------------------------------------------- P1a-2 / 3 / 4
 hdr "P1a-2, P1a-3, P1a-4 — a real tunnel, live stats, and surviving the client"
-sudo -u "#$CLIENT_UID" python3 - "$SOCK" "$TARGET" <<'PY'
+# Watch the tunnel device during the fetches. Flat counters alone cannot say
+# whether the packets went around the tunnel or into it and vanished; this
+# separates the two.
+rm -f /tmp/lios-fetching
+( for _ in $(seq 1 150); do [ -f /tmp/lios-fetching ] && break; sleep 0.2; done
+  # Bounded: an unbounded wait here hangs `wait $DUMPER` forever whenever the
+  # client dies before it arms the capture, which turns a failed run into a
+  # hung one.
+  TUN="$(tun_iface)"
+  [ -n "$TUN" ] && timeout 15 tcpdump -n -i "$TUN" -c 20 \
+    > /tmp/lios-verify/traffic.pcap.txt 2>&1 ) &
+DUMPER=$!
+subst <<'PY' | sudo -u "#$CLIENT_UID" python3 - "$SOCK" "$TARGET"
 import socket,sys,json,time,subprocess,urllib.request
 sock, target = sys.argv[1], sys.argv[2]
-prof=open("/tmp/lios-verify/profile.json").read()
+prof=open(sys.argv[3] if len(sys.argv)>3 else "/tmp/lios-verify/profile.json").read()
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(sock)
 f=s.makefile("rwb")
 def send(o): f.write((json.dumps(o)+"\n").encode()); f.flush()
@@ -168,13 +202,13 @@ def read(n=1, t=15):
     return out
 
 send({"type":"hello","id":1,"protocol_version":1}); read(1)
-send({"type":"connect","id":2,"params":{"profile_json":prof,"user":"tunneluser",
-      "route_mode":"test","cidrs":["1.1.1.1/32"],"capture_dns":False,
+send({"type":"connect","id":2,"params":{"profile_json":prof,"user":"__SSHUSER__",
+      "route_mode":"test","cidrs":["__CIDR__"],"capture_dns":False,
       "tun_address":"10.90.0.1"}})
 msgs=read(2, t=30)
 print("  connect reply:", json.dumps(msgs))
 if not any(m.get("type")=="ack" for m in msgs):
-    print("  FAIL  the tunnel did not come up"); sys.exit(1)
+    print("  FAIL  P1a-2: the tunnel did not come up"); sys.exit(3)
 print("  PASS  P1a-2: connect brought up a real tunnel")
 
 # Collect a couple of stats frames, then drive traffic and collect more.
@@ -184,9 +218,11 @@ for _ in range(3):
     if m and m[0].get("type")=="stats": before=m[0]["snapshot"]; break
 print("  stats before traffic:", before)
 
+open("/tmp/lios-fetching", "w").write("go")   # arms the capture
+time.sleep(1.5)                                       # let tcpdump attach
 for _ in range(4):
     try: urllib.request.urlopen(f"http://{target}/", timeout=8).read()
-    except Exception as e: print("  curl:", e)
+    except Exception as e: print("  fetch:", e)
 for _ in range(6):
     m=read(1, t=5)
     if m and m[0].get("type")=="stats": after=m[0]["snapshot"]
@@ -195,16 +231,25 @@ print("  stats after traffic :", after)
 if before and after and (after["bytes_up"]>before["bytes_up"] or after["bytes_down"]>before["bytes_down"]):
     print("  PASS  P1a-3: stats moved in response to traffic — the bytes went through the engine")
 else:
-    print("  FAIL  P1a-3: stats did not move")
+    print("  FAIL  P1a-3: stats did not move; the fetches did not go through the engine")
+    sys.exit(2)          # scored by the shell — a printed FAIL must not tally as a pass
 PY
 RC=$?
-[ $RC -eq 0 ] && pass=$((pass+2)) || fail=$((fail+1))
+wait $DUMPER 2>/dev/null
+echo "  packets on the tunnel device during those fetches:"
+sed 's/^/    /' /tmp/lios-verify/traffic.pcap.txt 2>/dev/null | head -8 || echo "    <none captured>"
+# 0 = both criteria met; 2 = tunnel up but no traffic through it; 3 = no tunnel.
+case $RC in
+  0) pass=$((pass+2)) ;;
+  2) pass=$((pass+1)); fail=$((fail+1)) ;;   # P1a-2 yes, P1a-3 no
+  *) fail=$((fail+2)) ;;
+esac
 
 hdr "P1a-4 — the tunnel outlives the client that started it"
 echo "  (the python client above has exited; the helper should still hold the tunnel)"
-RT_TUN="$(netstat -rn -f inet 2>/dev/null | grep '1\.1\.1\.1' | head -2)"
+RT_TUN="$(routes | grep -F "$TARGET" | head -2)"
 echo "  route: ${RT_TUN:-<none>}"
-OUT=$(sudo -u "#$CLIENT_UID" python3 - "$SOCK" <<'PY'
+OUT=$(subst <<'PY' | sudo -u "#$CLIENT_UID" python3 - "$SOCK"
 import socket,sys,json,time
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(sys.argv[1])
 s.sendall(b'{"type":"hello","id":1,"protocol_version":1}\n')
@@ -218,7 +263,7 @@ echo "$OUT" | grep -q '"state":"Connected"' \
   || bad "a reconnecting client did not see the tunnel"
 
 hdr "teardown"
-sudo -u "#$CLIENT_UID" python3 - "$SOCK" <<'PY'
+subst <<'PY' | sudo -u "#$CLIENT_UID" python3 - "$SOCK"
 import socket,sys,time
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(sys.argv[1])
 s.sendall(b'{"type":"hello","id":1,"protocol_version":1}\n')
@@ -228,13 +273,13 @@ PY
 
 kill $HPID 2>/dev/null; wait $HPID 2>/dev/null; trap - EXIT
 sleep 1
-DEFAULT_AFTER="$(netstat -rn -f inet 2>/dev/null | grep '^default' || ip route show default 2>/dev/null)"
-IFACES_AFTER="$(ifconfig -l 2>/dev/null || ip -br link | awk '{print $1}' | tr '\n' ' ')"
+DEFAULT_AFTER="$(default_route)"
+IFACES_AFTER="$(iface_list)"
 [ "$DEFAULT_BEFORE" = "$DEFAULT_AFTER" ] \
   && ok "default route unchanged throughout" || bad "DEFAULT ROUTE CHANGED"
 [ "$IFACES_BEFORE" = "$IFACES_AFTER" ] \
   && ok "no interface left behind" || bad "interfaces differ: $IFACES_BEFORE -> $IFACES_AFTER"
-LEFTOVER="$(netstat -rn -f inet 2>/dev/null | grep -E 'utun|10\.90\.0|^1\.1\.1\.1' || true)"
+LEFTOVER="$(routes | grep -E "$(tun_pattern)|10\.90\.0|$(echo "$TARGET" | sed 's/\./\\./g')" || true)"
 [ -z "$LEFTOVER" ] \
   && ok "no tunnel or utun route survived teardown" \
   || bad "left behind: $LEFTOVER"

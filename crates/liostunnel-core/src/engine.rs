@@ -74,7 +74,7 @@ impl Drop for StoppedOnDrop {
 }
 
 #[derive(Clone)]
-pub struct StatsHandle(Arc<EngineCounters>);
+pub struct StatsHandle(Arc<EngineCounters>, Arc<dyn Protocol>);
 
 impl StatsHandle {
     /// `state` is never hardcoded to `Connected`: before this fix it was,
@@ -92,8 +92,23 @@ impl StatsHandle {
         } else {
             ConnectionState::Connected
         };
+        // Bytes are counted by the protocol, not here: the engine hands a
+        // flow to `Protocol::open_stream` and never sees the payload again.
+        // Before this, `load` filled them from `..Default::default()`, so
+        // every consumer read a permanent zero while `SshTunnel` was counting
+        // them correctly the whole time — two counter sets, and the one
+        // anybody could reach was the one without the bytes.
+        //
+        // Caught by the Phase 1a verification: a packet capture showed a full
+        // HTTP transaction crossing the TUN device while the reported
+        // counters stayed flat. Spec §8.2 already ruled that a counter nobody
+        // populates must not be reported as a measurement; this makes the
+        // ones we do report true rather than dropping them.
+        let proto = self.1.stats();
         ConnectionStats {
             state,
+            bytes_up: proto.bytes_up,
+            bytes_down: proto.bytes_down,
             flows_failed: self.0.flows_failed.load(Ordering::Relaxed),
             dns_queries: self.0.dns_queries.load(Ordering::Relaxed),
             active_flows: u32::try_from(self.0.active_flows.load(Ordering::Relaxed))
@@ -126,7 +141,7 @@ impl Engine {
     }
 
     pub fn stats_handle(&self) -> StatsHandle {
-        StatsHandle(self.counters.clone())
+        StatsHandle(self.counters.clone(), self.protocol.clone())
     }
 
     pub fn shutdown_handle(&self) -> ShutdownHandle {
@@ -326,6 +341,11 @@ mod tests {
         opened: Mutex<Vec<SocketAddr>>,
         far_end: Mutex<Vec<tokio::io::DuplexStream>>,
         fail: bool,
+        /// Bytes the protocol claims to have carried. Only the protocol
+        /// counts these -- the engine never sees a flow's payload -- so this
+        /// is what `StatsHandle::load` has to reach for.
+        bytes_up: AtomicU64,
+        bytes_down: AtomicU64,
     }
 
     #[async_trait::async_trait]
@@ -358,7 +378,11 @@ mod tests {
             Ok(())
         }
         fn stats(&self) -> ConnectionStats {
-            ConnectionStats::default()
+            ConnectionStats {
+                bytes_up: self.bytes_up.load(Ordering::Relaxed),
+                bytes_down: self.bytes_down.load(Ordering::Relaxed),
+                ..Default::default()
+            }
         }
     }
 
@@ -367,6 +391,8 @@ mod tests {
             opened: Mutex::new(Vec::new()),
             far_end: Mutex::new(Vec::new()),
             fail,
+            bytes_up: AtomicU64::new(0),
+            bytes_down: AtomicU64::new(0),
         })
     }
 
@@ -865,6 +891,55 @@ mod tests {
             stats.load().state,
             crate::stats::ConnectionState::Disconnected,
             "aborting the engine's task must still be observable as stopped"
+        );
+    }
+
+    /// Bytes the protocol counted must reach whoever holds the `StatsHandle`.
+    ///
+    /// They are counted in the protocol -- the engine hands a flow off and
+    /// never sees its payload -- and `load` used to fill them from
+    /// `..Default::default()`, so every consumer read a permanent zero while
+    /// `SshTunnel` counted correctly the whole time. Two counter sets, and
+    /// the reachable one had no bytes in it.
+    ///
+    /// Found by the Phase 1a verification, not by this suite: a packet
+    /// capture showed a complete HTTP transaction crossing the TUN device
+    /// while the reported counters stayed flat. Nothing here would have
+    /// noticed, because every mock reported zero and zero was what we
+    /// asserted.
+    #[tokio::test]
+    async fn reported_stats_include_the_bytes_the_protocol_counted() {
+        let proto = mock(false);
+        let (_tcp_tx, tcp_accept) = tokio::sync::mpsc::channel(4);
+        let (_udp_in_tx, udp_inbound) = tokio::sync::mpsc::channel(4);
+        let (udp_outbound, _udp_out_rx) = tokio::sync::mpsc::channel(4);
+        let engine = Engine::new(
+            proto.clone(),
+            Arc::new(MockResolver {
+                answer: Mutex::new(None),
+            }),
+            StackHandles {
+                tcp_accept,
+                udp_inbound,
+                udp_outbound,
+                shutdown: inert_shutdown(),
+            },
+        );
+        let stats = engine.stats_handle();
+
+        assert_eq!(stats.load().bytes_up, 0, "nothing carried yet");
+
+        proto.bytes_up.store(4096, Ordering::Relaxed);
+        proto.bytes_down.store(8192, Ordering::Relaxed);
+
+        let s = stats.load();
+        assert_eq!(
+            s.bytes_up, 4096,
+            "bytes the protocol counted must be reported"
+        );
+        assert_eq!(
+            s.bytes_down, 8192,
+            "bytes the protocol counted must be reported"
         );
     }
 
