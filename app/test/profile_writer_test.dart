@@ -117,6 +117,7 @@ void main() {
   });
 
   usernameTests();
+  editTests();
 
   test('a fresh id is a distinct UUID each time', () async {
     final a = await newProfileId();
@@ -163,6 +164,119 @@ void usernameTests() {
     final loaded = await ProfileStore(directory: dir.path).load();
     expect(loaded.length, 1);
     expect(loaded.single.ok, isTrue);
+    dir.deleteSync(recursive: true);
+  });
+}
+
+// Editing renames the file, because the filename comes from the profile name.
+// Both halves of that matter: the old file has to go, or the list shows one
+// profile twice; and the new name must not land on a different profile, which
+// would destroy it without a word.
+void editTests() {
+  test('an edit keeps the id', () async {
+    // A new id would make it a different server to anything keyed on id.
+    final dir = Directory.systemTemp.createTempSync('lios-edit-id');
+    final w = ProfileWriter(directory: dir.path);
+    final first = await w.writeProfile(dto());
+    final original = await parseProfile(json: first.readAsStringSync());
+
+    final edited = await w.writeProfile(
+      ProfileDto(
+        id: original.id,
+        name: original.name,
+        protocol: 'ssh',
+        host: '203.0.113.9',
+        port: 2222,
+        authKind: original.authKind,
+        authSecretSource: original.authSecretSource,
+        dnsMode: original.dnsMode,
+        dnsServers: original.dnsServers,
+        splitTunnel: original.splitTunnel,
+        splitTunnelApps: original.splitTunnelApps,
+        killSwitch: original.killSwitch,
+      ),
+      replacingPath: first.path,
+    );
+    final back = await parseProfile(json: edited.readAsStringSync());
+    expect(back.id, original.id);
+    expect(back.host, '203.0.113.9');
+    dir.deleteSync(recursive: true);
+  });
+
+  test('renaming moves the file and leaves no duplicate behind', () async {
+    final dir = Directory.systemTemp.createTempSync('lios-rename');
+    final w = ProfileWriter(directory: dir.path);
+    final first = await w.writeProfile(dto(name: 'Old name'), sshUser: 'u');
+    expect(File('${first.path}.user').existsSync(), isTrue);
+
+    final renamed = await w.writeProfile(
+      dto(name: 'New name'),
+      sshUser: 'u',
+      replacingPath: first.path,
+    );
+
+    expect(renamed.path, isNot(first.path));
+    expect(File(first.path).existsSync(), isFalse, reason: 'the old profile');
+    expect(File('${first.path}.user').existsSync(), isFalse,
+        reason: 'and its sidecar');
+    expect((await ProfileStore(directory: dir.path).load()).length, 1);
+    dir.deleteSync(recursive: true);
+  });
+
+  test('renaming onto a different profile is refused, not silent', () async {
+    final dir = Directory.systemTemp.createTempSync('lios-collide');
+    final w = ProfileWriter(directory: dir.path);
+    final a = await w.writeProfile(dto(name: 'Server A'));
+    await w.writeProfile(dto(name: 'Server B'));
+
+    // Renaming A to B would otherwise overwrite B and destroy it.
+    await expectLater(
+      w.writeProfile(dto(name: 'Server B'), replacingPath: a.path),
+      throwsA(isA<StateError>()),
+    );
+    expect((await ProfileStore(directory: dir.path).load()).length, 2);
+    dir.deleteSync(recursive: true);
+  });
+
+  test('saving over itself under the same name is allowed', () async {
+    final dir = Directory.systemTemp.createTempSync('lios-same');
+    final w = ProfileWriter(directory: dir.path);
+    final f = await w.writeProfile(dto(name: 'Same'));
+    await expectLater(
+      w.writeProfile(dto(name: 'Same'), replacingPath: f.path),
+      completes,
+    );
+    dir.deleteSync(recursive: true);
+  });
+
+  test('clearing the username removes the sidecar', () async {
+    // Left behind, it would keep sending a username the user just deleted.
+    final dir = Directory.systemTemp.createTempSync('lios-clear');
+    final w = ProfileWriter(directory: dir.path);
+    final f = await w.writeProfile(dto(), sshUser: 'someone');
+    expect(File('${f.path}.user').existsSync(), isTrue);
+
+    await w.writeProfile(dto(), sshUser: '', replacingPath: f.path);
+    expect(File('${f.path}.user').existsSync(), isFalse);
+    expect((await ProfileStore(directory: dir.path).load()).single.sshUser,
+        isNull);
+    dir.deleteSync(recursive: true);
+  });
+
+  test('delete removes the profile and its sidecar, not the secret',
+      () async {
+    // Deleting a profile is not consent to destroy a credential: the key may
+    // be one the user relies on elsewhere.
+    final dir = Directory.systemTemp.createTempSync('lios-del');
+    final w = ProfileWriter(directory: dir.path);
+    final secret = await w.writeSecret('Home VPS', 'hunter2');
+    final f = await w.writeProfile(dto(source: secret), sshUser: 'u');
+
+    await w.delete(f.path);
+    expect(File(f.path).existsSync(), isFalse);
+    expect(File('${f.path}.user').existsSync(), isFalse);
+    expect(File(secret.substring(5)).existsSync(), isTrue,
+        reason: 'the credential is left where it is');
     dir.deleteSync(recursive: true);
   });
 }

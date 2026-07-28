@@ -18,6 +18,7 @@ class ProfilesScreen extends StatelessWidget {
     required this.onSelect,
     required this.onReload,
     required this.onCreate,
+    required this.onEdit,
   });
 
   final List<LoadedProfile> profiles;
@@ -26,6 +27,7 @@ class ProfilesScreen extends StatelessWidget {
   final void Function(LoadedProfile) onSelect;
   final VoidCallback onReload;
   final VoidCallback onCreate;
+  final void Function(LoadedProfile) onEdit;
 
   @override
   Widget build(BuildContext context) {
@@ -71,7 +73,14 @@ class ProfilesScreen extends StatelessWidget {
                     leading: const Icon(Icons.error_outline),
                     title: Text(p.name),
                     subtitle: Text(p.error!),
-                    enabled: false,
+                    // Still tappable: a profile that will not parse is
+                    // exactly the one a user needs to open and repair.
+                    trailing: IconButton(
+                      key: ValueKey('edit-${p.path}'),
+                      icon: const Icon(Icons.edit_outlined),
+                      tooltip: 'Edit',
+                      onPressed: () => onEdit(p),
+                    ),
                   );
                 }
                 final dto = p.profile!;

@@ -184,6 +184,7 @@ void main() {
           onSelect: (_) {},
           onReload: () {},
         onCreate: () {},
+        onEdit: _ignore,
         ),
       ),
     );
@@ -210,6 +211,7 @@ void main() {
           onSelect: (_) {},
           onReload: () {},
         onCreate: () {},
+        onEdit: _ignore,
         ),
       ),
     );
@@ -229,6 +231,7 @@ void main() {
           onSelect: (p) => picked = p,
           onReload: () {},
         onCreate: () {},
+        onEdit: _ignore,
         ),
       ),
     );
@@ -248,6 +251,7 @@ void main() {
           onSelect: _ignore,
           onReload: _noop,
           onCreate: _noop,
+          onEdit: _ignore,
         ),
       ),
     );

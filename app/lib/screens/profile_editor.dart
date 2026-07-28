@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../services/profile_store.dart';
 import '../services/profile_writer.dart';
 import '../src/rust/api/config.dart';
 import '../src/rust/dto/profile.dart';
@@ -17,10 +18,14 @@ class ProfileEditorScreen extends StatefulWidget {
     super.key,
     required this.writer,
     required this.onSaved,
+    this.existing,
   });
 
   final ProfileWriter writer;
   final VoidCallback onSaved;
+
+  /// The profile being edited, or null to create one.
+  final LoadedProfile? existing;
 
   @override
   State<ProfileEditorScreen> createState() => _ProfileEditorScreenState();
@@ -29,11 +34,11 @@ class ProfileEditorScreen extends StatefulWidget {
 class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
   final _form = GlobalKey<FormState>();
 
-  final _name = TextEditingController(text: 'My server');
+  final _name = TextEditingController();
   final _host = TextEditingController();
-  final _port = TextEditingController(text: '22');
+  final _port = TextEditingController();
   final _user = TextEditingController();
-  final _dns = TextEditingController(text: '1.1.1.1, 1.0.0.1');
+  final _dns = TextEditingController();
   final _secretPath = TextEditingController();
   final _secret = TextEditingController();
 
@@ -43,6 +48,39 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
   bool _busy = false;
   String? _error;
   String? _saved;
+
+  bool get _editing => widget.existing?.profile != null;
+
+  @override
+  void initState() {
+    super.initState();
+    final p = widget.existing?.profile;
+    if (p == null) {
+      _name.text = 'My server';
+      _port.text = '22';
+      _dns.text = '1.1.1.1, 1.0.0.1';
+      return;
+    }
+    _name.text = p.name;
+    _host.text = p.host;
+    _port.text = '${p.port}';
+    _user.text = widget.existing?.sshUser ?? '';
+    _dns.text = p.dnsServers.join(', ');
+    _dnsMode = p.dnsMode;
+    _authKind = p.authKind;
+
+    // The profile records where the secret lives, so the form can show that
+    // much. A password typed on a previous visit is NOT recoverable — it was
+    // written to a file and never kept here, which is the point.
+    final source = p.authSecretSource;
+    if (source.startsWith('env:')) {
+      _secretMode = 'env';
+      _secretPath.text = source.substring(4);
+    } else if (source.startsWith('file:')) {
+      _secretMode = 'file';
+      _secretPath.text = source.substring(5);
+    }
+  }
 
   @override
   void dispose() {
@@ -68,7 +106,9 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
               : 'file:${_secretPath.text.trim()}';
 
       final dto = ProfileDto(
-        id: await newProfileId(),
+        // An edit keeps its id. Minting a new one would make the profile a
+        // different server as far as anything keyed on id is concerned.
+        id: widget.existing?.profile?.id ?? await newProfileId(),
         name: _name.text.trim(),
         protocol: 'ssh',
         host: _host.text.trim(),
@@ -89,7 +129,11 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       // Checked by the same Rust that will read it back, so a profile the
       // app accepts is one the helper can parse.
       await checkProfile(dto: dto);
-      final file = await widget.writer.writeProfile(dto, sshUser: _user.text);
+      final file = await widget.writer.writeProfile(
+        dto,
+        sshUser: _user.text,
+        replacingPath: widget.existing?.path,
+      );
       if (!mounted) return;
       setState(() => _saved = file.path);
       widget.onSaved();
@@ -101,10 +145,52 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
     }
   }
 
+  Future<void> _confirmDelete() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Delete "${_name.text}"?'),
+        // The secret file is deliberately left alone: it may be an SSH key
+        // the user relies on elsewhere, and deleting a profile is not consent
+        // to destroy a credential.
+        content: const Text(
+          'The profile is removed. Any key or password file it points at is '
+          'left where it is.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            key: const Key('confirm-delete'),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    await widget.writer.delete(widget.existing!.path);
+    widget.onSaved();
+    if (mounted) Navigator.of(context).pop();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('New profile')),
+      appBar: AppBar(
+        title: Text(_editing ? 'Edit profile' : 'New profile'),
+        actions: [
+          if (_editing)
+            IconButton(
+              key: const Key('delete-button'),
+              icon: const Icon(Icons.delete_outline),
+              tooltip: 'Delete',
+              onPressed: _busy ? null : _confirmDelete,
+            ),
+        ],
+      ),
       body: Form(
         key: _form,
         child: ListView(
@@ -211,7 +297,13 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
             FilledButton(
               key: const Key('save-button'),
               onPressed: _busy ? null : _save,
-              child: Text(_busy ? 'Saving…' : 'Save profile'),
+              child: Text(
+                _busy
+                    ? 'Saving…'
+                    : _editing
+                        ? 'Save changes'
+                        : 'Save profile',
+              ),
             ),
           ],
         ),

@@ -59,6 +59,29 @@ class _HomePageState extends State<HomePage> {
     _reload();
   }
 
+  /// One page for both, so creating and editing cannot drift apart.
+  void _openEditor(LoadedProfile? existing) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ProfileEditorScreen(
+          writer: _writer,
+          existing: existing,
+          // Reload rather than patch the list in place: the store is the
+          // truth, and a list built from what we *think* we wrote drifts from
+          // what is on disk — which is what a rename would expose first.
+          onSaved: () {
+            _reload();
+            // A profile that was renamed or deleted is no longer the one the
+            // connection screen is holding.
+            if (existing != null && _selected?.path == existing.path) {
+              setState(() => _selected = null);
+            }
+          },
+        ),
+      ),
+    );
+  }
+
   Future<void> _reload() async {
     final loaded = await _store.load();
     if (mounted) setState(() => _profiles = loaded);
@@ -133,17 +156,8 @@ class _HomePageState extends State<HomePage> {
           _selected = p;
           _tab = 1;
         }),
-        onCreate: () => Navigator.of(context).push(
-          MaterialPageRoute<void>(
-            builder: (_) => ProfileEditorScreen(
-              writer: _writer,
-              // Reload rather than insert: the store is the truth, and a
-              // list built from what we *think* we wrote would drift from
-              // what is actually on disk.
-              onSaved: _reload,
-            ),
-          ),
-        ),
+        onCreate: () => _openEditor(null),
+        onEdit: _openEditor,
       ),
       ConnectionScreen(
         selected: _selected,

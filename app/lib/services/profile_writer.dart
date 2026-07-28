@@ -35,15 +35,53 @@ class ProfileWriter {
   /// A sidecar rather than an extension to the profile format: that format is
   /// shared with the CLI and belongs to the core, and widening it from here
   /// would fork it.
-  Future<File> writeProfile(ProfileDto dto, {String? sshUser}) async {
+  /// [replacingPath] is the profile being edited, if any.
+  ///
+  /// The filename comes from the profile's name, so renaming one means moving
+  /// it. Both halves matter: the old file has to go, or the list shows the
+  /// profile twice under two names, and the new name must not land on top of
+  /// a *different* profile, which would silently destroy it.
+  Future<File> writeProfile(
+    ProfileDto dto, {
+    String? sshUser,
+    String? replacingPath,
+  }) async {
     final json = await exportProfile(dto: dto);
     Directory(directory).createSync(recursive: true);
     final file = File('$directory/${_slug(dto.name)}.json');
+
+    if (file.existsSync() && file.path != replacingPath) {
+      throw StateError(
+        'a different profile is already called "${dto.name}"',
+      );
+    }
+
     file.writeAsStringSync(json);
+    final sidecar = File('${file.path}.user');
     if (sshUser != null && sshUser.trim().isNotEmpty) {
-      File('${file.path}.user').writeAsStringSync(sshUser.trim());
+      sidecar.writeAsStringSync(sshUser.trim());
+    } else if (sidecar.existsSync()) {
+      // Cleared on purpose: leaving the old one would keep sending a username
+      // the user has just removed.
+      sidecar.deleteSync();
+    }
+
+    if (replacingPath != null && replacingPath != file.path) {
+      _deleteQuietly(replacingPath);
+      _deleteQuietly('$replacingPath.user');
     }
     return file;
+  }
+
+  /// Removes a profile and its sidecar.
+  Future<void> delete(String profilePath) async {
+    _deleteQuietly(profilePath);
+    _deleteQuietly('$profilePath.user');
+  }
+
+  static void _deleteQuietly(String path) {
+    final f = File(path);
+    if (f.existsSync()) f.deleteSync();
   }
 
   /// Writes a password to a file only this user can read, and returns the
