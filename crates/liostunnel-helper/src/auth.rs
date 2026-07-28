@@ -279,26 +279,37 @@ mod tests {
     }
 
     #[test]
-    fn a_symlink_is_judged_by_its_target_not_the_link() {
-        // A symlink whose *link* looks acceptable but whose *target* fails
-        // the gate must still be refused. We build a real target file
+    fn a_symlink_resolves_its_type_and_mode_through_the_link() {
+        // What this pins: `secret_readable_by` stats a symlink with a
+        // *following* call (`metadata`, not `symlink_metadata`) for the
+        // purposes of the type and mode checks. We build a real target file
         // (owned by us, mode 0600, via `write_owned`) and a symlink to it,
         // then call with a deliberately mismatched uid.
         //
-        // This distinguishes `metadata` (follows symlinks) from
-        // `symlink_metadata` (does not), rather than merely asserting
-        // `.is_err()`, which both implementations would satisfy for
-        // different and wrong reasons:
+        // What this does NOT pin: which owner is consulted for the
+        // ownership check. The link and its target here are owned by the
+        // same process (us), so an implementation that read ownership from
+        // the link's own inode instead of the target's would produce the
+        // exact same `SecretNotOwned` result — this fixture cannot tell the
+        // two apart. Constructing a fixture where link-owner and
+        // target-owner genuinely differ needs root (chowning a file to a
+        // uid you are not requires CAP_CHOWN); see the root-only
+        // `a_root_owned_link_to_a_foreign_owned_target_is_still_refused`
+        // below for that discriminator.
+        //
+        // The two implementations this test *can* tell apart both reach a
+        // real error either way, so `.is_err()` would not be enough; the
+        // specific variant is what carries the evidence:
         //   - `metadata` on the link resolves to the *target*: a regular
-        //     file, mode 0600 (passes the mode check), owned by us but not
-        //     by `mismatched` -> `SecretNotOwned`. This is the behavior we
-        //     want to pin.
+        //     file, mode 0600 (passes the type and mode checks), so the
+        //     call reaches the ownership check and is refused there ->
+        //     `SecretNotOwned`. This is the behavior we want to pin.
         //   - `symlink_metadata` on the link resolves to the *link itself*:
-        //     its file type is a symlink, not a regular file, so it would be
+        //     its file type is a symlink, not a regular file, so it is
         //     rejected by the earlier `is_file()` check with
         //     `SecretRejected { reason: "not a regular file" }` — an error,
-        //     but never reaching the ownership branch this test exists to
-        //     exercise.
+        //     but the wrong one, and it never reaches the ownership check
+        //     at all.
         let d = scratch("symlink");
         let target = write_owned(&d, 0o600);
         let link = d.join("link");
@@ -311,9 +322,91 @@ mod tests {
             .expect_err("a symlink to a file the given uid does not own must be refused");
         assert!(
             matches!(err, AuthError::SecretNotOwned { .. }),
-            "expected SecretNotOwned (proving the target's ownership was checked, \
-             not the link's mode or type), got {err:?}"
+            "expected SecretNotOwned (proving the symlink's type and mode were resolved \
+             through the link rather than rejected at the link's own type), got {err:?}"
         );
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    #[ignore = "needs root: chowns a file to a non-root uid to make link-owner != target-owner; \
+                run with `cargo test -p liostunnel-helper auth -- --include-ignored` as root \
+                (see the Linux/Docker invocation in task-3-report.md)"]
+    fn a_root_owned_link_to_a_foreign_owned_target_is_still_refused() {
+        // The property `a_symlink_resolves_its_type_and_mode_through_the_link`
+        // above cannot pin: whether *ownership* is read from the target or
+        // from the link's own inode, because in that fixture link-owner and
+        // target-owner are identical. This test makes them genuinely
+        // different, which needs root (chowning a file to a uid you are not
+        // requires CAP_CHOWN) — hence `#[ignore]` rather than a silent early
+        // `return`. An ignored test still prints as "ignored" in `cargo
+        // test` output, so a reader can see this coverage exists and is
+        // gated on a privilege the ordinary dev/CI environment lacks,
+        // instead of it silently reporting a pass it never earned.
+        use std::os::unix::fs::MetadataExt;
+
+        let me = unsafe { libc::getuid() };
+        assert_eq!(
+            me, 0,
+            "this test requires root to chown a file to a foreign uid; got uid {me}. \
+             Run it deliberately (see the Docker invocation in task-3-report.md) — \
+             do not let it report a pass for an assertion it never ran."
+        );
+
+        let d = scratch("symlink-foreign-owner");
+        let target = write_owned(&d, 0o600); // created by us: root, uid 0
+        let link = d.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        // Find a non-root uid to chown the target to. 65534 (`nobody`) is
+        // present in the Debian slim image this test is designed to run in,
+        // but we look it up rather than assume the number.
+        let nobody: u32 = {
+            let out = std::process::Command::new("id")
+                .args(["-u", "nobody"])
+                .output()
+                .expect("`id -u nobody` must be runnable in the test environment");
+            assert!(
+                out.status.success(),
+                "`id -u nobody` failed: {out:?} (need a non-root uid to build this fixture)"
+            );
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .parse()
+                .expect("`id -u nobody` must print a uid")
+        };
+        assert_ne!(
+            nobody, 0,
+            "need a non-root uid for the target owner; `nobody` resolved to uid 0"
+        );
+
+        // Chown only the TARGET to `nobody`. The link itself is untouched
+        // and remains owned by root (0) — this is the divergence the
+        // deterministic test above cannot produce.
+        std::os::unix::fs::chown(&target, Some(nobody), None)
+            .expect("chown(target, nobody) must succeed as root");
+
+        let link_owner = std::fs::symlink_metadata(&link).unwrap().uid();
+        assert_eq!(link_owner, 0, "the link itself must remain root-owned");
+        let target_owner = std::fs::metadata(&target).unwrap().uid();
+        assert_eq!(
+            target_owner, nobody,
+            "the target must now be owned by `nobody`"
+        );
+
+        // Ask on behalf of root (0), the link's own owner. A correct
+        // implementation resolves ownership from the *target* (nobody) and
+        // refuses; an implementation that reads the *link's* metadata
+        // instead would see owner 0 == uid 0 and wrongly accept.
+        let err = secret_readable_by(&link, 0).expect_err(
+            "target is owned by `nobody`, not root; a root-owned link to it must still be refused",
+        );
+        assert!(
+            matches!(err, AuthError::SecretNotOwned { .. }),
+            "expected SecretNotOwned (proving ownership was resolved from the target, \
+             not the link), got {err:?}"
+        );
+
         std::fs::remove_dir_all(&d).ok();
     }
 }
