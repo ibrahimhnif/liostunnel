@@ -14,7 +14,7 @@
 //! true by construction rather than something to remember on each branch.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::mpsc;
 
@@ -30,18 +30,74 @@ pub struct EngineCounters {
     pub flows_opened: AtomicU64,
     pub flows_failed: AtomicU64,
     pub dns_queries: AtomicU64,
+    /// Currently in-flight proxied flows -- incremented when a flow's task is
+    /// spawned, decremented (via `ActiveFlowGuard`) when it ends by any
+    /// means, so `StatsHandle::load` reports the real concurrent count
+    /// rather than a hardcoded `0`.
+    active_flows: AtomicU64,
+    /// Set once `Engine::run` returns, by any means -- the stack closing both
+    /// channels on request, on its own (a stack-thread panic or
+    /// `Poller::wait` giving up, `poll.rs`'s `AfterWait::GiveUp`), or the
+    /// engine's own task being cancelled/aborted out from under it. See
+    /// `StatsHandle::load`'s doc: this is what stops it from asserting
+    /// `Connected` forever after the engine has, in fact, stopped.
+    stopped: AtomicBool,
+}
+
+/// Decrements `active_flows` when a flow's task ends, by any means --
+/// success, error, or cancellation -- the same drop-guarantee `proxy_one`'s
+/// own doc explains for `LocalStream`: nothing here needs to remember to
+/// decrement on every branch, because unwinding the frame drops this guard
+/// unconditionally.
+struct ActiveFlowGuard(Arc<EngineCounters>);
+
+impl Drop for ActiveFlowGuard {
+    fn drop(&mut self) {
+        self.0.active_flows.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Sets `EngineCounters::stopped` on *every* exit from `Engine::run` -- clean
+/// completion, a panic unwinding through it, or this task's own `JoinHandle`
+/// being aborted from outside. The last of those is exactly why this has to
+/// be a `Drop` guard rather than a line at the end of the function body:
+/// aborting a task drops its in-progress future without running any more of
+/// its code, but dropping that future still drops every local still live in
+/// it -- the same structural guarantee `proxy_one`'s own doc explains for
+/// `LocalStream` further down this file.
+struct StoppedOnDrop(Arc<EngineCounters>);
+
+impl Drop for StoppedOnDrop {
+    fn drop(&mut self) {
+        self.0.stopped.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Clone)]
 pub struct StatsHandle(Arc<EngineCounters>);
 
 impl StatsHandle {
+    /// `state` is never hardcoded to `Connected`: before this fix it was,
+    /// regardless of whether `Engine::run` had already returned -- so a dead
+    /// packet engine (stack thread crashed, `Poller::wait` gave up, the
+    /// engine's own task panicked or was aborted) was reported as
+    /// `Connected` forever, with `connect.rs`'s three-line summary the only
+    /// thing an operator could have used to notice, and only after the
+    /// process itself finally exited. Reporting `Disconnected` once the
+    /// engine has stopped is a state the process can actually vouch for;
+    /// asserting `Connected` unconditionally is not.
     pub fn load(&self) -> ConnectionStats {
+        let state = if self.0.stopped.load(Ordering::Acquire) {
+            ConnectionState::Disconnected
+        } else {
+            ConnectionState::Connected
+        };
         ConnectionStats {
-            state: ConnectionState::Connected,
+            state,
             flows_failed: self.0.flows_failed.load(Ordering::Relaxed),
             dns_queries: self.0.dns_queries.load(Ordering::Relaxed),
-            active_flows: 0,
+            active_flows: u32::try_from(self.0.active_flows.load(Ordering::Relaxed))
+                .unwrap_or(u32::MAX),
             ..Default::default()
         }
     }
@@ -96,6 +152,9 @@ impl Engine {
     /// *both* are closed and drained — never losing a flow or a query queued
     /// ahead of the other channel's shutdown.
     pub async fn run(mut self) -> Result<(), TunnelError> {
+        // See `StoppedOnDrop`'s own doc: covers every way this function can
+        // stop running, not just the loop below ending normally.
+        let _stopped_guard = StoppedOnDrop(self.counters.clone());
         let mut tcp_open = true;
         let mut udp_open = true;
         while tcp_open || udp_open {
@@ -128,7 +187,16 @@ impl Engine {
     fn spawn_flow(&self, flow: TcpFlow) {
         let protocol = self.protocol.clone();
         let counters = self.counters.clone();
-        tokio::spawn(async move { proxy_one(flow, protocol, counters).await });
+        counters.active_flows.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            // Guarantees the decrement on every exit path `proxy_one` itself
+            // guarantees for `LocalStream` -- success, error, or this whole
+            // task being aborted -- for the same structural reason: dropping
+            // the compiler-generated future drops every local still live in
+            // it, this guard included.
+            let _active = ActiveFlowGuard(counters.clone());
+            proxy_one(flow, protocol, counters).await
+        });
     }
 
     /// Spawns one DNS query's resolution. As with `spawn_flow`, the datagram
@@ -171,7 +239,15 @@ async fn resolve_one(
                 tracing::debug!("stack closed before the DNS reply could be delivered");
             }
         }
-        Err(e) => tracing::debug!(%e, "DNS query failed; the client will retry"),
+        // `warn!`, not `debug!`: this is the only place a query that ran out
+        // every configured resolver (or, per the review's item 3, a query
+        // that starved behind a full channel budget until its own timeout)
+        // becomes visible at all. At the previous `debug!` level it never
+        // reached an operator's default-configured log output, so a
+        // starved-DNS failure mode looked identical to "nothing happened."
+        // The query name/answer themselves are still never logged -- only
+        // the outcome, per this function's own contract above.
+        Err(e) => tracing::warn!(%e, "DNS query failed; the client will retry"),
     }
 }
 
@@ -237,9 +313,18 @@ mod tests {
 
     /// Records the destinations asked for and returns a duplex pipe whose far
     /// end the test can drive — standing in for the SSH channel.
+    ///
+    /// `far_end` holds every far end ever produced (one per `open_tcp_stream`
+    /// call), not just the most recent -- a test driving more than one
+    /// concurrent flow through the same mock (see
+    /// `active_flows_rises_and_falls_with_real_concurrent_flows`) needs each
+    /// one to survive independently; overwriting a single slot would drop an
+    /// earlier flow's far end the moment a second flow opened, ending its
+    /// `copy_bidirectional` early for a reason that has nothing to do with
+    /// what that test is actually exercising.
     struct MockProtocol {
         opened: Mutex<Vec<SocketAddr>>,
-        far_end: Mutex<Option<tokio::io::DuplexStream>>,
+        far_end: Mutex<Vec<tokio::io::DuplexStream>>,
         fail: bool,
     }
 
@@ -262,7 +347,7 @@ mod tests {
                 return Err(TunnelError::Protocol("refused".into()));
             }
             let (near, far) = tokio::io::duplex(8192);
-            *self.far_end.lock().unwrap() = Some(far);
+            self.far_end.lock().unwrap().push(far);
             Ok(Box::new(near))
         }
 
@@ -280,7 +365,7 @@ mod tests {
     fn mock(fail: bool) -> Arc<MockProtocol> {
         Arc::new(MockProtocol {
             opened: Mutex::new(Vec::new()),
-            far_end: Mutex::new(None),
+            far_end: Mutex::new(Vec::new()),
             fail,
         })
     }
@@ -660,5 +745,193 @@ mod tests {
             N,
             "every flow buffered ahead of udp_inbound's close must still be processed"
         );
+    }
+
+    // --- Review item 1: `StatsHandle::load` must not assert `Connected`
+    // unconditionally, and `connect.rs` must be able to notice the engine
+    // dying on its own. -----------------------------------------------------
+
+    #[tokio::test]
+    async fn stats_report_connected_while_the_engine_is_still_running() {
+        let (_tcp_tx, tcp_accept) = tokio::sync::mpsc::channel(4);
+        let (_udp_tx, udp_inbound) = tokio::sync::mpsc::channel(4);
+        let (udp_outbound, _udp_out_rx) = tokio::sync::mpsc::channel(4);
+
+        let engine = Engine::new(
+            mock(false),
+            Arc::new(UnimplementedResolver),
+            StackHandles {
+                tcp_accept,
+                udp_inbound,
+                udp_outbound,
+                shutdown: inert_shutdown(),
+            },
+        );
+        let stats = engine.stats_handle();
+        let handle = tokio::spawn(engine.run());
+
+        assert_eq!(
+            stats.load().state,
+            crate::stats::ConnectionState::Connected,
+            "a live engine must report Connected"
+        );
+
+        drop(_tcp_tx);
+        drop(_udp_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// The Item-1 regression test: before this fix, `StatsHandle::load`
+    /// hardcoded `ConnectionState::Connected` no matter what, so a caller
+    /// polling stats after the engine had already stopped (stack thread
+    /// died, `run`'s loop drained both closed channels and returned) still
+    /// read a tunnel that looked perfectly healthy. Reporting a state the
+    /// process cannot vouch for is worse than reporting `Disconnected`.
+    #[tokio::test]
+    async fn stats_report_disconnected_once_the_engine_has_stopped() {
+        let (tcp_tx, tcp_accept) = tokio::sync::mpsc::channel(4);
+        let (udp_in_tx, udp_inbound) = tokio::sync::mpsc::channel(4);
+        let (udp_outbound, _udp_out_rx) = tokio::sync::mpsc::channel(4);
+
+        let engine = Engine::new(
+            mock(false),
+            Arc::new(UnimplementedResolver),
+            StackHandles {
+                tcp_accept,
+                udp_inbound,
+                udp_outbound,
+                shutdown: inert_shutdown(),
+            },
+        );
+        let stats = engine.stats_handle();
+        let handle = tokio::spawn(engine.run());
+
+        // Simulates the stack thread dying: both channels close, which is
+        // exactly how `Engine::run` returns `Ok(())` on its own per the
+        // review's item 1 (`AfterWait::GiveUp`, `engine_gone`, or any other
+        // stack-thread exit -- none of which involve this process ever
+        // calling `shutdown()`).
+        drop(tcp_tx);
+        drop(udp_in_tx);
+
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("the engine must actually stop")
+            .expect("the task must not have panicked")
+            .unwrap();
+
+        assert_eq!(
+            stats.load().state,
+            crate::stats::ConnectionState::Disconnected,
+            "a stopped engine must never still report Connected"
+        );
+    }
+
+    /// Same property, proven for the abort path too: `connect.rs`'s cleanup
+    /// calls `engine_task.abort()` unconditionally, and `StoppedOnDrop`'s own
+    /// doc claims this still sets `stopped` because dropping an aborted
+    /// task's future drops every local still live in it. This is the test
+    /// that would fail if a future refactor moved the guard somewhere that
+    /// doesn't get dropped on that path.
+    #[tokio::test]
+    async fn stats_report_disconnected_after_the_engines_task_is_aborted() {
+        let (_tcp_tx, tcp_accept) = tokio::sync::mpsc::channel(4);
+        let (_udp_tx, udp_inbound) = tokio::sync::mpsc::channel(4);
+        let (udp_outbound, _udp_out_rx) = tokio::sync::mpsc::channel(4);
+
+        let engine = Engine::new(
+            mock(false),
+            Arc::new(UnimplementedResolver),
+            StackHandles {
+                tcp_accept,
+                udp_inbound,
+                udp_outbound,
+                shutdown: inert_shutdown(),
+            },
+        );
+        let stats = engine.stats_handle();
+        let handle = tokio::spawn(engine.run());
+
+        // Never sent to and never dropped: `run` sits parked in `select!`
+        // indefinitely, exactly like a real, healthy, idle engine -- so the
+        // only way this task ever stops is the abort below.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(stats.load().state, crate::stats::ConnectionState::Connected);
+
+        handle.abort();
+        let _ = handle.await;
+
+        assert_eq!(
+            stats.load().state,
+            crate::stats::ConnectionState::Disconnected,
+            "aborting the engine's task must still be observable as stopped"
+        );
+    }
+
+    /// `active_flows` must reflect real concurrency, not the hardcoded `0`
+    /// the review flagged alongside `state`: it rises while a flow is being
+    /// proxied and falls back once every in-flight flow has actually ended.
+    #[tokio::test]
+    async fn active_flows_rises_and_falls_with_real_concurrent_flows() {
+        let proto = mock(false);
+        let (tcp_tx, tcp_accept) = tokio::sync::mpsc::channel(4);
+        let (_udp_tx, udp_inbound) = tokio::sync::mpsc::channel(4);
+        let (udp_outbound, _udp_out_rx) = tokio::sync::mpsc::channel(4);
+
+        let engine = Engine::new(
+            proto.clone(),
+            Arc::new(UnimplementedResolver),
+            StackHandles {
+                tcp_accept,
+                udp_inbound,
+                udp_outbound,
+                shutdown: inert_shutdown(),
+            },
+        );
+        let stats = engine.stats_handle();
+        let handle = tokio::spawn(engine.run());
+
+        // Two flows held open by their peer half, standing in for the packet
+        // stack keeping a real connection alive.
+        let (stream_a, peer_a) = local_stream_pair(8, Wakeup::default());
+        let (stream_b, peer_b) = local_stream_pair(8, Wakeup::default());
+        for (i, stream) in [stream_a, stream_b].into_iter().enumerate() {
+            tcp_tx
+                .send(TcpFlow {
+                    src: "10.90.0.2:51234".parse().unwrap(),
+                    dst: format!("93.184.216.34:{}", 40_000 + i).parse().unwrap(),
+                    stream,
+                })
+                .await
+                .unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            stats.load().active_flows,
+            2,
+            "both still-open flows must count as active"
+        );
+
+        // `copy_bidirectional` only finishes once *both* directions of a
+        // flow see EOF: dropping the peer ends the device -> tunnel
+        // direction (application traffic), and dropping the mock's far ends
+        // ends the tunnel -> device direction (the "remote" side) -- both
+        // are needed, or a flow's task (and its `ActiveFlowGuard`) would sit
+        // parked forever on whichever direction is still open.
+        drop(peer_a);
+        drop(peer_b);
+        proto.far_end.lock().unwrap().clear();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while stats.load().active_flows != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("active_flows must fall back to 0 once every flow actually ends");
+
+        drop(tcp_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
     }
 }

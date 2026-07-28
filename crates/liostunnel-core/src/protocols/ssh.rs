@@ -25,15 +25,43 @@ pub enum HostKeyPolicy {
 
 /// Conservative: OpenSSH's default limits are higher, but a burst of flows
 /// from the packet engine should queue rather than fail. Spec §8.
+///
+/// This bounds ordinary proxied TCP flows only, not DNS -- see
+/// [`MAX_CONCURRENT_DNS_CHANNELS`] and `Protocol::open_dns_stream`'s doc for
+/// why DNS gets its own separate, reserved allowance (review item 3) rather
+/// than sharing this one. The server-side total a busy tunnel can open is
+/// therefore this plus that, not just this.
 const MAX_CONCURRENT_CHANNELS: usize = 64;
+
+/// A small, separate channel budget reserved for DNS queries so a busy
+/// tunnel's worth of ordinary proxied flows (routinely dozens of held-open
+/// browser connections, all counted against [`MAX_CONCURRENT_CHANNELS`])
+/// cannot starve DNS resolution out of existence. `tokio::sync::Semaphore` is
+/// FIFO-fair, so before this existed a DNS query queued behind 64 held-open
+/// flows would queue past its own 5s timeout (`over_tcp::DEFAULT_TIMEOUT`)
+/// and fail — invisibly, since nothing distinguished "starved" from "the
+/// resolver is actually down." Sized generously relative to how many
+/// concurrent DNS lookups a single tunnel realistically has in flight (a
+/// page load resolves a handful of hostnames, not dozens at once).
+const MAX_CONCURRENT_DNS_CHANNELS: usize = 8;
 
 pub struct SshTunnel {
     user: String,
     policy: HostKeyPolicy,
     handle: Option<client::Handle<ClientHandler>>,
+    /// The concrete address the last successful `connect` actually resolved
+    /// and connected to. `None` before the first successful `connect` and
+    /// after a failed one. Review item 2: this is what `default`-mode route
+    /// pinning (`connect.rs`, via `peer_addr`) must pin, since a second,
+    /// independent resolution of `profile.host` can legally disagree with
+    /// this one (a dual-stack host where a naive pick lands on the AAAA
+    /// record, or a multi-A-record host where the two resolutions land on
+    /// different addresses entirely).
+    peer_addr: Option<SocketAddr>,
     state: ConnectionState,
     counters: Arc<Counters>,
     channel_limit: Arc<tokio::sync::Semaphore>,
+    dns_channel_limit: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Default)]
@@ -50,10 +78,19 @@ impl SshTunnel {
             user,
             policy,
             handle: None,
+            peer_addr: None,
             state: ConnectionState::Disconnected,
             counters: Arc::new(Counters::default()),
             channel_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CHANNELS)),
+            dns_channel_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DNS_CHANNELS)),
         }
+    }
+
+    /// The concrete address the last successful `connect` actually resolved
+    /// and connected to -- see the `peer_addr` field's own doc for why this
+    /// exists and what it fixes (review item 2).
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr
     }
 }
 
@@ -222,10 +259,11 @@ impl Protocol for SshTunnel {
         // that eventually settles. Centralised here rather than repeated at
         // each fallible step below.
         match self.connect_inner(profile, store).await {
-            Ok(handle) => {
+            Ok((handle, addr)) => {
                 self.handle = Some(handle);
+                self.peer_addr = Some(addr);
                 self.state = ConnectionState::Connected;
-                tracing::info!(host = %profile.host, port = profile.port, "ssh session established");
+                tracing::info!(host = %profile.host, port = profile.port, %addr, "ssh session established");
                 Ok(())
             }
             Err(e) => {
@@ -234,6 +272,7 @@ impl Protocol for SshTunnel {
                 // stale, still-authenticated session (with keepalives still
                 // running) behind a `Failed` state.
                 self.handle = None;
+                self.peer_addr = None;
                 self.state = ConnectionState::Failed;
                 Err(e)
             }
@@ -245,6 +284,14 @@ impl Protocol for SshTunnel {
         dest: SocketAddr,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
         self.open_tcp_stream_named(&dest.ip().to_string(), dest.port(), dest)
+            .await
+    }
+
+    async fn open_dns_stream(
+        &self,
+        dest: SocketAddr,
+    ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        self.open_dns_stream_named(&dest.ip().to_string(), dest.port(), dest)
             .await
     }
 
@@ -297,6 +344,36 @@ impl SshTunnel {
         port: u16,
         origin: SocketAddr,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        self.open_channel(host, port, origin, &self.channel_limit)
+            .await
+    }
+
+    /// As [`Self::open_tcp_stream_named`], but drawn from the reserved DNS
+    /// channel budget ([`MAX_CONCURRENT_DNS_CHANNELS`]) instead of the
+    /// general one -- see `Protocol::open_dns_stream`'s doc for why the two
+    /// must not share a pool (review item 3).
+    pub async fn open_dns_stream_named(
+        &self,
+        host: &str,
+        port: u16,
+        origin: SocketAddr,
+    ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+        self.open_channel(host, port, origin, &self.dns_channel_limit)
+            .await
+    }
+
+    /// The shared body of `open_tcp_stream_named`/`open_dns_stream_named`:
+    /// identical in every respect except *which* semaphore gates it, which is
+    /// the entire point -- a bulk proxied flow and a DNS query must never be
+    /// able to block each other out of existence by competing for the same
+    /// permits.
+    async fn open_channel(
+        &self,
+        host: &str,
+        port: u16,
+        origin: SocketAddr,
+        limit: &Arc<tokio::sync::Semaphore>,
+    ) -> Result<Box<dyn TunnelStream>, TunnelError> {
         let handle = self
             .handle
             .as_ref()
@@ -304,8 +381,7 @@ impl SshTunnel {
 
         // Bound concurrent channels so a burst of flows cannot exhaust the
         // server's channel limit. Spec §8.
-        let permit = self
-            .channel_limit
+        let permit = limit
             .clone()
             .acquire_owned()
             .await
@@ -343,11 +419,26 @@ impl SshTunnel {
     /// secret resolution, transport, auth, key decode, unsupported methods —
     /// funnels through one `Failed`-state transition in the caller instead of
     /// each call site having to remember to set it.
+    ///
+    /// Returns the concrete [`SocketAddr`] actually connected to, alongside
+    /// the handle -- review item 2. `profile.host` is resolved exactly once,
+    /// here, and `client::connect` below is handed that same concrete
+    /// address rather than the host string, so there is no second,
+    /// independent resolution anywhere for the two to disagree on. Before
+    /// this fix, `connect.rs` re-resolved `profile.host` itself (via
+    /// `tokio::net::lookup_host(...).next()`) to build the `default`-mode
+    /// route pin, entirely separately from whatever address this function
+    /// connected to -- on a dual-stack host, or a multi-A-record one, those
+    /// two resolutions could legally land on *different* addresses, either
+    /// producing a malformed route command (an IPv6 address fed to the
+    /// IPv4-only commands in `route::linux`/`route::macos`) or a pin that
+    /// misses the real SSH peer entirely, letting the tunnel's own transport
+    /// route through itself.
     async fn connect_inner(
         &self,
         profile: &ServerProfile,
         store: &dyn SecretStore,
-    ) -> Result<client::Handle<ClientHandler>, TunnelError> {
+    ) -> Result<(client::Handle<ClientHandler>, SocketAddr), TunnelError> {
         let config = Arc::new(client::Config {
             // Detects a dead session directly rather than via a stalled flow. Spec §8.
             keepalive_interval: Some(std::time::Duration::from_secs(15)),
@@ -361,8 +452,16 @@ impl SshTunnel {
             policy: self.policy.clone(),
         };
 
-        let mut handle =
-            client::connect(config, (profile.host.as_str(), profile.port), handler).await?;
+        let candidates: Vec<SocketAddr> =
+            tokio::net::lookup_host((profile.host.as_str(), profile.port))
+                .await
+                .map_err(|e| {
+                    TunnelError::Protocol(format!("cannot resolve {}: {e}", profile.host))
+                })?
+                .collect();
+        let addr = pick_ipv4(candidates)?;
+
+        let mut handle = client::connect(config, addr, handler).await?;
 
         let result = match &profile.auth {
             AuthMethod::Password { password } => {
@@ -413,7 +512,44 @@ impl SshTunnel {
             }
         }
 
-        Ok(handle)
+        Ok((handle, addr))
+    }
+}
+
+/// Picks the first IPv4 candidate from a resolved address list, in order.
+///
+/// The `default`-mode route pin this address feeds (`connect.rs`, via
+/// `SshTunnel::peer_addr`) is built by IPv4-only commands --
+/// `route::linux`/`route::macos` hardcode a `/32` and expect a v4 gateway --
+/// so handing them a v6 address produces a malformed route command that
+/// fails `RouteGuard::apply` partway through applying (review item 2). A
+/// dual-stack host's resolved address list often has the AAAA record first,
+/// so picking blindly (`.next()`, the pre-fix behaviour) rather than
+/// filtering for v4 is itself the bug this closes.
+///
+/// Errors clearly, rather than silently building a malformed command, when
+/// the host resolves to IPv6 addresses only -- Phase 0 has no IPv6 support
+/// anywhere else in the stack either (the TUN device, `StackConfig`, and the
+/// route commands are all IPv4-only), so this is a real, honest limitation
+/// to surface at connect time, not a bug to paper over.
+pub fn pick_ipv4(addrs: impl IntoIterator<Item = SocketAddr>) -> Result<SocketAddr, TunnelError> {
+    let mut saw_any = false;
+    for addr in addrs {
+        saw_any = true;
+        if addr.is_ipv4() {
+            return Ok(addr);
+        }
+    }
+    if saw_any {
+        Err(TunnelError::Protocol(
+            "host resolved only to IPv6 addresses; Phase 0's route pinning and packet stack are \
+             IPv4-only"
+                .into(),
+        ))
+    } else {
+        Err(TunnelError::Protocol(
+            "host resolved to no addresses".into(),
+        ))
     }
 }
 
@@ -643,5 +779,86 @@ mod tests {
             policy: HostKeyPolicy::AcceptAny,
         };
         assert!(h.check_server_key(&key(ED25519_KEY_B)).await.unwrap());
+    }
+
+    // --- Review item 2: `pick_ipv4` --------------------------------------
+    //
+    // Pure, no network, no handle -- this is the one piece of the fix that
+    // does not need a live SSH session to verify. The property under test:
+    // whatever `connect_inner` resolves to, and whatever `SshTunnel::peer_addr`
+    // reports afterward for the route pin, must be an IPv4 address (the route
+    // commands are IPv4-only), chosen deterministically rather than by
+    // whatever order `lookup_host` happened to return.
+
+    fn v4(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn v6(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_v4_address_is_chosen_when_the_list_is_v6_first_then_v4() {
+        // The exact dual-stack shape the review names: `lookup_host` often
+        // surfaces the AAAA record first. A `.next()`-style pick (the
+        // pre-fix behaviour) would have taken the v6 address here.
+        let picked = pick_ipv4([v6("[2001:db8::1]:22"), v4("198.51.100.7:22")]).unwrap();
+        assert_eq!(picked, v4("198.51.100.7:22"));
+    }
+
+    #[test]
+    fn a_v4_address_is_chosen_when_it_already_comes_first() {
+        let picked = pick_ipv4([v4("198.51.100.7:22"), v6("[2001:db8::1]:22")]).unwrap();
+        assert_eq!(picked, v4("198.51.100.7:22"));
+    }
+
+    #[test]
+    fn the_first_v4_wins_among_several_a_records() {
+        let picked = pick_ipv4([
+            v6("[2001:db8::1]:22"),
+            v4("198.51.100.7:22"),
+            v4("198.51.100.8:22"),
+        ])
+        .unwrap();
+        assert_eq!(
+            picked,
+            v4("198.51.100.7:22"),
+            "must be deterministic, not merely 'some' v4 address"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_only_resolution_is_a_clear_error_not_a_malformed_route_later() {
+        let err = pick_ipv4([v6("[2001:db8::1]:22"), v6("[2001:db8::2]:22")]).unwrap_err();
+        match err {
+            TunnelError::Protocol(reason) => {
+                assert!(
+                    reason.contains("IPv4"),
+                    "error should explain the IPv4-only constraint: {reason}"
+                );
+            }
+            other => panic!("expected TunnelError::Protocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_addresses_at_all_is_also_a_clear_error() {
+        assert!(pick_ipv4(std::iter::empty()).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_freshly_constructed_tunnel_reports_no_peer_address_yet() {
+        let tunnel = SshTunnel::new(
+            "me".into(),
+            HostKeyPolicy::Verify {
+                known_hosts: scratch("peer-addr-fresh").join("known_hosts"),
+            },
+        );
+        assert_eq!(
+            tunnel.peer_addr(),
+            None,
+            "peer_addr must be None before any successful connect"
+        );
     }
 }

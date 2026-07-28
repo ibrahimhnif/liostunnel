@@ -42,10 +42,19 @@ use crate::error::TunnelError;
 /// `dont_frag(true)` is set unconditionally below, so a legal answer under
 /// this cap but over the MTU still produces a frame the TUN device may
 /// refuse or the OS may drop — the same "looks like a hang" failure mode as
-/// a bad checksum, just for a different reason. `build_udp_packet` has no
-/// way to know the configured MTU without a signature change that would
-/// ripple through `StackCore::inject_datagram`, `testutil::build_udp`, and
-/// every caller of both — left as a follow-up, not solved here.
+/// a bad checksum, just for a different reason. `build_udp_packet` itself
+/// still has no way to know the configured MTU without a signature change
+/// that would ripple through `testutil::build_udp` and every other caller
+/// that doesn't care about MTU truncation at all (the inbound-query test
+/// packets built via `testutil::build_udp`, for instance). Review item 4
+/// resolves the MTU/answer-size mismatch one call site up instead:
+/// `StackCore::inject_datagram` (the *only* caller synthesising outbound DNS
+/// *answers*, and the only one with `StackConfig::mtu` in scope) now checks
+/// the answer against the MTU itself and, when it doesn't fit, hands
+/// [`truncate_dns_reply`]'s output to this function instead of the real
+/// (oversized) answer — a truncated reply with the TC bit set (RFC 1035
+/// §4.1.1), so the client's own resolver retries over TCP rather than the
+/// hostname simply never resolving.
 pub const MAX_UDP_PAYLOAD: usize = u16::MAX as usize - 20 - 8;
 
 /// Resolves a DNS query by carrying it through the tunnel. Decision D3.
@@ -81,6 +90,57 @@ pub fn dns_query_id(payload: &[u8]) -> Option<u16> {
         return None;
     }
     Some(u16::from_be_bytes([payload[0], payload[1]]))
+}
+
+/// The DNS header's fixed 12-byte layout (RFC 1035 §4.1.1). Only the offsets
+/// this module actually touches are named.
+const DNS_HEADER_LEN: usize = 12;
+/// Byte 2: `QR(1) Opcode(4) AA(1) TC(1) RD(1)`. `0x02` is the TC bit.
+const DNS_FLAGS_BYTE: usize = 2;
+const DNS_TC_BIT: u8 = 0x02;
+
+/// Truncates an oversized DNS *answer* (not a query) down to just its
+/// 12-byte header, with the TC (truncated) bit set and every record count
+/// zeroed to match — RFC 1035 §4.1.1's mechanism for telling the client
+/// "retry over TCP" instead of silently failing to deliver an answer the
+/// device cannot carry as a single UDP/IP datagram. Review item 4.
+///
+/// `answer` is expected to already be a real, valid (merely oversized) DNS
+/// message from the upstream resolver — its ID and flags (QR, Opcode, AA,
+/// RD, RA, RCODE) are copied through unmodified, since the resolver already
+/// set them correctly; only TC and the four counts change. This function
+/// never fabricates a header from scratch.
+///
+/// Deliberately does *not* attempt to retain the question section. Doing so
+/// correctly means walking the QNAME label encoding — length-prefixed labels
+/// terminated by a zero byte, with edge cases (a length byte that runs past
+/// the buffer, a compression pointer, a QDCOUNT that lies) that amount to
+/// real DNS message parsing, not a fixed-offset field access like the TC bit
+/// itself. A bug there would risk corrupting or panicking on the one packet
+/// this function exists to make *safer* to emit — the header-only, RFC-legal
+/// truncated reply below is unconditionally well-formed, is never wrong to
+/// send, and does not require parsing anything.
+pub fn truncate_dns_reply(answer: &[u8]) -> Vec<u8> {
+    // A message too short to even have a full header cannot be answered
+    // meaningfully either way; pad with zeroed bytes rather than index out of
+    // bounds. This was never going to resolve anything regardless of the
+    // path taken -- the goal here is only "never panic," not "recover a
+    // sensible ID out of a malformed answer."
+    let mut header = if answer.len() >= DNS_HEADER_LEN {
+        answer[..DNS_HEADER_LEN].to_vec()
+    } else {
+        let mut h = answer.to_vec();
+        h.resize(DNS_HEADER_LEN, 0);
+        h
+    };
+
+    header[DNS_FLAGS_BYTE] |= DNS_TC_BIT;
+    // QDCOUNT, ANCOUNT, NSCOUNT, ARCOUNT: all zeroed. Nothing follows the
+    // header in a truncated-to-just-the-header reply, so claiming otherwise
+    // (e.g. a QDCOUNT of 1 with no question section actually present) would
+    // itself be a malformed message.
+    header[4..DNS_HEADER_LEN].fill(0);
+    header
 }
 
 /// Builds a complete IPv4 + UDP packet carrying `payload`. Checksums must be
@@ -285,5 +345,109 @@ mod tests {
         // wired in yet. Must fail, never fabricate an answer.
         let r = UnimplementedResolver;
         assert!(r.query(b"\x00\x01query").await.is_err());
+    }
+
+    // --- Review item 4: `truncate_dns_reply` -----------------------------
+
+    /// A realistic (if fictitious past byte 12) DNS answer header: id
+    /// 0xABCD, standard query response flags (`0x81 0x80` = QR + RD + RA,
+    /// RCODE NOERROR), one question, one answer.
+    fn sample_header() -> Vec<u8> {
+        vec![
+            0xAB, 0xCD, // ID
+            0x81, 0x80, // flags: QR=1 RD=1 RA=1, RCODE=0
+            0x00, 0x01, // QDCOUNT=1
+            0x00, 0x01, // ANCOUNT=1
+            0x00, 0x00, // NSCOUNT=0
+            0x00, 0x00, // ARCOUNT=0
+        ]
+    }
+
+    #[test]
+    fn an_oversized_answer_is_truncated_to_exactly_a_12_byte_header() {
+        let mut answer = sample_header();
+        answer.extend(vec![0x41u8; 4000]); // the oversized rest of the message
+
+        let truncated = truncate_dns_reply(&answer);
+        assert_eq!(
+            truncated.len(),
+            12,
+            "a truncated-to-header reply must be exactly 12 bytes"
+        );
+    }
+
+    #[test]
+    fn the_transaction_id_survives_truncation() {
+        let mut answer = sample_header();
+        answer.extend(vec![0x41u8; 4000]);
+
+        let truncated = truncate_dns_reply(&answer);
+        assert_eq!(
+            &truncated[..2],
+            &[0xAB, 0xCD],
+            "the client matches replies to queries by transaction id; it must be unchanged"
+        );
+    }
+
+    #[test]
+    fn the_tc_bit_is_set_without_disturbing_the_other_flag_bits() {
+        let mut answer = sample_header();
+        answer.extend(vec![0x41u8; 4000]);
+
+        let truncated = truncate_dns_reply(&answer);
+        assert_eq!(
+            truncated[2], 0x83,
+            "0x81 (QR|RD) with TC (0x02) added must be 0x83"
+        );
+        assert_eq!(truncated[3], 0x80, "RA/RCODE byte must be untouched");
+    }
+
+    #[test]
+    fn every_record_count_is_zeroed_since_nothing_follows_the_header() {
+        let mut answer = sample_header();
+        answer.extend(vec![0x41u8; 4000]);
+
+        let truncated = truncate_dns_reply(&answer);
+        assert_eq!(
+            &truncated[4..12],
+            &[0, 0, 0, 0, 0, 0, 0, 0],
+            "QDCOUNT/ANCOUNT/NSCOUNT/ARCOUNT must all read 0 -- nothing past \
+             the header is actually present"
+        );
+    }
+
+    #[test]
+    fn a_message_shorter_than_a_full_header_is_padded_not_panicked() {
+        // Never realistically produced by a real resolver, but a function
+        // that must never panic the shared stack thread (see
+        // `build_udp_packet`'s own regression tests for why that stakes are
+        // this high) must handle it anyway.
+        let truncated = truncate_dns_reply(&[0xAB, 0xCD]);
+        assert_eq!(truncated.len(), 12);
+        assert_eq!(&truncated[..2], &[0xAB, 0xCD]);
+        assert_eq!(truncated[2] & DNS_TC_BIT, DNS_TC_BIT);
+    }
+
+    #[test]
+    fn an_empty_message_is_also_padded_not_panicked() {
+        let truncated = truncate_dns_reply(&[]);
+        assert_eq!(truncated.len(), 12);
+        assert_eq!(truncated[2] & DNS_TC_BIT, DNS_TC_BIT);
+    }
+
+    #[test]
+    fn the_truncated_reply_still_builds_into_a_valid_udp_packet() {
+        // End-to-end within this module: the truncated bytes must still be a
+        // legal `build_udp_packet` payload, since that is exactly how
+        // `StackCore::inject_datagram` uses this function's output.
+        let mut answer = sample_header();
+        answer.extend(vec![0x41u8; 4000]);
+        let truncated = truncate_dns_reply(&answer);
+
+        let raw = build_udp_packet(sa("1.1.1.1:53"), sa("10.90.0.2:51234"), &truncated).unwrap();
+        let ip = Ipv4Packet::new_checked(&raw[..]).expect("valid IPv4");
+        assert!(ip.verify_checksum());
+        let udp = UdpPacket::new_checked(ip.payload()).expect("valid UDP");
+        assert_eq!(udp.payload().len(), 12);
     }
 }

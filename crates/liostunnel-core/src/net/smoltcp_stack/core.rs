@@ -264,8 +264,35 @@ impl StackCore {
     /// `dg.src`/`dg.dst` are already oriented device-ward: `src` is whoever
     /// is answering (the resolver), `dst` is the application that asked.
     /// Spec §7.5.
+    ///
+    /// Review item 4: a DNS answer can legally be up to
+    /// [`crate::dns::MAX_UDP_PAYLOAD`] bytes (RFC 1035's own TCP-answer
+    /// ceiling), comfortably larger than the device's actual MTU
+    /// (`self.cfg.mtu`, default 1500) -- `build_udp_packet` has no way to
+    /// know that on its own (see its own doc). Before this fix, an answer in
+    /// that range was queued and written to the device anyway, which either
+    /// the OS or the device itself would refuse -- surfacing as nothing more
+    /// than `poll.rs`'s `tracing::warn!("TUN write failed")`, with the
+    /// hostname simply never resolving from the application's point of view.
+    /// Synthesising a truncated reply with the TC bit set instead (RFC 1035
+    /// §4.1.1) tells the client's own resolver to retry over TCP, which is
+    /// how a real, oversized answer gets delivered at all.
     pub fn inject_datagram(&mut self, dg: Datagram) {
-        match crate::dns::build_udp_packet(dg.src, dg.dst, &dg.payload) {
+        let max_payload = self.cfg.mtu.saturating_sub(20 + 8);
+        let truncated;
+        let payload: &[u8] = if dg.payload.len() > max_payload {
+            tracing::warn!(
+                answer_len = dg.payload.len(),
+                mtu = self.cfg.mtu,
+                "DNS answer exceeds the device MTU; replying truncated (TC bit set) rather \
+                 than emitting a packet the device cannot carry"
+            );
+            truncated = crate::dns::truncate_dns_reply(&dg.payload);
+            &truncated
+        } else {
+            &dg.payload
+        };
+        match crate::dns::build_udp_packet(dg.src, dg.dst, payload) {
             Ok(packet) => self.device.push_tx(packet),
             Err(e) => {
                 self.udp_dropped += 1;
@@ -837,7 +864,7 @@ impl StackCore {
 mod tests {
     use super::*;
     use crate::net::testutil::{TcpFlags, build_tcp, build_udp};
-    use smoltcp::wire::{Ipv4Packet, TcpPacket};
+    use smoltcp::wire::{Ipv4Packet, TcpPacket, UdpPacket};
     use std::net::{Ipv4Addr, SocketAddr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1684,5 +1711,66 @@ mod tests {
         });
         assert!(core.drain_tx().is_empty());
         assert_eq!(core.udp_dropped(), 1);
+    }
+
+    /// Review item 4's regression test: a DNS answer well under
+    /// `dns::MAX_UDP_PAYLOAD` (so `build_udp_packet` alone would happily
+    /// build it) but well over the device's MTU used to be queued and
+    /// written to the device anyway -- which the device/OS would refuse,
+    /// with nothing but a `tracing::warn!` in `poll.rs` to show for it, and
+    /// the hostname simply never resolving. It must instead be replied to
+    /// with a truncated (TC bit set) reply that fits comfortably inside the
+    /// MTU, so the client's own resolver retries over TCP.
+    #[test]
+    fn an_answer_larger_than_the_mtu_is_truncated_with_tc_set_instead_of_dropped() {
+        let mut core = StackCore::new(StackConfig::default()); // mtu: 1500
+        let dns = (Ipv4Addr::new(1, 1, 1, 1), 53);
+
+        let mut oversized = vec![
+            0xAB, 0xCD, // ID
+            0x81, 0x80, // flags
+            0x00, 0x01, // QDCOUNT
+            0x00, 0x01, // ANCOUNT
+            0x00, 0x00, // NSCOUNT
+            0x00, 0x00, // ARCOUNT
+        ];
+        oversized.extend(vec![0x41u8; 2000]); // pushes the packet past the 1500-byte MTU
+
+        core.inject_datagram(Datagram {
+            src: sa(dns),
+            dst: sa(APP),
+            payload: oversized,
+        });
+
+        let tx = core.drain_tx();
+        assert_eq!(tx.len(), 1, "a truncated reply must still reach the device");
+
+        let ip = Ipv4Packet::new_checked(&tx[0][..]).unwrap();
+        assert!(ip.verify_checksum());
+        assert!(
+            (ip.total_len() as usize) <= StackConfig::default().mtu,
+            "the truncated packet itself must actually fit the device MTU: {}",
+            ip.total_len()
+        );
+
+        let udp = UdpPacket::new_checked(ip.payload()).unwrap();
+        let payload = udp.payload();
+        assert_eq!(payload.len(), 12, "truncated down to just the DNS header");
+        assert_eq!(
+            &payload[..2],
+            &[0xAB, 0xCD],
+            "the transaction id must survive truncation"
+        );
+        assert_eq!(payload[2] & 0x02, 0x02, "the TC bit must be set");
+        assert_eq!(
+            &payload[4..12],
+            &[0, 0, 0, 0, 0, 0, 0, 0],
+            "every record count must be zeroed"
+        );
+        assert_eq!(
+            core.udp_dropped(),
+            0,
+            "a truncated reply is a successful delivery, not a drop"
+        );
     }
 }

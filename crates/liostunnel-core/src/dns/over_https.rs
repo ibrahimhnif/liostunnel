@@ -26,12 +26,17 @@
 //! situation `over_tcp::TcpResolver` documents on itself. Nothing in this
 //! module, in the `Resolver` trait, or in the `Protocol` trait's contract
 //! caps concurrent in-flight queries; that bound today comes entirely from
-//! `SshTunnel::open_tcp_stream` being gated by `MAX_CONCURRENT_CHANNELS`
-//! (64, `protocols/ssh.rs`), shared with ordinary proxied TCP flows and with
-//! `TcpResolver`'s own channels. A future `Protocol` impl that does not
-//! throttle concurrent `open_tcp_stream` calls the same way would not
-//! inherit that ceiling for free, and neither `DohResolver` nor its caller
-//! would catch that on its own.
+//! [`crate::protocols::Protocol::open_dns_stream`] (not `open_tcp_stream` --
+//! review item 3), which `SshTunnel` gates with its own dedicated
+//! `MAX_CONCURRENT_DNS_CHANNELS` semaphore (8, `protocols/ssh.rs`) --
+//! deliberately *separate* from `MAX_CONCURRENT_CHANNELS` (64), the budget
+//! ordinary proxied TCP flows draw from. Before that separation existed,
+//! this resolver's queries and `TcpResolver`'s shared one semaphore with
+//! every bulk proxied flow, so a tunnel busy with ordinary traffic could
+//! starve every DNS query behind it until each one expired against its own
+//! `timeout`. A future `Protocol` impl that does not reserve a separate DNS
+//! allowance the same way would not inherit that immunity for free, and
+//! neither `DohResolver` nor its caller would catch that on its own.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -133,10 +138,12 @@ impl DohResolver {
     async fn query_one(&self, server: IpAddr, query: &[u8]) -> Result<Vec<u8>, TunnelError> {
         // The channel is opened to an IP literal; TLS is verified against
         // the configured SNI. This is what removes the bootstrap loop --
-        // see the module doc.
+        // see the module doc. `open_dns_stream`, not `open_tcp_stream`:
+        // draws from the reserved DNS channel budget so a busy tunnel's
+        // ordinary proxied flows can never starve this out -- review item 3.
         let stream = self
             .protocol
-            .open_tcp_stream(SocketAddr::new(server, HTTPS_PORT))
+            .open_dns_stream(SocketAddr::new(server, HTTPS_PORT))
             .await?;
 
         let name = rustls::pki_types::ServerName::try_from(self.doh.sni.clone())

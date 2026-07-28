@@ -110,6 +110,24 @@ pub async fn run(
     //    interface.
     let mut ssh = SshTunnel::new(user, policy);
     ssh.connect(profile, &FileSecretStore).await?;
+    // The exact address the SSH session actually connected to -- not a
+    // second, independent `lookup_host` call. Review item 2: a dual-stack or
+    // multi-A-record host could previously make this resolution disagree
+    // with the one `SshTunnel::connect` performed internally, either handing
+    // the (IPv4-only) route commands below a v6 address or pinning the wrong
+    // peer entirely. `SshTunnel::peer_addr` is `Some` here in every real
+    // case -- `connect` above already returned `Ok`, and `connect`'s own Err
+    // arm is the only place that leaves it `None` -- but a clean error still
+    // beats a `panic!`/`unwrap!` if that invariant is ever violated by a
+    // future refactor.
+    let server_ip = ssh
+        .peer_addr()
+        .ok_or_else(|| {
+            TunnelError::Route(
+                "ssh session reports no resolved peer address after connecting".into(),
+            )
+        })?
+        .ip();
     let protocol: Arc<dyn Protocol> = Arc::new(ssh);
 
     // 2. Create the TUN device.
@@ -133,18 +151,12 @@ pub async fn run(
     let _stack_guard = StackShutdownOnDrop(handles.shutdown.clone());
 
     // 4. Install routes. The guard reverts them on drop (including on a
-    //    panic), which is why a failure here -- gateway detection, DNS
-    //    resolution for the server's own address, or the route commands
-    //    themselves -- can be propagated with a plain `?` without leaving
-    //    routes behind.
+    //    panic), which is why a failure here -- gateway detection, or the
+    //    route commands themselves -- can be propagated with a plain `?`
+    //    without leaving routes behind. `server_ip` was already resolved in
+    //    step 1, from the SSH connection itself, not re-resolved here.
     let manager = platform_manager();
     let gateway = manager.detect_gateway()?;
-    let server_ip = tokio::net::lookup_host((profile.host.as_str(), profile.port))
-        .await
-        .map_err(|e| TunnelError::Route(format!("cannot resolve {}: {e}", profile.host)))?
-        .next()
-        .ok_or_else(|| TunnelError::Route(format!("no address for {}", profile.host)))?
-        .ip();
 
     let plan = RoutePlan {
         interface,
@@ -198,7 +210,7 @@ pub async fn run(
     let engine = Engine::new(protocol, resolver, handles);
     let shutdown = engine.shutdown_handle();
     let stats = engine.stats_handle();
-    let engine_task = tokio::spawn(engine.run());
+    let mut engine_task = tokio::spawn(engine.run());
 
     println!("connected — press Ctrl-C to stop");
     // Deliberately not `tokio::signal::ctrl_c().await?;` here. An early `?`
@@ -219,10 +231,39 @@ pub async fn run(
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(TunnelError::Transport)?;
 
-    let ctrl_c = tokio::select! {
-        r = tokio::signal::ctrl_c() => r,
-        _ = sigterm.recv() => Ok(()),
+    // Review item 1: the engine's own task is a third arm here, not just the
+    // two signals. `Engine::run` (`engine.rs`) returns `Ok(())` whenever the
+    // packet stack closes both its channels -- which happens on a
+    // stack-thread panic, `Poller::wait` giving up after repeated failures
+    // (`poll.rs`'s `AfterWait::GiveUp`), or any other unrequested stack
+    // exit, none of which involve this process ever calling `shutdown()`
+    // itself. Before this fix, that left the process sitting in
+    // `ctrl_c().await` forever with the routes (in `default` mode, both `/1`
+    // halves and the server pin) still installed and no packet engine behind
+    // them -- a total, silent network blackout, with `StatsHandle::load`
+    // still reporting `Connected` the whole time.
+    let stop = tokio::select! {
+        r = tokio::signal::ctrl_c() => Stop::Signal(r),
+        _ = sigterm.recv() => Stop::Signal(Ok(())),
+        res = &mut engine_task => Stop::EngineExited(res),
     };
+
+    // `None` on the signal path (the ordinary, expected way to stop); `Some`
+    // is the exact condition that must turn into a loud log line and a
+    // non-zero exit further down.
+    let engine_failure = match &stop {
+        Stop::EngineExited(res) => {
+            let detail = describe_engine_exit(res);
+            tracing::error!(
+                reason = %detail,
+                "tunnel stopped on its own, not by operator request; reverting routes and \
+                 exiting non-zero"
+            );
+            Some(detail)
+        }
+        Stop::Signal(_) => None,
+    };
+
     println!("\nshutting down");
 
     shutdown.shutdown();
@@ -231,6 +272,9 @@ pub async fn run(
     // them would be stale as soon as this process exits; clear it now so the
     // next start does not mistake a normal exit for a crash to recover from.
     liostunnel_core::route::state::AppliedState::clear(&state_path);
+    // A no-op if `stop` is already `EngineExited` (the task has already
+    // finished); still required on the signal path, where the engine is very
+    // much still running.
     engine_task.abort();
 
     let s = stats.load();
@@ -239,8 +283,41 @@ pub async fn run(
         s.flows_failed, s.dns_queries
     );
 
-    ctrl_c?;
+    if let Some(detail) = engine_failure {
+        return Err(TunnelError::Protocol(format!(
+            "tunnel engine stopped unexpectedly: {detail}"
+        )));
+    }
+
+    match stop {
+        Stop::Signal(r) => r.map_err(TunnelError::Transport)?,
+        Stop::EngineExited(_) => unreachable!("handled and returned above"),
+    }
     Ok(())
+}
+
+/// Why `run`'s final `select!` has a third arm, alongside Ctrl-C and
+/// `SIGTERM` -- see the comment at its call site for the failure mode this
+/// closes.
+enum Stop {
+    Signal(std::io::Result<()>),
+    EngineExited(Result<Result<(), TunnelError>, tokio::task::JoinError>),
+}
+
+/// Describes why the engine's task ended, for the log line and non-zero
+/// exit `run` produces when the tunnel dies on its own. Factored out as a
+/// pure function -- no I/O, no process state -- so every shape this can take
+/// is covered by a test that needs no TUN device, no routes, and no root.
+fn describe_engine_exit(res: &Result<Result<(), TunnelError>, tokio::task::JoinError>) -> String {
+    match res {
+        Ok(Ok(())) => "the packet engine stopped on its own -- the packet stack closed both of \
+                       its channels without this process ever asking it to. The tunnel is no \
+                       longer forwarding any traffic."
+            .to_string(),
+        Ok(Err(e)) => format!("the packet engine returned an error: {e}"),
+        Err(e) if e.is_panic() => format!("the packet engine's task panicked: {e}"),
+        Err(e) => format!("the packet engine's task ended unexpectedly: {e}"),
+    }
 }
 
 #[cfg(test)]
@@ -353,5 +430,69 @@ mod tests {
             }
             other => panic!("expected TunnelError::Config, got {other:?}"),
         }
+    }
+
+    // --- Review item 1: `describe_engine_exit` ---------------------------
+    //
+    // Pure, so every shape `engine_task`'s outcome can take is covered
+    // without a TUN device, routes, or root -- exactly the property this
+    // whole fix pass is about (per the module's own testing convention
+    // above). This is the message an operator actually sees (via
+    // `tracing::error!` at the call site, and again via `main.rs`'s own
+    // `eprintln!("error: {e}")` once it becomes this function's `Err`).
+
+    #[test]
+    fn a_clean_engine_return_is_described_as_stopping_on_its_own() {
+        let msg = describe_engine_exit(&Ok(Ok(())));
+        assert!(
+            msg.contains("stopped on its own"),
+            "must say the engine ended without being asked to: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_engine_error_return_names_the_underlying_error() {
+        let res = Ok(Err(TunnelError::Protocol("stack thread gave up".into())));
+        let msg = describe_engine_exit(&res);
+        assert!(
+            msg.contains("stack thread gave up"),
+            "must surface the actual error, not just say something failed: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_engine_task_is_described_as_a_panic() {
+        // A real `JoinError`, not a hand-built stand-in: spawning a task
+        // that panics and awaiting its handle is the only way to get one
+        // whose `is_panic()` is genuinely true.
+        let handle = tokio::spawn(async { panic!("simulated stack-thread panic") });
+        let join_err = handle.await.expect_err("a panicking task must join as Err");
+        assert!(
+            join_err.is_panic(),
+            "test setup must actually produce a panic"
+        );
+
+        let msg = describe_engine_exit(&Err(join_err));
+        assert!(
+            msg.contains("panicked"),
+            "a panicking task must be described as a panic, not a generic failure: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_aborted_engine_task_is_described_without_claiming_it_panicked() {
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        let join_err = handle.await.expect_err("an aborted task must join as Err");
+        assert!(
+            join_err.is_cancelled(),
+            "test setup must actually produce a cancellation"
+        );
+
+        let msg = describe_engine_exit(&Err(join_err));
+        assert!(
+            !msg.contains("panicked"),
+            "a cancelled task must not be described as a panic: {msg}"
+        );
     }
 }

@@ -32,18 +32,29 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// aggregate memory across many simultaneous in-flight queries.
 ///
 /// What actually bounds that today, in the deployed system, is a property of
-/// the *`Protocol` implementation* in use, not of this module:
-/// `SshTunnel::open_tcp_stream` is gated by `MAX_CONCURRENT_CHANNELS` (64,
-/// `protocols/ssh.rs`), shared with ordinary proxied TCP flows, which caps
-/// worst-case simultaneous answer buffers at roughly 64 * 65,535 bytes
-/// (~4.2 MB). That is `SshTunnel`'s own choice, not something the
-/// `Resolver`/`Protocol` trait contracts require -- a future `Protocol` impl
-/// that does not throttle concurrent `open_tcp_stream` calls the same way
-/// would not inherit that ceiling for free, and neither `TcpResolver` nor
-/// `engine.rs`'s dispatch loop would catch that on its own. Fixing that
-/// properly (a concurrency limit at the dispatch layer, independent of
-/// whatever the `Protocol` impl happens to do) belongs to `engine.rs`, not
-/// here.
+/// the *`Protocol` implementation* in use, not of this module: every query
+/// goes out via [`crate::protocols::Protocol::open_dns_stream`] (not
+/// `open_tcp_stream` — see review item 3 below), and `SshTunnel`'s
+/// implementation gates that call with its own dedicated
+/// `MAX_CONCURRENT_DNS_CHANNELS` semaphore (8, `protocols/ssh.rs`), which
+/// caps worst-case simultaneous answer buffers at roughly 8 * 65,535 bytes
+/// (~524 KB) -- and, just as importantly, is a *separate* budget from
+/// ordinary proxied TCP flows (`MAX_CONCURRENT_CHANNELS`, 64), not shared
+/// with them.
+///
+/// That separation is itself a fix, not just a memory bound: before it
+/// existed, DNS queries and bulk proxied flows drew from the exact same
+/// 64-permit semaphore. `tokio::sync::Semaphore` is FIFO-fair, so a tunnel
+/// with dozens of held-open flows (routine for an ordinary browser session)
+/// could queue every DNS query behind them until it expired against its own
+/// `timeout` -- DNS silently starved by ordinary traffic, indistinguishable
+/// from the resolver itself being down. That memory/concurrency bound is
+/// `SshTunnel`'s own choice, not something the `Resolver`/`Protocol` trait
+/// contracts require -- a future `Protocol` impl that does not reserve a
+/// separate DNS allowance the same way would not inherit either property
+/// (the bound or the starvation immunity) for free, and neither
+/// `TcpResolver` nor `engine.rs`'s dispatch loop would catch that on its
+/// own.
 pub struct TcpResolver {
     protocol: Arc<dyn Protocol>,
     servers: Vec<IpAddr>,
@@ -75,7 +86,11 @@ impl TcpResolver {
     /// what (and what doesn't) bound how many of these run at once.
     async fn query_one(&self, server: IpAddr, query: &[u8]) -> Result<Vec<u8>, TunnelError> {
         let dest = SocketAddr::new(server, DNS_PORT);
-        let mut stream = self.protocol.open_tcp_stream(dest).await?;
+        // `open_dns_stream`, not `open_tcp_stream`: draws from the reserved
+        // DNS channel budget so a busy tunnel's ordinary proxied flows can
+        // never starve this out — see `TcpResolver`'s own doc, "review item
+        // 3."
+        let mut stream = self.protocol.open_dns_stream(dest).await?;
 
         // The caller (`query`) already rejected anything over `u16::MAX`, so
         // this cannot fail -- kept as a `try_from` rather than an
@@ -479,5 +494,103 @@ mod tests {
              doesn't, the internal timeout guard has regressed",
         );
         assert!(result.is_err());
+    }
+
+    // --- Review item 3: DNS must draw from the reserved channel, not the
+    // general one -----------------------------------------------------------
+
+    /// Distinguishes `open_tcp_stream` from `open_dns_stream` by answering
+    /// them completely differently -- unlike `EchoDnsProtocol` above (which
+    /// only implements `open_tcp_stream` and so exercises the trait's
+    /// *default* `open_dns_stream` body, proving that default still works),
+    /// this mock proves `TcpResolver` calls the *specific* method meant for
+    /// DNS, not merely something that happens to work today.
+    struct DispatchProbeProtocol {
+        tcp_calls: Mutex<u32>,
+        dns_calls: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl crate::protocols::Protocol for DispatchProbeProtocol {
+        async fn connect(
+            &mut self,
+            _p: &crate::config::profile::ServerProfile,
+            _s: &dyn crate::config::secret::SecretStore,
+        ) -> Result<(), TunnelError> {
+            Ok(())
+        }
+
+        async fn open_tcp_stream(
+            &self,
+            _dest: SocketAddr,
+        ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+            *self.tcp_calls.lock().unwrap() += 1;
+            // Ordinary proxied flows must never observe this being confused
+            // with the DNS path -- refusing outright makes any accidental
+            // fallback to the general path fail loudly in the assertions
+            // below rather than silently "working" via the wrong budget.
+            Err(TunnelError::Protocol(
+                "must not be called for a DNS query".into(),
+            ))
+        }
+
+        async fn open_dns_stream(
+            &self,
+            dest: SocketAddr,
+        ) -> Result<Box<dyn TunnelStream>, TunnelError> {
+            *self.dns_calls.lock().unwrap() += 1;
+            let (near, mut far) = tokio::io::duplex(4096);
+            let answer = b"\xAB\xCDdns-reserved-answer".to_vec();
+            let _ = dest;
+            tokio::spawn(async move {
+                let mut len = [0u8; 2];
+                if far.read_exact(&mut len).await.is_err() {
+                    return;
+                }
+                let mut q = vec![0u8; u16::from_be_bytes(len) as usize];
+                if far.read_exact(&mut q).await.is_err() {
+                    return;
+                }
+                let _ = far.write_all(&(answer.len() as u16).to_be_bytes()).await;
+                let _ = far.write_all(&answer).await;
+            });
+            Ok(Box::new(near))
+        }
+
+        async fn send_udp(&self, _d: SocketAddr, _b: &[u8]) -> Result<(), TunnelError> {
+            Err(TunnelError::Unsupported("udp"))
+        }
+        async fn disconnect(&mut self) -> Result<(), TunnelError> {
+            Ok(())
+        }
+        fn stats(&self) -> ConnectionStats {
+            ConnectionStats::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_queries_use_the_reserved_dns_stream_not_the_general_one() {
+        let p = Arc::new(DispatchProbeProtocol {
+            tcp_calls: Mutex::new(0),
+            dns_calls: Mutex::new(0),
+        });
+        let r = TcpResolver::new(p.clone(), vec!["1.1.1.1".parse().unwrap()]);
+
+        let answer = r
+            .query(b"\xAB\xCDquery")
+            .await
+            .expect("the reserved-path mock must answer successfully");
+        assert_eq!(answer, b"\xAB\xCDdns-reserved-answer".to_vec());
+
+        assert_eq!(
+            *p.dns_calls.lock().unwrap(),
+            1,
+            "exactly one DNS-reserved channel must have been opened"
+        );
+        assert_eq!(
+            *p.tcp_calls.lock().unwrap(),
+            0,
+            "a DNS query must never open a channel via the general open_tcp_stream path"
+        );
     }
 }
