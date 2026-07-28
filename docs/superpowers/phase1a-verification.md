@@ -14,15 +14,22 @@ per platform is worth less than one that means nothing.
 | | Linux | macOS |
 |---|---|---|
 | P1a-1 — profiles parsed through FRB, not Dart | ✅ | ✅ |
-| P1a-2 — connect brings up a real tunnel and traffic flows | ✅ | ❌ blocked |
-| P1a-3 — stats update live while traffic moves | ✅ | ❌ blocked |
+| P1a-2 — connect brings up a real tunnel and traffic flows | ✅ | ✅ in use, script re-run pending |
+| P1a-3 — stats update live while traffic moves | ✅ | ✅ in use, script re-run pending |
 | P1a-4 — the tunnel outlives the UI | ✅ | ✅ |
 | P1a-5 — an unauthorized uid is refused | ✅ | ✅ |
 | P1a-6 — a secret the caller does not own is refused | ✅ | ✅ |
 | P1a-7 — a version-mismatched client fails cleanly | ✅ | ✅ |
 
-**Linux: 14 checks, 0 failures.** macOS: 12 of 14, with P1a-2/P1a-3 blocked by
-a pre-existing engine defect described below — not by anything in this slice.
+**Linux: 14 checks, 0 failures.**
+
+macOS was 12 of 14 when this was first written, with P1a-2 and P1a-3 blocked
+by the double-framing defect described below. That defect is fixed, and the
+tunnel has since been observed carrying real traffic on macOS through the app
+— a live SSH session to a remote server, with the helper logging DNS activity
+over it. **The verification script has not been re-run there since the fix**,
+so those two rows are reported as observed rather than as measured. Run
+`sudo ./testing/verify-phase1a.sh` to close them properly.
 
 P1a-1 is covered by the automated suites rather than this script: 9 Dart tests
 parse real profile documents through the FFI, and the widget tests render what
@@ -98,22 +105,32 @@ be reported as a measurement; these were left in on the assumption they
 worked. No unit test could have caught it: every mock reported zero and zero
 was what the assertions expected.
 
-**3. macOS: the engine reads nothing from the TUN device.** Open, and *not*
-introduced by this slice — Phase 0's own CLI fails identically:
+**3. macOS: the engine read nothing from the TUN device.** FIXED (`231b8ef`).
+`tun-rs` builds its macOS device with `ignore_packet_information: true`, so it
+already strips the four-byte utun address-family header on `recv` and prepends
+it on `send` — and this crate did it a second time. The extra strip ate the
+first four bytes of every inbound IP header, smoltcp discarded the result
+silently, and the extra prefix on write produced a double header the kernel
+rejected. Packets reached the interface, the stack thread stayed alive, every
+counter read zero.
+
+It was *not* introduced by this slice — Phase 0's own CLI failed identically,
+which is what ruled out the new helper:
 
 ```
 helper: SYN on utun9, retransmitted 5x, engine counters flat, curl times out
 CLI:    same profile, same CIDR, run as root — curl http_code=000, 0 flows
 ```
 
-Packets reach the interface (`tcpdump` sees them), the stack thread is alive
-(it logs `stack thread exiting` only at shutdown), and nothing is read.
-Phase 0's README claims all seven of its exit criteria verified, but records
-that they ran **in a Linux container** — so the macOS packet path was never
-exercised. `README.md`'s opening claim of macOS support does not hold today.
+Phase 0 claims all seven of its exit criteria verified, but its own table
+records that they ran **in a Linux container** — so the macOS packet path was
+never exercised, and a bug that made the platform carry nothing at all went
+unnoticed through an entire phase. That is the lesson worth keeping from this,
+more than the bug itself.
 
-Reproduce with `sudo ./testing/diagnose-p1a3.sh`, which captures on the TUN
-device and then runs the same connection through the CLI for comparison.
+`sudo ./testing/diagnose-p1a3.sh` still reproduces the measurement: it
+captures on the TUN device and then runs the same connection through the CLI
+for comparison.
 
 ## Defects in the verification itself
 
