@@ -1,0 +1,175 @@
+use std::net::IpAddr;
+
+use crate::error::TunnelError;
+use crate::route::{
+    RouteCommand, RouteManager, RouteMode, RoutePlan, dns_servers_needing_host_routes,
+    reject_full_default_prefixes,
+};
+
+pub struct LinuxRoutes;
+
+/// Parse the gateway address out of `ip route show default` output, e.g.
+/// "default via 192.168.1.1 dev eth0 proto dhcp metric 100". Factored out of
+/// `detect_gateway` so it can be unit-tested without shelling out.
+fn parse_gateway(text: &str) -> Option<IpAddr> {
+    text.split_whitespace()
+        .skip_while(|t| *t != "via")
+        .nth(1)
+        .and_then(|v| v.parse().ok())
+}
+
+/// Single-host prefix length for a route: 32 bits for IPv4, 128 for IPv6.
+/// A hardcoded `/32` would silently mismatch an IPv6 DNS resolver.
+fn host_prefix_len(addr: &IpAddr) -> u8 {
+    if addr.is_ipv4() { 32 } else { 128 }
+}
+
+impl RouteManager for LinuxRoutes {
+    fn apply_commands(&self, plan: &RoutePlan) -> Result<Vec<RouteCommand>, TunnelError> {
+        let mut cmds = Vec::new();
+        match &plan.mode {
+            RouteMode::Test { cidrs, capture_dns } => {
+                reject_full_default_prefixes(cidrs)?;
+                for cidr in cidrs {
+                    cmds.push(RouteCommand::new(
+                        "ip",
+                        &["route", "add", &cidr.to_string(), "dev", &plan.interface],
+                    ));
+                }
+                if *capture_dns {
+                    for dns in dns_servers_needing_host_routes(cidrs, &plan.dns_servers) {
+                        cmds.push(RouteCommand::new(
+                            "ip",
+                            &[
+                                "route",
+                                "add",
+                                &format!("{dns}/{}", host_prefix_len(dns)),
+                                "dev",
+                                &plan.interface,
+                            ],
+                        ));
+                    }
+                }
+            }
+            RouteMode::Default => {
+                // The server pin comes first: install it after 0.0.0.0/1 and the
+                // SSH connection can be cut before its own escape route exists.
+                cmds.push(RouteCommand::new(
+                    "ip",
+                    &[
+                        "route",
+                        "add",
+                        &format!("{}/32", plan.server_ip),
+                        "via",
+                        &plan.original_gateway.to_string(),
+                    ],
+                ));
+                // Two /1 routes beat 0.0.0.0/0 by being more specific, so the
+                // real default route is never deleted and restoring is exact.
+                for half in ["0.0.0.0/1", "128.0.0.0/1"] {
+                    cmds.push(RouteCommand::new(
+                        "ip",
+                        &["route", "add", half, "dev", &plan.interface],
+                    ));
+                }
+            }
+        }
+        Ok(cmds)
+    }
+
+    fn revert_commands(&self, plan: &RoutePlan) -> Result<Vec<RouteCommand>, TunnelError> {
+        let mut cmds = Vec::new();
+        match &plan.mode {
+            RouteMode::Test { cidrs, capture_dns } => {
+                reject_full_default_prefixes(cidrs)?;
+                for cidr in cidrs {
+                    cmds.push(RouteCommand::new(
+                        "ip",
+                        &["route", "del", &cidr.to_string(), "dev", &plan.interface],
+                    ));
+                }
+                if *capture_dns {
+                    for dns in dns_servers_needing_host_routes(cidrs, &plan.dns_servers) {
+                        cmds.push(RouteCommand::new(
+                            "ip",
+                            &[
+                                "route",
+                                "del",
+                                &format!("{dns}/{}", host_prefix_len(dns)),
+                                "dev",
+                                &plan.interface,
+                            ],
+                        ));
+                    }
+                }
+            }
+            RouteMode::Default => {
+                for half in ["0.0.0.0/1", "128.0.0.0/1"] {
+                    cmds.push(RouteCommand::new(
+                        "ip",
+                        &["route", "del", half, "dev", &plan.interface],
+                    ));
+                }
+                cmds.push(RouteCommand::new(
+                    "ip",
+                    &["route", "del", &format!("{}/32", plan.server_ip)],
+                ));
+            }
+        }
+        Ok(cmds)
+    }
+
+    fn detect_gateway(&self) -> Result<IpAddr, TunnelError> {
+        let out = std::process::Command::new("ip")
+            .args(["route", "show", "default"])
+            .output()
+            .map_err(|e| TunnelError::Route(format!("cannot run `ip route show default`: {e}")))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        parse_gateway(&text).ok_or_else(|| TunnelError::Route("no default gateway found".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_gateway_from_ip_route_show_default_output() {
+        let text = "default via 192.168.1.1 dev eth0 proto dhcp metric 100\n";
+        assert_eq!(
+            parse_gateway(text),
+            Some("192.168.1.1".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_gateway_returns_none_when_absent() {
+        let text = "10.0.0.0/24 dev eth0 proto kernel scope link src 10.0.0.5\n";
+        assert_eq!(parse_gateway(text), None);
+    }
+
+    #[test]
+    fn dns_capture_uses_a_128_bit_mask_for_ipv6_resolvers() {
+        let plan = RoutePlan {
+            interface: "utun7".into(),
+            mode: RouteMode::Test {
+                cidrs: vec![],
+                capture_dns: true,
+            },
+            server_ip: "198.51.100.7".parse().unwrap(),
+            original_gateway: "192.168.1.1".parse().unwrap(),
+            dns_servers: vec!["2001:4860:4860::8888".parse().unwrap()],
+        };
+        let cmds = LinuxRoutes.apply_commands(&plan).unwrap();
+        let rendered: Vec<String> = cmds
+            .iter()
+            .map(|c| format!("{} {}", c.program, c.args.join(" ")))
+            .collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|c| c.contains("2001:4860:4860::8888/128")),
+            "IPv6 resolvers must get a single-host /128, not /32: {rendered:?}"
+        );
+    }
+}

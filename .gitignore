@@ -7,4 +7,6 @@
 /testing/local/
 known_hosts
 
+testing/docker/sshd/keys/
+
 .DS_Store

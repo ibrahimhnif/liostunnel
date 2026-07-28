@@ -70,7 +70,27 @@ handle.channel_open_direct_tcpip(host: A, port: u32, originator_address: B, orig
 handle.disconnect(reason: Disconnect, description: &str, language_tag: &str) -> Result<(), russh::Error>
 channel.into_stream() -> russh::ChannelStream<client::Msg>   // impl AsyncRead + AsyncWrite
 enum client::AuthResult { Success, Failure { remaining_methods: MethodSet, partial_success: bool } }
-russh::keys::{PrivateKeyWithHashAlg, HashAlg, check_known_hosts_path, ssh_key}
+russh::keys::known_hosts::{check_known_hosts_path, learn_known_hosts_path, known_host_keys_path}
+russh::keys::{PrivateKeyWithHashAlg, HashAlg, ssh_key}
+// check_known_hosts_path is TRI-state and its Ok(false) is NOT simply "unknown host":
+//   Ok(true)  = a recorded entry matches this exact key
+//   Err(KeyChanged) = a recorded entry uses the SAME algorithm with a DIFFERENT key
+//   Ok(false) = EITHER the host has no entry at all, OR it has entries but none
+//               uses this key's algorithm.
+// Treating Ok(false) as "unknown, trust on first use" is a machine-in-the-middle
+// acceptance path: an attacker answers with RSA for a host recorded as ed25519 and
+// is trusted AND persisted. Check known_host_keys_path for existing entries first;
+// TOFU only when that list is empty.
+//
+// Second trap: known_host_keys_path swallows EVERY File::open error and returns
+// Ok(vec![]) (known_hosts.rs:70-74), so an empty list is ambiguous between three
+// cases. Discriminate on READABILITY, not existence:
+//   file absent                         -> first contact, TOFU
+//   file opens, no entry for this host  -> first contact for THIS host, TOFU
+//                                          (this is how a second profile is added;
+//                                           failing closed here breaks multi-server
+//                                           use permanently after the first host)
+//   file exists but will not open       -> unverifiable, reject
 ```
 
 ## File structure
@@ -745,6 +765,10 @@ pub struct ServerProfile {
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolKind {
     Ssh,
+    // `rename_all = "snake_case"` would render this `"wire_guard"` — serde
+    // inserts an underscore at every internal capital. The wire format the
+    // PRD specifies is `"wireguard"`, so this one variant overrides it.
+    #[serde(rename = "wireguard")]
     WireGuard,
     Shadowsocks,
 }
@@ -871,7 +895,7 @@ Append to the `tests` module in `crates/liostunnel-core/src/config/profile.rs`:
             host: "198.51.100.7".into(),
             port: 22,
             auth: AuthMethod::Password {
-                password: SecretRef::Env { var: "LIOS_VALID_PW".into() },
+                password: SecretRef::File { path: secret_file("valid", "pw") },
             },
             dns: DnsConfig { mode: DnsMode::Tcp, servers: vec![ip(1, 1, 1, 1)], https: None },
             split_tunnel: SplitTunnelRule::AllTraffic,
@@ -879,9 +903,31 @@ Append to the `tests` module in `crates/liostunnel-core/src/config/profile.rs`:
         }
     }
 
+    /// A real 0600 file rather than an env var. `std::env::set_var` is `unsafe`
+    /// in edition 2024 because concurrent set/get is UB, and cargo runs the
+    /// tests in one binary across threads — several of these tests share a
+    /// helper, so env vars would be a genuine data race.
+    fn secret_file(tag: &str, body: &str) -> std::path::PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // Unique per caller and cleaned up by the caller: cargo runs a binary's
+        // tests across threads, so a shared path would be a write race.
+        let dir = std::env::temp_dir().join(format!("lios-pv-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        path
+    }
+
     fn store() -> impl SecretStore {
-        // SAFETY: single-threaded test.
-        unsafe { std::env::set_var("LIOS_VALID_PW", "pw") };
         FileSecretStore
     }
 
@@ -927,10 +973,10 @@ Append to the `tests` module in `crates/liostunnel-core/src/config/profile.rs`:
     fn an_unresolvable_secret_is_rejected_at_validation_not_at_connect() {
         let mut p = valid_profile();
         p.auth = AuthMethod::Password {
-            password: SecretRef::Env { var: "LIOS_NEVER_SET_ANYWHERE".into() },
+            password: SecretRef::File { path: "/nonexistent/lios/secret".into() },
         };
         let e = p.validate(&store()).unwrap_err().to_string();
-        assert!(e.contains("LIOS_NEVER_SET_ANYWHERE"), "{e}");
+        assert!(e.contains("/nonexistent/lios/secret"), "{e}");
     }
 
     #[test]
@@ -961,6 +1007,11 @@ Append to the `tests` module in `crates/liostunnel-core/src/config/profile.rs`:
 
 Run: `cargo test -p liostunnel-core profile`
 Expected: FAIL — `no method named validate found`.
+
+> **As implemented:** `valid_profile` takes a `tag: &str` and returns
+> `(ServerProfile, PathBuf)` so each test gets its own secret-file directory and
+> removes it, matching the cleanup convention in `secret.rs`. A single shared
+> temp path across parallel test threads was a latent write race.
 
 - [ ] **Step 3: Implement**
 
@@ -1014,14 +1065,14 @@ impl ServerProfile {
         let mut w = Vec::new();
         if self.kill_switch {
             w.push(
-                "kill_switch is set but is NOT enforced in this Phase 0 build; \
+                "kill_switch is set but is not enforced in this Phase 0 build; \
                  traffic will not be blocked if the tunnel drops"
                     .to_string(),
             );
         }
         if self.split_tunnel != SplitTunnelRule::AllTraffic {
             w.push(
-                "split_tunnel is set but is NOT enforced in this Phase 0 build; \
+                "split_tunnel is set but is not enforced in this Phase 0 build; \
                  all routed traffic will use the tunnel"
                     .to_string(),
             );
@@ -1326,21 +1377,52 @@ impl PortableProfile {
     }
 }
 
-/// Creates the file with 0600 already set, so the secret is never briefly
-/// world-readable between `create` and `set_permissions`.
+/// Always creates a *fresh* file at 0600.
+///
+/// `create(true)` is not enough: POSIX applies `open`'s mode argument only when
+/// the file is newly created, so an existing file at a looser mode would keep it
+/// while receiving the secret — and an existing symlink would be followed.
+/// `create_new` avoids both; if the path exists we remove it and retry rather
+/// than inheriting unknown state. `id` is preserved across import, so the path
+/// is deterministic and this case is reachable on re-import.
 fn write_secret_file(path: &Path, value: &str) -> Result<(), TunnelError> {
     use std::io::Write;
 
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path).map_err(|e| {
-        TunnelError::config(format!("secret file {}", path.display()), format!("cannot write: {e}"))
-    })?;
+    let open_fresh = || {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(path)
+    };
+
+    let mut f = match open_fresh() {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path).map_err(|e| {
+                TunnelError::config(
+                    format!("secret file {}", path.display()),
+                    format!("cannot replace existing file: {e}"),
+                )
+            })?;
+            open_fresh().map_err(|e| {
+                TunnelError::config(
+                    format!("secret file {}", path.display()),
+                    format!("cannot create: {e}"),
+                )
+            })?
+        }
+        Err(e) => {
+            return Err(TunnelError::config(
+                format!("secret file {}", path.display()),
+                format!("cannot write: {e}"),
+            ));
+        }
+    };
+
     f.write_all(value.as_bytes())
         .map_err(|e| TunnelError::config(format!("secret file {}", path.display()), e.to_string()))
 }
@@ -1432,7 +1514,12 @@ COPY keys/ssh_host_ed25519_key.pub /etc/ssh/ssh_host_ed25519_key.pub
 COPY keys/authorized_keys          /home/tunneluser/.ssh/authorized_keys
 RUN chmod 600 /etc/ssh/ssh_host_ed25519_key /home/tunneluser/.ssh/authorized_keys \
  && chown -R tunneluser:tunneluser /home/tunneluser/.ssh \
- && printf 'AllowTcpForwarding yes\nPermitOpen any\nPasswordAuthentication yes\nPubkeyAuthentication yes\nPermitRootLogin no\n' >> /etc/ssh/sshd_config
+ # OpenSSH takes the FIRST occurrence of a directive, and Alpine's stock
+ # config already sets `AllowTcpForwarding no`. Appending `yes` after it is
+ # silently ignored and every direct-tcpip request is refused, so rewrite
+ # the existing line rather than adding a second one.
+ && sed -i 's/^AllowTcpForwarding no$/AllowTcpForwarding yes/' /etc/ssh/sshd_config \
+ && printf 'PermitOpen any\nPasswordAuthentication yes\nPubkeyAuthentication yes\nPermitRootLogin no\n' >> /etc/ssh/sshd_config
 EXPOSE 22
 CMD ["/usr/sbin/sshd", "-D", "-e"]
 ```
@@ -1526,10 +1613,30 @@ fn profile(auth: AuthMethod) -> ServerProfile {
     }
 }
 
+/// File-backed rather than env-backed: `std::env::set_var` is `unsafe` in
+/// edition 2024 because concurrent set/get is UB, and these tests share this
+/// helper across threads in one test binary.
+fn secret_file(tag: &str, body: &str) -> PathBuf {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = scratch(tag);
+    let path = dir.join("secret");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    f.write_all(body.as_bytes()).unwrap();
+    path
+}
+
 fn password_auth() -> AuthMethod {
-    // SAFETY: tests in this file are single-threaded with respect to this var.
-    unsafe { std::env::set_var("LIOS_IT_PASSWORD", "tunnelpass") };
-    AuthMethod::Password { password: SecretRef::Env { var: "LIOS_IT_PASSWORD".into() } }
+    AuthMethod::Password {
+        password: SecretRef::File { path: secret_file("pw", "tunnelpass") },
+    }
 }
 
 #[tokio::test]
@@ -1598,8 +1705,9 @@ async fn connects_with_a_private_key() {
 #[tokio::test]
 #[ignore = "requires docker fixture: make -C testing/docker up"]
 async fn a_wrong_password_produces_an_auth_error() {
-    unsafe { std::env::set_var("LIOS_IT_BADPW", "not-the-password") };
-    let auth = AuthMethod::Password { password: SecretRef::Env { var: "LIOS_IT_BADPW".into() } };
+    let auth = AuthMethod::Password {
+        password: SecretRef::File { path: secret_file("badpw", "not-the-password") },
+    };
     let mut t = SshTunnel::new("tunneluser".into(), HostKeyPolicy::AcceptAny);
     let err = t.connect(&profile(auth), &FileSecretStore).await.unwrap_err();
     assert!(matches!(err, liostunnel_core::TunnelError::Auth(_)), "got {err:?}");
@@ -1779,11 +1887,17 @@ impl client::Handler for ClientHandler {
                         TunnelError::HostKey(format!("cannot create known_hosts directory: {e}"))
                     })?;
                 }
+                // Does this host have ANY recorded key? Ok(false) below cannot
+                // distinguish "no entry" from "entry exists with another
+                // algorithm", and conflating them accepts a MITM key.
+                let existing = known_host_keys_path(&self.host, self.port, known_hosts)
+                    .map_err(|e| TunnelError::HostKey(format!("cannot read known_hosts: {e}")))?;
+
                 match check_known_hosts_path(&self.host, self.port, key, known_hosts) {
                     // Known and matching.
                     Ok(true) => Ok(true),
-                    // Unknown host: trust on first use, then record it.
-                    Ok(false) => {
+                    // Only genuine first contact may be trusted on first use.
+                    Ok(false) if existing.is_empty() => {
                         tracing::warn!(
                             host = %self.host, port = self.port,
                             fingerprint = %key.fingerprint(Default::default()),
@@ -1795,6 +1909,14 @@ impl client::Handler for ClientHandler {
                             })?;
                         Ok(true)
                     }
+                    // Host is recorded but this key did not match any entry.
+                    // Same severity as an outright key change. Never accept.
+                    Ok(false) => Err(TunnelError::HostKey(format!(
+                        "host {}:{} is known but presented a {} key matching no recorded entry",
+                        self.host,
+                        self.port,
+                        key.algorithm()
+                    ))),
                     // Known but different — the dangerous case. Never auto-accept.
                     Err(e) => Err(TunnelError::HostKey(format!(
                         "host key for {}:{} does not match {}: {e}",
@@ -2004,7 +2126,13 @@ async fn a_refused_destination_reports_a_protocol_error_without_killing_the_sess
 
     // Nothing listens on this port inside the container.
     let dest: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
-    let err = t.open_tcp_stream(dest).await.unwrap_err();
+    // `unwrap_err` requires T: Debug, and `Box<dyn TunnelStream>` deliberately
+    // has none — a Debug on a stream type is how payload bytes leak. Discard
+    // the Ok value instead.
+    let err = match t.open_tcp_stream(dest).await {
+        Ok(_) => panic!("expected the destination to be refused"),
+        Err(e) => e,
+    };
     assert!(matches!(err, liostunnel_core::TunnelError::Protocol(_)), "got {err:?}");
 
     // Spec §11: a per-flow failure must not tear down the session.
@@ -2178,49 +2306,29 @@ impl SshTunnel {
             self.counters.active_flows.clone(),
         );
 
-        // The permit lives as long as the stream.
-        Ok(Box::new(PermitStream { inner: stream, _permit: permit }))
-    }
-}
-
-/// Keeps a semaphore permit alive for the lifetime of the stream.
-struct PermitStream<S> {
-    inner: S,
-    _permit: tokio::sync::OwnedSemaphorePermit,
-}
-
-impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for PermitStream<S> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for PermitStream<S> {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
-    }
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        Ok(Box::new(stream))
     }
 }
 ```
+
+The semaphore permit is carried by `CountingStream` itself rather than a second
+wrapper. Add the field in `counting.rs` — a separate `PermitStream` would
+duplicate all four `poll_*` delegations verbatim for one extra field:
+
+```rust
+pub struct CountingStream<S> {
+    inner: S,
+    up: Arc<AtomicU64>,
+    down: Arc<AtomicU64>,
+    active: Arc<AtomicU64>,
+    /// Released when the stream drops, bounding concurrent SSH channels.
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+```
+
+with `new(...)` taking `permit: Option<tokio::sync::OwnedSemaphorePermit>` as its
+last argument (tests pass `None`), and `open_tcp_stream_named` passing
+`Some(permit)`.
 
 Change `Counters` to hold `Arc<AtomicU64>` fields so `CountingStream` can share them, and add the semaphore to `SshTunnel`:
 
@@ -2383,10 +2491,18 @@ pub fn load(path: &Path, secret_dir: &Path) -> Result<ServerProfile, TunnelError
 
     match serde_json::from_str::<PortableProfile>(&raw) {
         Ok(p) => p.import(secret_dir),
-        Err(e) => Err(TunnelError::config(
-            path.display().to_string(),
-            format!("not a valid profile in either format: {e}"),
-        )),
+        Err(e) => {
+            // The raw serde error is not shown to the user: PortableProfile's
+            // scalar fields (port, kill_switch, protocol) make serde's
+            // invalid_type/unknown_variant messages echo the offending value
+            // verbatim, and a secret misplaced into one of those fields would
+            // leak into this error text.
+            tracing::debug!(path = %path.display(), error = %e, "profile parse failed");
+            Err(TunnelError::config(
+                path.display().to_string(),
+                "not a valid profile in either format",
+            ))
+        }
     }
 }
 
@@ -2567,6 +2683,7 @@ async fn run(cli: Cli) -> Result<(), liostunnel_core::TunnelError> {
         Command::Import { profile } => {
             let p = profile_io::load(&profile, &secret_dir)?;
             p.validate(&FileSecretStore)?;
+            emit_warnings(&p);
             let out = home.join(format!("{}.json", p.id));
             std::fs::create_dir_all(&home).map_err(liostunnel_core::TunnelError::from)?;
             std::fs::write(&out, serde_json::to_string_pretty(&p).unwrap())
@@ -3302,7 +3419,10 @@ Spec §7.2. This is the only place the synchronous stack thread and the tokio ru
 
 - [ ] **Step 1: Add the dependency**
 
-Add to `[workspace.dependencies]`: `tokio-util = { version = "0.7", features = ["sync"] }`, and to `crates/liostunnel-core/Cargo.toml`: `tokio-util.workspace = true`.
+Add to `[workspace.dependencies]`: `tokio-util = "0.7"` (no `features` list —
+tokio-util 0.7.19 has no `sync` feature at all; `PollSender` lives in its
+unconditional base), and to `crates/liostunnel-core/Cargo.toml`:
+`tokio-util.workspace = true`.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -4150,8 +4270,10 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p liostunnel-core stack_core`
+Run: `cargo test -p liostunnel-core smoltcp_stack::core`
 Expected: FAIL — `cannot find type StackCore in this scope`.
+
+(The module path is `smoltcp_stack::core`, not `stack_core` — a bare `stack_core` filter matches nothing and silently reports "0 passed" as if it were success.)
 
 - [ ] **Step 3: Implement**
 
@@ -4458,7 +4580,7 @@ Add `pub mod core;` to `crates/liostunnel-core/src/net/smoltcp_stack/mod.rs`, an
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p liostunnel-core stack_core -- --nocapture`
+Run: `cargo test -p liostunnel-core smoltcp_stack::core -- --nocapture`
 Expected: PASS — 9 passed.
 
 If `Socket::set_timeout` or `SocketSet::remove` differ, check `cargo doc -p smoltcp --open`; everything else in this task is pinned by the verified API reference.
@@ -4800,7 +4922,7 @@ Spec §7.6 and §11.
 
 **Interfaces:**
 - Consumes: `NetStack`/`StackHandles`/`TcpFlow` (10, 14), `Protocol` (6), `ConnectionStats` (6).
-- Produces: `struct Engine` with `Engine::new(protocol: Arc<dyn Protocol>, handles: StackHandles) -> Self`, `async fn run(self) -> Result<(), TunnelError>`, `fn stats(&self) -> ConnectionStats`, `fn shutdown(&self)`.
+- Produces: `struct Engine` with `Engine::new(protocol: Arc<dyn Protocol>, handles: StackHandles) -> Self`, `async fn run(self) -> Result<(), TunnelError>`, `fn stats_handle(&self) -> StatsHandle`, `fn shutdown_handle(&self) -> ShutdownHandle`. (Task 17's `connect.rs` calls the `_handle` names — the Step 2 code below is authoritative.)
 
 - [ ] **Step 1: Write the failing tests**
 
