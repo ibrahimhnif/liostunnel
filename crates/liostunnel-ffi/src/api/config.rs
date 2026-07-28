@@ -33,6 +33,37 @@ pub fn export_profile(dto: ProfileDto) -> Result<String, String> {
     serde_json::to_string_pretty(&core).map_err(|_| "could not serialize".to_string())
 }
 
+/// A fresh profile id.
+///
+/// Generated in Rust so the id format stays a property of the schema rather
+/// than something Dart reimplements — the same reasoning as parse_profile
+/// (P1a-1). A v4 UUID formatted the way `ServerProfile` expects to read it
+/// back.
+pub fn new_profile_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Checks a profile the UI is about to save, without touching its secret.
+///
+/// Deliberately NOT `ServerProfile::validate`: that resolves every
+/// `SecretRef` through a `SecretStore`, which would have the app read key
+/// material it has no business reading. This checks the shape only — the
+/// helper re-validates properly at connect time, as the caller's uid.
+pub fn check_profile(dto: ProfileDto) -> Result<(), String> {
+    let core = liostunnel_core::config::profile::ServerProfile::try_from(dto)
+        .map_err(|e| e.to_string())?;
+    if core.host.trim().is_empty() {
+        return Err("host must not be empty".into());
+    }
+    if core.port == 0 {
+        return Err("port must not be zero".into());
+    }
+    if core.dns.servers.is_empty() {
+        return Err("at least one DNS server is required".into());
+    }
+    Ok(())
+}
+
 /// One-line summary for the profiles list.
 pub fn profile_summary(dto: ProfileDto) -> String {
     format!("{} — {}:{}", dto.name, dto.host, dto.port)

@@ -17,6 +17,7 @@ class ProfilesScreen extends StatelessWidget {
     required this.selectedPath,
     required this.onSelect,
     required this.onReload,
+    required this.onCreate,
   });
 
   final List<LoadedProfile> profiles;
@@ -24,6 +25,7 @@ class ProfilesScreen extends StatelessWidget {
   final String? selectedPath;
   final void Function(LoadedProfile) onSelect;
   final VoidCallback onReload;
+  final VoidCallback onCreate;
 
   @override
   Widget build(BuildContext context) {
@@ -31,6 +33,12 @@ class ProfilesScreen extends StatelessWidget {
       appBar: AppBar(
         title: const Text('Profiles'),
         actions: [
+          IconButton(
+            key: const Key('create-button'),
+            icon: const Icon(Icons.add),
+            tooltip: 'New profile',
+            onPressed: onCreate,
+          ),
           IconButton(
             key: const Key('reload-button'),
             icon: const Icon(Icons.refresh),
@@ -45,7 +53,7 @@ class ProfilesScreen extends StatelessWidget {
                 padding: const EdgeInsets.all(24),
                 child: Text(
                   'No profiles in $directory.\n'
-                  'Drop a profile JSON file there and reload.',
+                  'Use + to create one, or drop a JSON file there and reload.',
                   textAlign: TextAlign.center,
                 ),
               ),

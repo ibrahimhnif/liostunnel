@@ -4,10 +4,12 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import 'screens/connection.dart';
+import 'screens/profile_editor.dart';
 import 'screens/profiles.dart';
 import 'services/connection_model.dart';
 import 'services/helper_client.dart';
 import 'services/profile_store.dart';
+import 'services/profile_writer.dart';
 import 'src/rust/api/protocol.dart';
 import 'src/rust/frb_generated.dart';
 
@@ -45,6 +47,7 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final _client = HelperClient();
   final _store = ProfileStore();
+  late final _writer = ProfileWriter(directory: _store.directory);
   List<LoadedProfile> _profiles = const [];
   LoadedProfile? _selected;
   int _tab = 0;
@@ -127,6 +130,17 @@ class _HomePageState extends State<HomePage> {
           _selected = p;
           _tab = 1;
         }),
+        onCreate: () => Navigator.of(context).push(
+          MaterialPageRoute<void>(
+            builder: (_) => ProfileEditorScreen(
+              writer: _writer,
+              // Reload rather than insert: the store is the truth, and a
+              // list built from what we *think* we wrote would drift from
+              // what is actually on disk.
+              onSaved: _reload,
+            ),
+          ),
+        ),
       ),
       ConnectionScreen(
         selected: _selected,

@@ -27,6 +27,24 @@ Future<ProfileDto> parseProfile({required String json}) =>
 Future<String> exportProfile({required ProfileDto dto}) =>
     RustLib.instance.api.crateApiConfigExportProfile(dto: dto);
 
+/// A fresh profile id.
+///
+/// Generated in Rust so the id format stays a property of the schema rather
+/// than something Dart reimplements — the same reasoning as parse_profile
+/// (P1a-1). A v4 UUID formatted the way `ServerProfile` expects to read it
+/// back.
+Future<String> newProfileId() =>
+    RustLib.instance.api.crateApiConfigNewProfileId();
+
+/// Checks a profile the UI is about to save, without touching its secret.
+///
+/// Deliberately NOT `ServerProfile::validate`: that resolves every
+/// `SecretRef` through a `SecretStore`, which would have the app read key
+/// material it has no business reading. This checks the shape only — the
+/// helper re-validates properly at connect time, as the caller's uid.
+Future<void> checkProfile({required ProfileDto dto}) =>
+    RustLib.instance.api.crateApiConfigCheckProfile(dto: dto);
+
 /// One-line summary for the profiles list.
 Future<String> profileSummary({required ProfileDto dto}) =>
     RustLib.instance.api.crateApiConfigProfileSummary(dto: dto);

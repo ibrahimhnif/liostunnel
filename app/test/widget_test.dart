@@ -5,10 +5,12 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 
 import 'package:liostunnel_app/screens/connection.dart';
+import 'package:liostunnel_app/screens/profile_editor.dart';
 import 'package:liostunnel_app/screens/profiles.dart';
 import 'package:liostunnel_app/services/connection_model.dart';
 import 'package:liostunnel_app/services/helper_client.dart';
 import 'package:liostunnel_app/services/profile_store.dart';
+import 'package:liostunnel_app/services/profile_writer.dart';
 import 'package:liostunnel_app/src/rust/dto/profile.dart';
 import 'package:liostunnel_app/src/rust/frb_generated.dart';
 
@@ -181,6 +183,7 @@ void main() {
           selectedPath: null,
           onSelect: (_) {},
           onReload: () {},
+        onCreate: () {},
         ),
       ),
     );
@@ -206,6 +209,7 @@ void main() {
           selectedPath: null,
           onSelect: (_) {},
           onReload: () {},
+        onCreate: () {},
         ),
       ),
     );
@@ -224,6 +228,7 @@ void main() {
           selectedPath: null,
           onSelect: (p) => picked = p,
           onReload: () {},
+        onCreate: () {},
         ),
       ),
     );
@@ -242,6 +247,7 @@ void main() {
           selectedPath: null,
           onSelect: _ignore,
           onReload: _noop,
+          onCreate: _noop,
         ),
       ),
     );
@@ -268,6 +274,8 @@ void main() {
     dir.deleteSync(recursive: true);
   });
 
+  editorTests();
+
   test('a missing profiles directory is empty, not an error', () async {
     final loaded = await ProfileStore(
       directory: '/nonexistent/lios-profiles',
@@ -278,3 +286,71 @@ void main() {
 
 void _ignore(LoadedProfile _) {}
 void _noop() {}
+
+// --- profile editor -------------------------------------------------------
+// Rendering and validation only. The save path crosses the FFI, and
+// testWidgets runs its body in a fake-async zone where those futures never
+// complete — that is covered by profile_writer_test.dart instead.
+
+/// A surface tall enough that the whole form is built.
+///
+/// The save button sits below the fold of a lazy ListView on the default
+/// 800x600 test view, so it is never constructed and `tap` finds nothing.
+/// scrollUntilVisible is not the answer here: it calls `.single` on the
+/// scrollable finder and the form has several.
+Future<void> pumpEditor(WidgetTester tester) async {
+  tester.view.physicalSize = const Size(1200, 2400);
+  tester.view.devicePixelRatio = 1.0;
+  addTearDown(tester.view.reset);
+  await tester.pumpWidget(editor());
+}
+
+Widget editor() => MaterialApp(
+      home: ProfileEditorScreen(
+        writer: ProfileWriter(directory: '/tmp/lios-editor-test'),
+        onSaved: () {},
+      ),
+    );
+
+void editorTests() {
+  testWidgets('an empty host is refused before anything is written',
+      (tester) async {
+    await pumpEditor(tester);
+    await tester.enterText(find.byKey(const Key('f-host')), '');
+    await tester.tap(find.byKey(const Key('save-button')));
+    await tester.pump();
+    expect(find.text('required'), findsWidgets);
+    expect(find.byKey(const Key('editor-saved')), findsNothing);
+  });
+
+  testWidgets('a port outside 1-65535 is refused', (tester) async {
+    await pumpEditor(tester);
+    await tester.enterText(find.byKey(const Key('f-port')), '70000');
+    await tester.tap(find.byKey(const Key('save-button')));
+    await tester.pump();
+    expect(find.text('1–65535'), findsOneWidget);
+  });
+
+  testWidgets('a typed password is obscured on screen', (tester) async {
+    await pumpEditor(tester);
+    await tester.tap(find.byKey(const Key('f-secret-mode')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Type it — save to a 0600 file').last);
+    await tester.pumpAndSettle();
+    final editable = tester.widget<EditableText>(
+      find.descendant(
+        of: find.byKey(const Key('f-secret')),
+        matching: find.byType(EditableText),
+      ),
+    );
+    expect(editable.obscureText, isTrue);
+  });
+
+  testWidgets('the file mode says the ownership rule the helper enforces',
+      (tester) async {
+    // A user whose key is 0644 gets refused at connect time with no way to
+    // know why from the form, so the form has to say it up front.
+    await pumpEditor(tester);
+    expect(find.textContaining('owned by you and mode 0600'), findsOneWidget);
+  });
+}
