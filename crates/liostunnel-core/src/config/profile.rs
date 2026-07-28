@@ -50,7 +50,10 @@ pub enum AuthMethod {
         peer_public_key: String,
     },
     /// Shadowsocks. `method` is a cipher name as Shadowsocks spells it
-    /// (`aes-256-gcm`, `2022-blake3-aes-256-gcm`); it is not secret. The
+    /// (`aes-256-gcm`, `chacha20-ietf-poly1305`); it is not secret. Which
+    /// names this build actually accepts is `protocols::shadowsocks`'s
+    /// `OFFERED` -- AEAD-2022 (`2022-blake3-*`) is not among them, so it is
+    /// not used as an example spelling here either. The
     /// password IS key material, hence a `SecretRef` — which is what makes
     /// the helper's ownership gate cover it with no new code.
     Shadowsocks {
