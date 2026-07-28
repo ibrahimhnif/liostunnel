@@ -1,4 +1,5 @@
 use std::os::fd::RawFd;
+use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -6,6 +7,10 @@ pub enum AuthError {
     PeerCred(std::io::Error),
     #[error("connection from uid {actual} refused; only uid {expected} is authorized")]
     WrongUid { expected: u32, actual: u32 },
+    #[error("secret file {path} is not owned by uid {uid}")]
+    SecretNotOwned { path: String, uid: u32 },
+    #[error("secret file {path}: {reason}")]
+    SecretRejected { path: String, reason: String },
 }
 
 /// The uid of the process on the other end of a connected unix socket.
@@ -61,6 +66,49 @@ pub fn authorize(fd: RawFd, expected: u32) -> Result<(), AuthError> {
     if actual != expected {
         return Err(AuthError::WrongUid { expected, actual });
     }
+    Ok(())
+}
+
+/// Whether `uid` may have this file used as a secret.
+///
+/// The helper runs as root and can read anything; this is what stops a
+/// caller from borrowing that power. Ownership is checked against the
+/// *calling* uid, and the mode rule Phase 0 established is preserved.
+///
+/// Deliberately uses `metadata` (which follows symlinks) rather than
+/// `symlink_metadata`: a link the caller owns pointing at a file they do
+/// not is exactly the bypass this must refuse.
+pub fn secret_readable_by(path: &Path, uid: u32) -> Result<(), AuthError> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let meta = std::fs::metadata(path).map_err(|e| AuthError::SecretRejected {
+        path: path.display().to_string(),
+        reason: format!("cannot stat: {e}"),
+    })?;
+
+    if !meta.is_file() {
+        return Err(AuthError::SecretRejected {
+            path: path.display().to_string(),
+            reason: "not a regular file".into(),
+        });
+    }
+
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(AuthError::SecretRejected {
+            path: path.display().to_string(),
+            reason: format!("mode {mode:o} grants access beyond the owner"),
+        });
+    }
+
+    if meta.uid() != uid {
+        return Err(AuthError::SecretNotOwned {
+            path: path.display().to_string(),
+            uid,
+        });
+    }
+
     Ok(())
 }
 
@@ -154,5 +202,104 @@ mod tests {
             }
             other => panic!("expected Err(AuthError::WrongUid {{ .. }}), got {other:?}"),
         }
+    }
+
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::PathBuf;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("lios-auth-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write_owned(dir: &std::path::Path, mode: u32) -> PathBuf {
+        let p = dir.join("secret");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(&p)
+            .unwrap();
+        f.write_all(b"KEYMATERIAL").unwrap();
+        p
+    }
+
+    #[test]
+    fn a_file_the_caller_owns_is_permitted() {
+        let d = scratch("owned");
+        let p = write_owned(&d, 0o600);
+        let me = unsafe { libc::getuid() };
+        assert!(secret_readable_by(&p, me).is_ok());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_file_owned_by_another_uid_is_refused() {
+        // THE ESCALATION. A root-owned file that this uid does not own must be
+        // refused even though the helper, running as root, could trivially read
+        // it. /etc/shadow is the canonical target: name it as your private key
+        // and its contents leave via an auth attempt or an error message.
+        let me = unsafe { libc::getuid() };
+        if me == 0 {
+            eprintln!("skipped: running as root, every file is 'ours'");
+            return;
+        }
+        let target = std::path::Path::new("/etc/shadow");
+        if !target.exists() {
+            eprintln!("skipped: /etc/shadow absent on this platform");
+            return;
+        }
+        let err = secret_readable_by(target, me)
+            .expect_err("a file owned by another uid must be refused");
+        assert!(
+            matches!(err, AuthError::SecretNotOwned { .. }),
+            "expected SecretNotOwned, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_world_readable_file_is_still_refused_even_if_owned() {
+        // Phase 0's FileSecretStore already rejects looser-than-0600. This
+        // check runs first, so the mode rule is not lost by moving ownership
+        // enforcement into the helper.
+        let d = scratch("loose");
+        let p = write_owned(&d, 0o644);
+        let me = unsafe { libc::getuid() };
+        assert!(secret_readable_by(&p, me).is_err());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_missing_file_is_an_error_not_a_panic() {
+        let me = unsafe { libc::getuid() };
+        assert!(secret_readable_by(std::path::Path::new("/nonexistent/lios"), me).is_err());
+    }
+
+    #[test]
+    fn a_symlink_is_judged_by_its_target_not_the_link() {
+        // A symlink the caller owns pointing at a file they do not is the
+        // obvious bypass. `metadata` follows the link, which is what we want —
+        // this test pins that we did not reach for `symlink_metadata`.
+        let me = unsafe { libc::getuid() };
+        if me == 0 {
+            eprintln!("skipped: running as root");
+            return;
+        }
+        let target = std::path::Path::new("/etc/shadow");
+        if !target.exists() {
+            eprintln!("skipped: /etc/shadow absent");
+            return;
+        }
+        let d = scratch("symlink");
+        let link = d.join("link");
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        assert!(
+            secret_readable_by(&link, me).is_err(),
+            "a symlink to a file the caller does not own must be refused"
+        );
+        std::fs::remove_dir_all(&d).ok();
     }
 }
