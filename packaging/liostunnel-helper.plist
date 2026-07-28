@@ -28,6 +28,16 @@
         <string>@UID@</string>
     </array>
 
+    <!-- The connect diagnostic (ssh user, host, port, and the SHAPE of the
+         credential: its path, size, mode, owner and trailing whitespace) is
+         logged at debug. It never prints a credential's value: this log is
+         root-owned, persists, and ends up in backups. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>liostunnel_helper=debug,liostunnel_core=info</string>
+    </dict>
+
     <key>RunAtLoad</key>
     <true/>
 

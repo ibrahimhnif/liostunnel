@@ -135,6 +135,11 @@ impl Tunnel {
         let policy = HostKeyPolicy::Verify {
             known_hosts: paths.known_hosts.clone(),
         };
+        // Everything needed to diagnose a rejected login, and nothing that
+        // would put a credential in a root-owned log that persists and gets
+        // backed up. `RUST_LOG=liostunnel_helper=debug` turns it on.
+        describe_connect_attempt(&auth.user, &auth.profile);
+
         let mut ssh = SshTunnel::new(auth.user, policy);
         ssh.connect(&auth.profile, &FileSecretStore).await?;
 
@@ -333,6 +338,63 @@ impl Tunnel {
             route_mode,
             tun_address,
         })
+    }
+}
+
+/// Logs what a connection attempt is about to use.
+///
+/// Reports the *shape* of the credential — where it lives, its size, its
+/// permissions, and whether it has trailing whitespace — never its value.
+/// That is enough to identify every cause of a rejected login this code can
+/// produce, and it keeps the rule the whole design rests on: the helper's log
+/// is the most sensitive one on the machine, and a password written there
+/// outlives the debugging session that wanted it.
+///
+/// The trailing-whitespace check earns its place. `FileSecretStore` strips at
+/// most ONE trailing line ending, so a file ending in `\n\n`, a space, or a
+/// CRLF pair sends a credential that differs from the one the user believes
+/// they stored — and the server's only reply is a flat rejection.
+fn describe_connect_attempt(user: &str, profile: &ServerProfile) {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    for r in profile.auth.secret_refs() {
+        let detail = match r {
+            SecretRef::Env { var } => format!("env:{var} (the helper refuses these)"),
+            SecretRef::File { path } => match std::fs::metadata(path) {
+                Err(e) => format!("file:{} — CANNOT STAT: {e}", path.display()),
+                Ok(m) => {
+                    // Only the final byte is inspected, and only to classify
+                    // it as whitespace or not.
+                    let trailing = std::fs::read(path)
+                        .ok()
+                        .and_then(|b| b.last().copied())
+                        .map(|b| match b {
+                            b'\n' => "ends with LF (one is stripped, more are not)",
+                            b'\r' => "ends with CR — likely a CRLF file",
+                            b' ' | b'\t' => "ENDS WITH A SPACE OR TAB — not stripped",
+                            _ => "no trailing whitespace",
+                        })
+                        .unwrap_or("empty file");
+                    format!(
+                        "file:{} — {} bytes, mode {:o}, owner uid {}, {}",
+                        path.display(),
+                        m.len(),
+                        m.permissions().mode() & 0o777,
+                        m.uid(),
+                        trailing
+                    )
+                }
+            },
+        };
+        tracing::debug!(
+            ssh_user = %user,
+            host = %profile.host,
+            port = profile.port,
+            auth = ?std::mem::discriminant(&profile.auth),
+            secret = %detail,
+            "connect attempt"
+        );
     }
 }
 

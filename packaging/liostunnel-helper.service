@@ -16,6 +16,10 @@ Type=simple
 ExecStart=/usr/local/libexec/liostunnel-helper \
           --socket /var/run/liostunnel.sock \
           --uid @UID@
+# The connect diagnostic is logged at debug. It reports the shape of a
+# credential -- path, size, mode, owner, trailing whitespace -- never its
+# value: this log is root-owned, persists, and ends up in backups.
+Environment=RUST_LOG=liostunnel_helper=debug,liostunnel_core=info
 Restart=on-failure
 RestartSec=2
 
