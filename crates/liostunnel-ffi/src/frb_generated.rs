@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -175115739;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 489664469;
 
 // Section: executor
 
@@ -79,6 +79,106 @@ fn wire__crate__api__probe__echo_probe_impl(
         },
     )
 }
+fn wire__crate__api__config__export_profile_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "export_profile",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_dto = <crate::dto::profile::ProfileDto>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::config::export_profile(api_dto)?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__config__parse_profile_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "parse_profile",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_json = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::config::parse_profile(api_json)?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__config__profile_summary_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "profile_summary",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_dto = <crate::dto::profile::ProfileDto>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, ()>((move || {
+                    let output_ok =
+                        Result::<_, ()>::Ok(crate::api::config::profile_summary(api_dto))?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
 
 // Section: dart2rust
 
@@ -87,6 +187,13 @@ impl SseDecode for String {
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         let mut inner = <Vec<u8>>::sse_decode(deserializer);
         return String::from_utf8(inner).unwrap();
+    }
+}
+
+impl SseDecode for bool {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        deserializer.cursor.read_u8().unwrap() != 0
     }
 }
 
@@ -162,6 +269,53 @@ impl SseDecode for crate::api::probe::ProbeDto {
     }
 }
 
+impl SseDecode for crate::dto::profile::ProfileDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_id = <String>::sse_decode(deserializer);
+        let mut var_name = <String>::sse_decode(deserializer);
+        let mut var_protocol = <String>::sse_decode(deserializer);
+        let mut var_host = <String>::sse_decode(deserializer);
+        let mut var_port = <u16>::sse_decode(deserializer);
+        let mut var_authKind = <String>::sse_decode(deserializer);
+        let mut var_authSecretSource = <String>::sse_decode(deserializer);
+        let mut var_authPassphraseSource = <Option<String>>::sse_decode(deserializer);
+        let mut var_peerPublicKey = <Option<String>>::sse_decode(deserializer);
+        let mut var_dnsMode = <String>::sse_decode(deserializer);
+        let mut var_dnsServers = <Vec<String>>::sse_decode(deserializer);
+        let mut var_dohSni = <Option<String>>::sse_decode(deserializer);
+        let mut var_dohPath = <Option<String>>::sse_decode(deserializer);
+        let mut var_splitTunnel = <String>::sse_decode(deserializer);
+        let mut var_splitTunnelApps = <Vec<String>>::sse_decode(deserializer);
+        let mut var_killSwitch = <bool>::sse_decode(deserializer);
+        return crate::dto::profile::ProfileDto {
+            id: var_id,
+            name: var_name,
+            protocol: var_protocol,
+            host: var_host,
+            port: var_port,
+            auth_kind: var_authKind,
+            auth_secret_source: var_authSecretSource,
+            auth_passphrase_source: var_authPassphraseSource,
+            peer_public_key: var_peerPublicKey,
+            dns_mode: var_dnsMode,
+            dns_servers: var_dnsServers,
+            doh_sni: var_dohSni,
+            doh_path: var_dohPath,
+            split_tunnel: var_splitTunnel,
+            split_tunnel_apps: var_splitTunnelApps,
+            kill_switch: var_killSwitch,
+        };
+    }
+}
+
+impl SseDecode for u16 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        deserializer.cursor.read_u16::<NativeEndian>().unwrap()
+    }
+}
+
 impl SseDecode for u32 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -188,13 +342,6 @@ impl SseDecode for i32 {
     }
 }
 
-impl SseDecode for bool {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
-        deserializer.cursor.read_u8().unwrap() != 0
-    }
-}
-
 fn pde_ffi_dispatcher_primary_impl(
     func_id: i32,
     port: flutter_rust_bridge::for_generated::MessagePort,
@@ -205,6 +352,9 @@ fn pde_ffi_dispatcher_primary_impl(
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
         1 => wire__crate__api__probe__echo_probe_impl(port, ptr, rust_vec_len, data_len),
+        2 => wire__crate__api__config__export_profile_impl(port, ptr, rust_vec_len, data_len),
+        3 => wire__crate__api__config__parse_profile_impl(port, ptr, rust_vec_len, data_len),
+        4 => wire__crate__api__config__profile_summary_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -269,11 +419,53 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::probe::ProbeDto>
         self
     }
 }
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::dto::profile::ProfileDto {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.id.into_into_dart().into_dart(),
+            self.name.into_into_dart().into_dart(),
+            self.protocol.into_into_dart().into_dart(),
+            self.host.into_into_dart().into_dart(),
+            self.port.into_into_dart().into_dart(),
+            self.auth_kind.into_into_dart().into_dart(),
+            self.auth_secret_source.into_into_dart().into_dart(),
+            self.auth_passphrase_source.into_into_dart().into_dart(),
+            self.peer_public_key.into_into_dart().into_dart(),
+            self.dns_mode.into_into_dart().into_dart(),
+            self.dns_servers.into_into_dart().into_dart(),
+            self.doh_sni.into_into_dart().into_dart(),
+            self.doh_path.into_into_dart().into_dart(),
+            self.split_tunnel.into_into_dart().into_dart(),
+            self.split_tunnel_apps.into_into_dart().into_dart(),
+            self.kill_switch.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::dto::profile::ProfileDto
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::dto::profile::ProfileDto>
+    for crate::dto::profile::ProfileDto
+{
+    fn into_into_dart(self) -> crate::dto::profile::ProfileDto {
+        self
+    }
+}
 
 impl SseEncode for String {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         <Vec<u8>>::sse_encode(self.into_bytes(), serializer);
+    }
+}
+
+impl SseEncode for bool {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        serializer.cursor.write_u8(self as _).unwrap();
     }
 }
 
@@ -336,6 +528,35 @@ impl SseEncode for crate::api::probe::ProbeDto {
     }
 }
 
+impl SseEncode for crate::dto::profile::ProfileDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.id, serializer);
+        <String>::sse_encode(self.name, serializer);
+        <String>::sse_encode(self.protocol, serializer);
+        <String>::sse_encode(self.host, serializer);
+        <u16>::sse_encode(self.port, serializer);
+        <String>::sse_encode(self.auth_kind, serializer);
+        <String>::sse_encode(self.auth_secret_source, serializer);
+        <Option<String>>::sse_encode(self.auth_passphrase_source, serializer);
+        <Option<String>>::sse_encode(self.peer_public_key, serializer);
+        <String>::sse_encode(self.dns_mode, serializer);
+        <Vec<String>>::sse_encode(self.dns_servers, serializer);
+        <Option<String>>::sse_encode(self.doh_sni, serializer);
+        <Option<String>>::sse_encode(self.doh_path, serializer);
+        <String>::sse_encode(self.split_tunnel, serializer);
+        <Vec<String>>::sse_encode(self.split_tunnel_apps, serializer);
+        <bool>::sse_encode(self.kill_switch, serializer);
+    }
+}
+
+impl SseEncode for u16 {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        serializer.cursor.write_u16::<NativeEndian>(self).unwrap();
+    }
+}
+
 impl SseEncode for u32 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -359,13 +580,6 @@ impl SseEncode for i32 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
         serializer.cursor.write_i32::<NativeEndian>(self).unwrap();
-    }
-}
-
-impl SseEncode for bool {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
-        serializer.cursor.write_u8(self as _).unwrap();
     }
 }
 

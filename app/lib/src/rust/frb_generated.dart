@@ -3,9 +3,11 @@
 
 // ignore_for_file: unused_import, unused_element, unnecessary_import, duplicate_ignore, invalid_use_of_internal_member, annotate_overrides, non_constant_identifier_names, curly_braces_in_flow_control_structures, prefer_const_literals_to_create_immutables, unused_field
 
+import 'api/config.dart';
 import 'api/probe.dart';
 import 'dart:async';
 import 'dart:convert';
+import 'dto/profile.dart';
 import 'frb_generated.dart';
 import 'frb_generated.io.dart'
     if (dart.library.js_interop) 'frb_generated.web.dart';
@@ -64,7 +66,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => -175115739;
+  int get rustContentHash => 489664469;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -77,6 +79,12 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
 
 abstract class RustLibApi extends BaseApi {
   Future<ProbeDto> crateApiProbeEchoProbe({required ProbeDto input});
+
+  Future<String> crateApiConfigExportProfile({required ProfileDto dto});
+
+  Future<ProfileDto> crateApiConfigParseProfile({required String json});
+
+  Future<String> crateApiConfigProfileSummary({required ProfileDto dto});
 }
 
 class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
@@ -115,6 +123,90 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiProbeEchoProbeConstMeta =>
       const TaskConstMeta(debugName: "echo_probe", argNames: ["input"]);
 
+  @override
+  Future<String> crateApiConfigExportProfile({required ProfileDto dto}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_box_autoadd_profile_dto(dto, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 2,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiConfigExportProfileConstMeta,
+        argValues: [dto],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiConfigExportProfileConstMeta =>
+      const TaskConstMeta(debugName: "export_profile", argNames: ["dto"]);
+
+  @override
+  Future<ProfileDto> crateApiConfigParseProfile({required String json}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(json, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 3,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_profile_dto,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiConfigParseProfileConstMeta,
+        argValues: [json],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiConfigParseProfileConstMeta =>
+      const TaskConstMeta(debugName: "parse_profile", argNames: ["json"]);
+
+  @override
+  Future<String> crateApiConfigProfileSummary({required ProfileDto dto}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_box_autoadd_profile_dto(dto, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 4,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiConfigProfileSummaryConstMeta,
+        argValues: [dto],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiConfigProfileSummaryConstMeta =>
+      const TaskConstMeta(debugName: "profile_summary", argNames: ["dto"]);
+
   @protected
   String dco_decode_String(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
@@ -122,9 +214,21 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  bool dco_decode_bool(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as bool;
+  }
+
+  @protected
   ProbeDto dco_decode_box_autoadd_probe_dto(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return dco_decode_probe_dto(raw);
+  }
+
+  @protected
+  ProfileDto dco_decode_box_autoadd_profile_dto(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_profile_dto(raw);
   }
 
   @protected
@@ -174,6 +278,38 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  ProfileDto dco_decode_profile_dto(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 16)
+      throw Exception('unexpected arr length: expect 16 but see ${arr.length}');
+    return ProfileDto(
+      id: dco_decode_String(arr[0]),
+      name: dco_decode_String(arr[1]),
+      protocol: dco_decode_String(arr[2]),
+      host: dco_decode_String(arr[3]),
+      port: dco_decode_u_16(arr[4]),
+      authKind: dco_decode_String(arr[5]),
+      authSecretSource: dco_decode_String(arr[6]),
+      authPassphraseSource: dco_decode_opt_String(arr[7]),
+      peerPublicKey: dco_decode_opt_String(arr[8]),
+      dnsMode: dco_decode_String(arr[9]),
+      dnsServers: dco_decode_list_String(arr[10]),
+      dohSni: dco_decode_opt_String(arr[11]),
+      dohPath: dco_decode_opt_String(arr[12]),
+      splitTunnel: dco_decode_String(arr[13]),
+      splitTunnelApps: dco_decode_list_String(arr[14]),
+      killSwitch: dco_decode_bool(arr[15]),
+    );
+  }
+
+  @protected
+  int dco_decode_u_16(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as int;
+  }
+
+  @protected
   int dco_decode_u_32(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as int;
@@ -199,9 +335,21 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  bool sse_decode_bool(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getUint8() != 0;
+  }
+
+  @protected
   ProbeDto sse_decode_box_autoadd_probe_dto(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_probe_dto(deserializer));
+  }
+
+  @protected
+  ProfileDto sse_decode_box_autoadd_profile_dto(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_profile_dto(deserializer));
   }
 
   @protected
@@ -268,6 +416,51 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  ProfileDto sse_decode_profile_dto(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_id = sse_decode_String(deserializer);
+    var var_name = sse_decode_String(deserializer);
+    var var_protocol = sse_decode_String(deserializer);
+    var var_host = sse_decode_String(deserializer);
+    var var_port = sse_decode_u_16(deserializer);
+    var var_authKind = sse_decode_String(deserializer);
+    var var_authSecretSource = sse_decode_String(deserializer);
+    var var_authPassphraseSource = sse_decode_opt_String(deserializer);
+    var var_peerPublicKey = sse_decode_opt_String(deserializer);
+    var var_dnsMode = sse_decode_String(deserializer);
+    var var_dnsServers = sse_decode_list_String(deserializer);
+    var var_dohSni = sse_decode_opt_String(deserializer);
+    var var_dohPath = sse_decode_opt_String(deserializer);
+    var var_splitTunnel = sse_decode_String(deserializer);
+    var var_splitTunnelApps = sse_decode_list_String(deserializer);
+    var var_killSwitch = sse_decode_bool(deserializer);
+    return ProfileDto(
+      id: var_id,
+      name: var_name,
+      protocol: var_protocol,
+      host: var_host,
+      port: var_port,
+      authKind: var_authKind,
+      authSecretSource: var_authSecretSource,
+      authPassphraseSource: var_authPassphraseSource,
+      peerPublicKey: var_peerPublicKey,
+      dnsMode: var_dnsMode,
+      dnsServers: var_dnsServers,
+      dohSni: var_dohSni,
+      dohPath: var_dohPath,
+      splitTunnel: var_splitTunnel,
+      splitTunnelApps: var_splitTunnelApps,
+      killSwitch: var_killSwitch,
+    );
+  }
+
+  @protected
+  int sse_decode_u_16(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getUint16();
+  }
+
+  @protected
   int sse_decode_u_32(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getUint32();
@@ -291,15 +484,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
-  bool sse_decode_bool(SseDeserializer deserializer) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    return deserializer.buffer.getUint8() != 0;
-  }
-
-  @protected
   void sse_encode_String(String self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_list_prim_u_8_strict(utf8.encoder.convert(self), serializer);
+  }
+
+  @protected
+  void sse_encode_bool(bool self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putUint8(self ? 1 : 0);
   }
 
   @protected
@@ -309,6 +502,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_probe_dto(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_profile_dto(
+    ProfileDto self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_profile_dto(self, serializer);
   }
 
   @protected
@@ -363,6 +565,33 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_profile_dto(ProfileDto self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.id, serializer);
+    sse_encode_String(self.name, serializer);
+    sse_encode_String(self.protocol, serializer);
+    sse_encode_String(self.host, serializer);
+    sse_encode_u_16(self.port, serializer);
+    sse_encode_String(self.authKind, serializer);
+    sse_encode_String(self.authSecretSource, serializer);
+    sse_encode_opt_String(self.authPassphraseSource, serializer);
+    sse_encode_opt_String(self.peerPublicKey, serializer);
+    sse_encode_String(self.dnsMode, serializer);
+    sse_encode_list_String(self.dnsServers, serializer);
+    sse_encode_opt_String(self.dohSni, serializer);
+    sse_encode_opt_String(self.dohPath, serializer);
+    sse_encode_String(self.splitTunnel, serializer);
+    sse_encode_list_String(self.splitTunnelApps, serializer);
+    sse_encode_bool(self.killSwitch, serializer);
+  }
+
+  @protected
+  void sse_encode_u_16(int self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putUint16(self);
+  }
+
+  @protected
   void sse_encode_u_32(int self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     serializer.buffer.putUint32(self);
@@ -383,11 +612,5 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   void sse_encode_i_32(int self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     serializer.buffer.putInt32(self);
-  }
-
-  @protected
-  void sse_encode_bool(bool self, SseSerializer serializer) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    serializer.buffer.putUint8(self ? 1 : 0);
   }
 }
