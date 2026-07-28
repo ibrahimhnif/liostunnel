@@ -48,8 +48,13 @@ class ConnectionModel extends ChangeNotifier {
         _state = state;
         // Numbers left on screen after a tunnel stops read as live traffic.
         if (state != 'Connected') _zeroStats();
-        // A banner that outlives its cause is worse than no banner.
-        _lastFault = null;
+        // Cleared only on success. Clearing on EVERY state event wiped the
+        // banner that had just been raised: a helper dying mid-connect fails
+        // the in-flight request (scheduling applyError) and then synthesises
+        // StateEvent('Disconnected') — the error microtask ran first and the
+        // state event erased it, so the spinner stopped and nothing else
+        // appeared.
+        if (state == 'Connected') _lastFault = null;
       case StatsEvent(
         :final bytesUp,
         :final bytesDown,

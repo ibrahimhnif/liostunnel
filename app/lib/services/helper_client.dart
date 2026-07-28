@@ -185,11 +185,20 @@ class HelperClient {
       if (_closed) return;
       try {
         await _open();
-        await hello();
+        // Bounded: `hello()` settles only on an ack, so a helper that accepts
+        // the connection and never answers used to park the retry callback
+        // forever — the loop stopped for the life of the process, and
+        // `isRetrying` read false because the timer had already fired.
+        await hello().timeout(const Duration(seconds: 5));
+        // And ASK where things stand. The helper emits state on transition or
+        // on request, so without this the app kept displaying the
+        // 'Disconnected' that `_onDropped` synthesised rather than what the
+        // helper actually reports.
+        await getStatus().timeout(const Duration(seconds: 5));
         if (!_reconnected.isCompleted) _reconnected.complete();
         _reconnected = Completer<void>();
       } catch (_) {
-        _scheduleRetry();
+        if (!_closed) _scheduleRetry();
       }
     });
   }

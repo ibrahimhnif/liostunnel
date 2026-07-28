@@ -219,11 +219,6 @@ impl Tunnel {
             ipv6_available: manager.ipv6_available(),
         };
 
-        // Recover anything a previously killed run left behind before
-        // installing anything new. Survives kill -9, which neither
-        // RouteGuard's Drop nor a signal handler can.
-        liostunnel_core::route::state::recover_if_stale(&paths.applied_routes)?;
-
         // Record before applying. A crash between these two lines leaves a
         // record of routes that were never installed, and reverting those is
         // harmless; the reverse order loses them entirely. Do not "optimise"
@@ -397,7 +392,26 @@ impl Tunnel {
 /// most ONE trailing line ending, so a file ending in `\n\n`, a space, or a
 /// CRLF pair sends a credential that differs from the one the user believes
 /// they stored — and the server's only reply is a flat rejection.
+/// The final byte, without reading the file.
+///
+/// The caller names this path, so `std::fs::read` here was a caller-chosen
+/// allocation inside a root daemon — an 8 GB file would OOM it mid-tunnel.
+fn last_byte_of(path: &Path) -> Option<u8> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    f.seek(SeekFrom::End(-1)).ok()?;
+    let mut b = [0u8; 1];
+    f.read_exact(&mut b).ok()?;
+    Some(b[0])
+}
+
 fn describe_connect_attempt(user: &str, profile: &ServerProfile) {
+    // Nothing below is built unless the level is actually on. `tracing`'s
+    // macro gates emission, not the construction of its arguments, so the
+    // work happened on every connect regardless.
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
 
@@ -409,9 +423,7 @@ fn describe_connect_attempt(user: &str, profile: &ServerProfile) {
                 Ok(m) => {
                     // Only the final byte is inspected, and only to classify
                     // it as whitespace or not.
-                    let trailing = std::fs::read(path)
-                        .ok()
-                        .and_then(|b| b.last().copied())
+                    let trailing = last_byte_of(path)
                         .map(|b| match b {
                             b'\n' => "ends with LF (one is stripped, more are not)",
                             b'\r' => "ends with CR — likely a CRLF file",
@@ -468,6 +480,19 @@ fn parse_route_mode(
                 ));
             }
             reject_full_default_prefixes(&parsed)?;
+            // `reject_full_default_prefixes` only rejects /0. The classic
+            // split-default pair `0.0.0.0/1` + `128.0.0.0/1` walks past it and
+            // covers the whole address space — and `test` mode installs NO
+            // server pin through the original gateway, unlike `default` mode.
+            // The SSH session's own packets then route into the tunnel that
+            // carries them: total connectivity loss, reachable from the
+            // unprivileged socket, persisting until an explicit disconnect.
+            if let Some(bad) = parsed.iter().find(|c| c.prefix_len() <= 1) {
+                return Err(StartError::BadRouteMode(format!(
+                    "{bad} is too broad for test mode, which installs no route \
+                     to the server itself; use default mode to capture everything"
+                )));
+            }
             Ok(RouteMode::Test {
                 cidrs: parsed,
                 capture_dns,
@@ -628,6 +653,46 @@ mod tests {
         let mut params = params_with_file_secret(&p);
         params.cidrs = vec![];
         assert!(Tunnel::authorize_params(&params, me()).is_err());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_split_default_pair_in_test_mode_is_refused() {
+        // reject_full_default_prefixes only rejects /0, so this pair walked
+        // past it — and test mode installs NO route to the server through the
+        // original gateway, unlike default mode. The SSH session's own packets
+        // would route into the tunnel carrying them: total connectivity loss,
+        // reachable from the unprivileged socket.
+        let d = scratch("split-default");
+        let p = owned_secret(&d);
+        let mut params = params_with_file_secret(&p);
+        params.cidrs = vec!["0.0.0.0/1".into(), "128.0.0.0/1".into()];
+        assert!(matches!(
+            Tunnel::authorize_params(&params, me()),
+            Err(StartError::BadRouteMode(_))
+        ));
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_single_half_of_the_default_route_is_refused_too() {
+        // One /1 is half the internet and still has no server pin behind it.
+        let d = scratch("one-half");
+        let p = owned_secret(&d);
+        let mut params = params_with_file_secret(&p);
+        params.cidrs = vec!["0.0.0.0/1".into()];
+        assert!(Tunnel::authorize_params(&params, me()).is_err());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn an_ordinary_prefix_is_still_accepted() {
+        // The guard must not swallow legitimate use.
+        let d = scratch("ordinary");
+        let p = owned_secret(&d);
+        let mut params = params_with_file_secret(&p);
+        params.cidrs = vec!["10.0.0.0/8".into(), "93.184.216.34/32".into()];
+        assert!(Tunnel::authorize_params(&params, me()).is_ok());
         std::fs::remove_dir_all(&d).ok();
     }
 

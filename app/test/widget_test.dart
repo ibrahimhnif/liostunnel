@@ -103,6 +103,29 @@ void main() {
     expect(button.onPressed, isNull);
   });
 
+  testWidgets('a running tunnel can be stopped without a profile selected',
+      (tester) async {
+    // `_selected` is null on every relaunch, and the app then asks the helper
+    // for status and is told Connected. Requiring a profile here left the
+    // button greyed out with no way to stop the tunnel at all.
+    var stopped = false;
+    final m = ConnectionModel()..applyEvent(const StateEvent('Connected'));
+    await tester.pumpWidget(wrap(
+      m,
+      ConnectionScreen(
+        selected: null,
+        onConnect: () {},
+        onDisconnect: () => stopped = true,
+      ),
+    ));
+    final button = tester.widget<FilledButton>(
+      find.byKey(const Key('connect-button')),
+    );
+    expect(button.onPressed, isNotNull, reason: 'Disconnect needs no profile');
+    await tester.tap(find.byKey(const Key('connect-button')));
+    expect(stopped, isTrue);
+  });
+
   testWidgets('no error banner when nothing has gone wrong', (tester) async {
     await tester.pumpWidget(
       wrap(

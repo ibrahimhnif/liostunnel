@@ -90,6 +90,18 @@ void main() {
     }
   });
 
+  test('a Disconnected event does not erase the error that caused it', () {
+    // The helper dying mid-connect fails the in-flight request AND emits a
+    // synthetic Disconnected. Clearing on every state event meant the second
+    // wiped the first, so the user saw the spinner stop and nothing else.
+    final m = ConnectionModel()
+      ..applyError(const HelperUnavailable())
+      ..applyEvent(const StateEvent('Disconnected'));
+    expect(m.lastFault, Fault.helperNotInstalled,
+        reason: 'the banner must survive the disconnect that produced it');
+    expect(m.userFacingError, isNotNull);
+  });
+
   test('a successful action clears the previous fault', () {
     final m = ConnectionModel()..applyError(const HelperUnavailable());
     expect(m.lastFault, isNotNull);

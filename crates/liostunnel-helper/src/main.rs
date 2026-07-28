@@ -63,6 +63,15 @@ fn main() -> std::process::ExitCode {
 
     let paths = HelperPaths::beside_socket(&args.socket);
 
+    // Before serving anything. A previous run killed with SIGKILL leaves its
+    // routes installed, and this used to run inside `Tunnel::start` — so they
+    // stayed until some client happened to ask for a connection. A user whose
+    // network is broken does not open the VPN app; they conclude it is
+    // broken. Recovery must not wait for them.
+    if let Err(e) = liostunnel_core::route::state::recover_if_stale(&paths.applied_routes) {
+        tracing::error!(error = %e, "could not recover routes from a previous run");
+    }
+
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -180,6 +189,12 @@ async fn serve_one(
                 }
             }
             _ = ticker.tick() => {
+                // A client refused at the version gate kept receiving a stats
+                // frame every second, and `interval`'s first tick fires
+                // immediately, so one could arrive before `hello` was even
+                // parsed. dispatch.rs says a client told to reinstall must not
+                // then be served; for this stream it was decorative.
+                if !sess.is_greeted() { continue }
                 let Some(t) = tunnel.as_ref() else { continue };
                 // An engine that exited on its own leaves routes installed
                 // with nothing behind them. Phase 0 had to fix exactly this

@@ -68,11 +68,13 @@ class ConnectionScreen extends StatelessWidget {
                 const SizedBox(width: 16),
                 FilledButton(
                   key: const Key('connect-button'),
-                  // Disabled without a profile: a connect with nothing
-                  // selected can only produce an error the user cannot act on.
-                  onPressed: dto == null
-                      ? null
-                      : (m.isConnected ? onDisconnect : onConnect),
+                  // Connect needs a profile; DISCONNECT DOES NOT. `_selected`
+                  // is null on every relaunch, so requiring one here left a
+                  // freshly-launched app showing "Connected" with a greyed-out
+                  // Disconnect and no way to stop the tunnel at all.
+                  onPressed: m.isConnected
+                      ? onDisconnect
+                      : (dto == null ? null : onConnect),
                   child: Text(m.isConnected ? 'Disconnect' : 'Connect'),
                 ),
               ],

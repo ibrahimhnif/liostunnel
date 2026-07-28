@@ -43,6 +43,14 @@ impl Session {
         }
     }
 
+    /// True once a `hello` with a matching protocol version has been acked.
+    ///
+    /// A refused hello leaves this false, so nothing downstream serves a
+    /// client that was told to reinstall.
+    pub fn is_greeted(&self) -> bool {
+        self.greeted
+    }
+
     pub fn is_connected(&self) -> bool {
         self.connected
     }
