@@ -118,6 +118,7 @@ void main() {
 
   usernameTests();
   editTests();
+  dohTests();
 
   test('a fresh id is a distinct UUID each time', () async {
     final a = await newProfileId();
@@ -277,6 +278,52 @@ void editTests() {
     expect(File('${f.path}.user').existsSync(), isFalse);
     expect(File(secret.substring(5)).existsSync(), isTrue,
         reason: 'the credential is left where it is');
+    dir.deleteSync(recursive: true);
+  });
+}
+
+// Selecting DNS-over-HTTPS without an endpoint used to save happily and fail
+// at connect time — in a different process, minutes later, about a field the
+// form never asked for.
+void dohTests() {
+  ProfileDto doh({String? sni, String? path}) => ProfileDto(
+        id: 'b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f',
+        name: 'DoH',
+        protocol: 'ssh',
+        host: 'h.example',
+        port: 22,
+        authKind: 'password',
+        authSecretSource: 'file:/tmp/k',
+        dnsMode: 'https',
+        dnsServers: const ['1.1.1.1'],
+        dohSni: sni,
+        dohPath: path,
+        splitTunnel: 'all_traffic',
+        splitTunnelApps: const [],
+        killSwitch: false,
+      );
+
+  test('DoH without an endpoint is refused at save time', () async {
+    await expectLater(checkProfile(dto: doh()), throwsA(anything));
+  });
+
+  test('a DoH path that is not a path is refused', () async {
+    await expectLater(
+      checkProfile(dto: doh(sni: 'cloudflare-dns.com', path: 'dns-query')),
+      throwsA(anything),
+    );
+  });
+
+  test('a complete DoH profile round-trips with its endpoint', () async {
+    final dto = doh(sni: 'cloudflare-dns.com', path: '/dns-query');
+    await expectLater(checkProfile(dto: dto), completes);
+
+    final dir = Directory.systemTemp.createTempSync('lios-doh');
+    final file = await ProfileWriter(directory: dir.path).writeProfile(dto);
+    final back = await parseProfile(json: file.readAsStringSync());
+    expect(back.dnsMode, 'https');
+    expect(back.dohSni, 'cloudflare-dns.com');
+    expect(back.dohPath, '/dns-query');
     dir.deleteSync(recursive: true);
   });
 }

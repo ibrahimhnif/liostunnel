@@ -41,6 +41,8 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
   final _dns = TextEditingController();
   final _secretPath = TextEditingController();
   final _secret = TextEditingController();
+  final _dohSni = TextEditingController();
+  final _dohPath = TextEditingController();
 
   String _authKind = 'password';
   String _secretMode = 'file';
@@ -59,6 +61,8 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       _name.text = 'My server';
       _port.text = '22';
       _dns.text = '1.1.1.1, 1.0.0.1';
+      _dohSni.text = 'cloudflare-dns.com';
+      _dohPath.text = '/dns-query';
       return;
     }
     _name.text = p.name;
@@ -68,6 +72,8 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
     _dns.text = p.dnsServers.join(', ');
     _dnsMode = p.dnsMode;
     _authKind = p.authKind;
+    _dohSni.text = p.dohSni ?? 'cloudflare-dns.com';
+    _dohPath.text = p.dohPath ?? '/dns-query';
 
     // The profile records where the secret lives, so the form can show that
     // much. A password typed on a previous visit is NOT recoverable — it was
@@ -84,7 +90,17 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
 
   @override
   void dispose() {
-    for (final c in [_name, _host, _port, _user, _dns, _secretPath, _secret]) {
+    for (final c in [
+      _name,
+      _host,
+      _port,
+      _user,
+      _dns,
+      _secretPath,
+      _secret,
+      _dohSni,
+      _dohPath,
+    ]) {
       c.dispose();
     }
     super.dispose();
@@ -116,6 +132,10 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
         authKind: _authKind,
         authSecretSource: source,
         dnsMode: _dnsMode,
+        // Only meaningful for DoH, and required there — a profile with mode
+        // `https` and no endpoint is refused by the helper at connect time.
+        dohSni: _dnsMode == 'https' ? _dohSni.text.trim() : null,
+        dohPath: _dnsMode == 'https' ? _dohPath.text.trim() : null,
         dnsServers: _dns.text
             .split(',')
             .map((s) => s.trim())
@@ -291,7 +311,27 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
               ],
               onChanged: (v) => setState(() => _dnsMode = v!),
             ),
-            _text(_dns, 'DNS servers', key: 'f-dns', hint: '1.1.1.1, 1.0.0.1'),
+            _text(
+              _dns,
+              'DNS servers',
+              key: 'f-dns',
+              hint: '1.1.1.1, 1.0.0.1',
+              help: _dnsMode == 'https'
+                  ? 'The IP of the DoH endpoint. No bootstrap lookup is done, '
+                      'so this must be an address, not a name.'
+                  : 'Tried in order, five seconds each. Many tunnel providers '
+                      'block outbound port 53 — if lookups are slow or fail, '
+                      'switch to DNS over HTTPS, which uses 443.',
+            ),
+            if (_dnsMode == 'https') ...[
+              _text(_dohSni, 'DoH server name', key: 'f-doh-sni',
+                  hint: 'cloudflare-dns.com'),
+              _text(_dohPath, 'DoH path', key: 'f-doh-path',
+                  hint: '/dns-query',
+                  validator: (v) => (v == null || !v.startsWith('/'))
+                      ? 'must start with /'
+                      : null),
+            ],
 
             const SizedBox(height: 24),
             FilledButton(

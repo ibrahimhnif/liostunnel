@@ -61,6 +61,23 @@ pub fn check_profile(dto: ProfileDto) -> Result<(), String> {
     if core.dns.servers.is_empty() {
         return Err("at least one DNS server is required".into());
     }
+    // Mirrors ServerProfile::validate's DoH rules. Without these the editor
+    // happily saved a profile with mode `https` and no endpoint, which the
+    // helper then refused at connect time — the failure arriving minutes
+    // later, from a different process, about a field the form never asked
+    // for.
+    if core.dns.mode == liostunnel_core::config::profile::DnsMode::Https {
+        match &core.dns.https {
+            None => return Err("DNS-over-HTTPS needs a server name and path".into()),
+            Some(d) if d.sni.trim().is_empty() => {
+                return Err("the DoH server name must not be empty".into());
+            }
+            Some(d) if !d.path.starts_with('/') => {
+                return Err("the DoH path must start with `/`".into());
+            }
+            Some(_) => {}
+        }
+    }
     Ok(())
 }
 
