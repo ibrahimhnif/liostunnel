@@ -52,7 +52,10 @@ use crate::dns::{MAX_UDP_PAYLOAD, Resolver};
 use crate::error::TunnelError;
 use crate::protocols::Protocol;
 
-const HTTPS_PORT: u16 = 443;
+/// Where a DoH resolver is contacted, defined once: `ShadowsocksTunnel`'s
+/// connect-time probe has to reach the *same* port this resolver will, or a
+/// DoH profile is probed somewhere the resolver never listens.
+pub(crate) const HTTPS_PORT: u16 = 443;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 const MEDIA_TYPE: &str = "application/dns-message";
 
@@ -103,7 +106,11 @@ pub fn build_doh_request(
         .map_err(|e| TunnelError::Dns(format!("cannot build DoH request: {e}")))
 }
 
-fn tls_config() -> Arc<rustls::ClientConfig> {
+/// `pub(crate)` for the same reason as [`HTTPS_PORT`]: `ShadowsocksTunnel`'s
+/// connect-time probe performs the identical handshake against the identical
+/// roots, and a second, separately-configured client config would be a
+/// trust decision made twice.
+pub(crate) fn tls_config() -> Arc<rustls::ClientConfig> {
     let roots = rustls::RootCertStore {
         roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
     };

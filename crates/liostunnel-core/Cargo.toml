@@ -44,4 +44,7 @@ doh = [
 ]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "time"] }
+# `test-util` is what makes `#[tokio::test(start_paused = true)]` available:
+# the probe's timeout test would otherwise burn 8s of real wall clock, which
+# was the whole module's runtime.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "time", "test-util"] }

@@ -24,7 +24,9 @@ use shadowsocks::context::Context;
 use shadowsocks::crypto::CipherKind;
 use shadowsocks::relay::socks5::Address;
 
-use crate::config::profile::{AuthMethod, ProtocolKind, ServerProfile};
+use crate::config::profile::{
+    AuthMethod, DnsConfig, DnsMode, DohConfig, ProtocolKind, ServerProfile,
+};
 use crate::config::secret::{Redacted, SecretRef, SecretStore};
 use crate::error::TunnelError;
 use crate::protocols::counting::CountingStream;
@@ -73,6 +75,12 @@ const MAX_CONCURRENT_FLOWS: usize = 64;
 /// `ssh::MAX_CONCURRENT_DNS_CHANNELS`, and matters here specifically because
 /// `open_dns_stream` relays over the same transport as everything else.
 const MAX_CONCURRENT_DNS_FLOWS: usize = 8;
+
+/// Where a `DnsMode::Tcp` resolver is contacted (RFC 7766). The DoH port
+/// deliberately is not spelled here: it lives on the resolver that uses it
+/// (`dns::over_https::HTTPS_PORT`), so the probe and the resolver cannot
+/// drift apart.
+const DNS_PORT: u16 = 53;
 
 #[derive(Default)]
 struct Counters {
@@ -240,9 +248,10 @@ impl ShadowsocksTunnel {
     /// returning `Ok` would mean "a socket opened" -- the UI would report
     /// Connected, routes would be installed, and nothing would carry.
     ///
-    /// One DNS query over a relayed stream, using the profile's own
-    /// resolver. If bytes come back, the cipher and password are right AND
-    /// the server relays traffic.
+    /// One round trip over a relayed stream to the profile's own resolver,
+    /// spoken the way that resolver is spoken to (`probe_over_dns` /
+    /// `probe_over_tls`). If bytes come back, the cipher and password are
+    /// right AND the server relays traffic.
     ///
     /// Drawn from the reserved DNS flow allowance (`dns_flow_limit`), not
     /// the general one (`open_tcp_stream`/`flow_limit`): this genuinely is a
@@ -256,39 +265,147 @@ impl ShadowsocksTunnel {
     /// This is not authentication in the SSH sense. It proves the server
     /// relays for these credentials; it does not identify the server.
     /// Shadowsocks offers no server identity at all.
-    async fn probe(&self, dns: SocketAddr) -> Result<(), TunnelError> {
+    ///
+    /// Follows `profile.dns.mode`, and must: a DoH profile's resolver is
+    /// contacted at `servers[0]:443` (`dns/over_https.rs`) and need not
+    /// serve plain DNS on 53 at all, so probing 53 unconditionally stalled a
+    /// DoH profile with *correct* credentials for the whole timeout and then
+    /// reported an auth failure.
+    async fn probe(&self, dns: &DnsConfig) -> Result<(), TunnelError> {
+        match tokio::time::timeout(Self::PROBE_TIMEOUT, self.probe_once(dns)).await {
+            Ok(r) => r,
+            // Deliberately not `Auth`. Running out of time says nothing
+            // about the credentials: an exit that cannot reach the
+            // configured resolver, or a network that stalls for eight
+            // seconds, produces exactly this, and telling that user their
+            // password is wrong sends them to change the one thing that was
+            // never at fault.
+            Err(_) => Err(TunnelError::Transport(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the tunnel did not carry a probe query to the configured resolver in time; \
+                 the exit may not be able to reach it",
+            ))),
+        }
+    }
+
+    async fn probe_once(&self, dns: &DnsConfig) -> Result<(), TunnelError> {
+        // Guarded by `ServerProfile::validate`, so this is a belt-and-braces
+        // arm rather than a reachable one -- but `connect` does not call
+        // `validate`, and the alternative here is indexing.
+        let Some(&server) = dns.servers.first() else {
+            return Err(TunnelError::config("dns.servers", "must not be empty"));
+        };
+
+        match dns.mode {
+            DnsMode::Tcp => self.probe_over_dns(SocketAddr::new(server, DNS_PORT)).await,
+            DnsMode::Https => self.probe_over_tls(server, dns.https.as_ref()).await,
+        }
+    }
+
+    /// `DnsMode::Tcp`: one RFC 7766-framed query to `servers[0]:53`. Two
+    /// bytes back is the whole proof -- they arrived through an AEAD tag
+    /// check, so a wrong-key server cannot have produced them.
+    async fn probe_over_dns(&self, dns: SocketAddr) -> Result<(), TunnelError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // A minimal A query for "." -- the smallest well-formed thing a
-        // resolver will answer. RFC 7766 framing: two-byte length prefix.
-        let query: [u8; 17] = [
-            0x00, 0x0f, // length
+        // resolver will answer. RFC 7766 §8 framing: two-byte length prefix.
+        // RFC 1035 §4.1.2: a question is QNAME, QTYPE(2), QCLASS(2), and all
+        // three are required. This declared 15 bytes and sent header(12) +
+        // root label(1) + QTYPE(2) -- one field short, and unparseable. It
+        // looked like it worked only because most resolvers answer FORMERR
+        // and two bytes of FORMERR read the same as two bytes of answer; a
+        // resolver that drops a malformed message instead answered nothing,
+        // and a correct password was reported as an auth failure.
+        let query: [u8; 19] = [
+            0x00, 0x11, // length: 17 bytes follow
             0xAB, 0xCD, // id
             0x01, 0x00, // standard query, recursion desired
             0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // root name
-            0x00, 0x01, // A
+            0x00, 0x01, // QTYPE  = A
+            0x00, 0x01, // QCLASS = IN
         ];
 
-        let fut = async {
-            let mut s = self.open_dns_stream(dns).await?;
-            s.write_all(&query).await?;
-            let mut len = [0u8; 2];
-            s.read_exact(&mut len).await.map_err(|_| {
-                TunnelError::Auth(
-                    "the server accepted the connection but returned nothing; \
-                     the cipher or password is probably wrong"
-                        .into(),
-                )
-            })?;
-            Ok::<(), TunnelError>(())
-        };
+        let mut s = self.open_dns_stream(dns).await?;
+        s.write_all(&query).await?;
+        let mut len = [0u8; 2];
+        s.read_exact(&mut len).await.map_err(|_| {
+            TunnelError::Auth(
+                "the server accepted the connection but returned nothing; \
+                 the cipher or password is probably wrong"
+                    .into(),
+            )
+        })?;
+        Ok(())
+    }
 
-        match tokio::time::timeout(Self::PROBE_TIMEOUT, fut).await {
-            Ok(r) => r,
-            Err(_) => Err(TunnelError::Auth(
-                "the server did not answer a probe query in time".into(),
-            )),
-        }
+    /// `DnsMode::Https`: relay to `servers[0]:443` and complete a TLS
+    /// handshake against the configured SNI, the same one `DohResolver` will
+    /// perform for every real query -- same `tls_config`, same roots, same
+    /// port, deliberately shared rather than re-derived here.
+    ///
+    /// A completed handshake is the same proof a DNS answer is: the
+    /// certificate, and every record carrying it, came back *through the
+    /// cipher*, which a wrong-key server cannot produce.
+    ///
+    /// `DohResolver` itself is not reused: it takes an `Arc<dyn Protocol>`,
+    /// and this runs inside `connect(&mut self)` where no such handle to
+    /// `self` exists or could be made without restructuring ownership around
+    /// a probe. The six lines below are the handshake and nothing else.
+    #[cfg(feature = "doh")]
+    async fn probe_over_tls(
+        &self,
+        server: std::net::IpAddr,
+        doh: Option<&DohConfig>,
+    ) -> Result<(), TunnelError> {
+        use crate::dns::over_https::{HTTPS_PORT, tls_config};
+
+        // Knowable before a byte is sent: without an SNI there is no
+        // handshake to attempt, so this must not cost the probe timeout
+        // first. `ServerProfile::validate` refuses it too, but `connect`
+        // does not call `validate`.
+        let Some(doh) = doh else {
+            return Err(TunnelError::config(
+                "dns.https",
+                "required when dns.mode is `https`",
+            ));
+        };
+        let name = rustls::pki_types::ServerName::try_from(doh.sni.clone()).map_err(|e| {
+            TunnelError::config(
+                "dns.https.sni",
+                format!("`{}` is not a server name: {e}", doh.sni),
+            )
+        })?;
+
+        let stream = self
+            .open_dns_stream(SocketAddr::new(server, HTTPS_PORT))
+            .await?;
+        tokio_rustls::TlsConnector::from(tls_config())
+            .connect(name, stream)
+            .await
+            // A rustls/IO error, never key material: the far end's
+            // certificate and alerts are all this can quote.
+            .map_err(|e| {
+                TunnelError::Auth(format!(
+                    "the server accepted the connection but no TLS handshake with the \
+                     resolver completed through it ({e}); the cipher or password is \
+                     probably wrong"
+                ))
+            })?;
+        Ok(())
+    }
+
+    /// Without `doh` there is no rustls in this build to handshake with,
+    /// and nothing can resolve for such a profile anyway (`dns::over_https`
+    /// is compiled out) -- so say that, rather than probe port 53 for a
+    /// resolver that was never asked to serve it.
+    #[cfg(not(feature = "doh"))]
+    async fn probe_over_tls(
+        &self,
+        _server: std::net::IpAddr,
+        _doh: Option<&DohConfig>,
+    ) -> Result<(), TunnelError> {
+        Err(TunnelError::Unsupported("dns-over-https"))
     }
 }
 
@@ -306,16 +423,13 @@ impl Protocol for ShadowsocksTunnel {
                 self.server = Some(server);
                 self.context = Some(context);
 
-                // The profile's first DNS server, asked over the tunnel
-                // just built. See `probe`'s doc for why this one round trip
+                // The profile's own resolver, asked over the tunnel just
+                // built, in whichever way the profile says that resolver is
+                // spoken to. See `probe`'s doc for why this one round trip
                 // is load-bearing: Shadowsocks has no handshake, so without
                 // it `Ok` here would mean nothing more than "a socket
                 // opened".
-                let probed = match profile.dns.servers.first() {
-                    Some(dns) => self.probe(SocketAddr::new(*dns, 53)).await,
-                    None => Err(TunnelError::config("dns.servers", "must not be empty")),
-                };
-                if let Err(e) = probed {
+                if let Err(e) = self.probe(&profile.dns).await {
                     // Same failure-state contract as the `Err` arm below: a
                     // tunnel whose credentials fail the probe must not be
                     // left `Connected`, or half-built with a server config
@@ -472,6 +586,23 @@ mod tests {
 
     fn profile(method: &str) -> ServerProfile {
         profile_at(method, "198.51.100.7", 8388)
+    }
+
+    /// The same profile with `dns.mode == https`, so the probe has to look at
+    /// the mode rather than assuming port 53. `resolver` is the DoH server's
+    /// IP literal -- never a name, per `over_https`'s bootstrap argument.
+    fn doh_profile_at(host: &str, port: u16, resolver: &str) -> ServerProfile {
+        serde_json::from_str(&format!(
+            r#"{{"id":"b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f","name":"SS",
+                "protocol":"shadowsocks","host":"{host}","port":{port},
+                "auth":{{"type":"shadowsocks","method":"aes-256-gcm",
+                        "password":{{"source":"file","path":"/tmp/k"}}}},
+                "dns":{{"mode":"https","servers":["{resolver}"],
+                        "https":{{"sni":"cloudflare-dns.com","path":"/dns-query"}}}},
+                "split_tunnel":{{"type":"all_traffic"}},
+                "kill_switch":false}}"#
+        ))
+        .unwrap()
     }
 
     /// Some destination to ask the tunnel for. Which one is irrelevant to
@@ -813,6 +944,341 @@ mod tests {
         addr
     }
 
+    // --- A real Shadowsocks server on loopback ---------------------------
+    //
+    // Everything above this line can be tested against a bare TCP socket,
+    // because everything above this line fails before a byte is decrypted.
+    // The probe cannot: the only way to tell "the probe correctly rejects
+    // bad credentials" from "the probe rejects everything" is to point it at
+    // a server that really does relay for the credentials it was given.
+    //
+    // `ProxyServerStream::from_stream` is exported unconditionally
+    // (`relay/tcprelay/proxy_stream/mod.rs`) and is not gated on
+    // `aead-cipher-2022`, so this stands up under the feature set this build
+    // pins.
+
+    /// What the loopback server below observed on one connection: the
+    /// destination the client asked it to relay to (from the Shadowsocks
+    /// request header) and the plaintext bytes that followed.
+    struct Probed {
+        dest: Address,
+        payload: Vec<u8>,
+    }
+
+    /// Hand-written so a failing assertion names the destination and prints
+    /// the bytes as hex -- a derived `Debug` over `Vec<u8>` renders decimal,
+    /// which is unreadable against an RFC's field layout.
+    impl fmt::Debug for Probed {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "{} bytes to {}: {:02x?}",
+                self.payload.len(),
+                self.dest,
+                self.payload
+            )
+        }
+    }
+
+    /// Everything the peer sent, gathered until it goes quiet, rather than
+    /// read to a length the peer itself declared. Reading exactly the framed
+    /// length would make any later assertion *about* that framing vacuously
+    /// true -- the bug in the probe's query was a length field that agreed
+    /// with a body missing a field.
+    async fn drain_briefly<S: tokio::io::AsyncRead + Unpin>(s: &mut S) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        while let Ok(Ok(n)) =
+            tokio::time::timeout(Duration::from_millis(150), s.read(&mut buf)).await
+        {
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        got
+    }
+
+    /// The probe's own resolver, in the only role that matters here: decide
+    /// whether this is a question it can answer. Returns the question's
+    /// QTYPE and QCLASS, or why the message is not a well-formed question.
+    ///
+    /// A real parser, deliberately: asserting that the probe's literal
+    /// equals a copy of the probe's literal proves nothing about whether the
+    /// bytes are a DNS message. RFC 1035 §4.1.2 -- a question is QNAME
+    /// (length-prefixed labels, terminated by a zero length) followed by
+    /// QTYPE(2) and QCLASS(2); RFC 7766 §8 -- over TCP the message is
+    /// preceded by its own two-byte length.
+    fn parse_dns_question(framed: &[u8]) -> Result<(u16, u16), String> {
+        if framed.len() < 2 {
+            return Err(format!(
+                "{} bytes is not even an RFC 7766 length prefix",
+                framed.len()
+            ));
+        }
+        let declared = usize::from(u16::from_be_bytes([framed[0], framed[1]]));
+        let msg = &framed[2..];
+        if declared != msg.len() {
+            return Err(format!(
+                "the length prefix declares {declared} bytes but {} follow",
+                msg.len()
+            ));
+        }
+        if msg.len() < 12 {
+            return Err(format!("{} bytes is short of a 12-byte header", msg.len()));
+        }
+        let qdcount = u16::from_be_bytes([msg[4], msg[5]]);
+        if qdcount != 1 {
+            return Err(format!("QDCOUNT is {qdcount}, not 1"));
+        }
+        // Walk the QNAME's length-prefixed labels to the root label.
+        let mut i = 12;
+        loop {
+            let label = usize::from(
+                *msg.get(i)
+                    .ok_or_else(|| "the QNAME runs past the end of the message".to_string())?,
+            );
+            if label >= 64 {
+                return Err(format!("`{label}` is not a plain label length"));
+            }
+            i += 1 + label;
+            if label == 0 {
+                break;
+            }
+        }
+        let rest = msg.len().saturating_sub(i);
+        if rest != 4 {
+            return Err(format!(
+                "the question carries {rest} bytes after the QNAME; QTYPE(2) + QCLASS(2) is 4"
+            ));
+        }
+        Ok((
+            u16::from_be_bytes([msg[i], msg[i + 1]]),
+            u16::from_be_bytes([msg[i + 2], msg[i + 3]]),
+        ))
+    }
+
+    /// A real Shadowsocks server on loopback, keyed with `method`/`password`,
+    /// standing in for the profile's exit. It decrypts one connection, reads
+    /// the request header, and answers *only* a well-formed DNS question.
+    ///
+    /// Answering selectively is the point, not decoration: a server that
+    /// echoed anything back would let the probe pass with a query no
+    /// resolver would answer, which is exactly how the malformed query
+    /// (missing QCLASS) survived. Refusing to answer models the resolver
+    /// that drops a malformed message rather than returning FORMERR.
+    ///
+    /// Keyed *differently* from the client, it models the bug this task is
+    /// named after: `handshake` below fails in the AEAD tag check without
+    /// the server ever reading a plaintext byte, and the socket drops.
+    async fn a_shadowsocks_server_keyed_with(
+        method: &str,
+        password: &str,
+    ) -> (SocketAddr, tokio::sync::oneshot::Receiver<Probed>) {
+        use shadowsocks::relay::tcprelay::ProxyServerStream;
+        use tokio::io::AsyncWriteExt;
+
+        let cipher = CipherKind::from_str(method).expect("the test's own cipher must build");
+        // The address is irrelevant to the wire protocol -- only the cipher
+        // and password feed key derivation -- but `ServerConfig` wants one.
+        let cfg = ServerConfig::new(("127.0.0.1".to_string(), 1), password.to_string(), cipher)
+            .expect("the test's own key must derive");
+        let key = cfg.key().to_vec();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            let ctx = Context::new_shared(ServerType::Server);
+            let mut s = ProxyServerStream::from_stream(ctx, sock, cipher, &key);
+            // A wrong key dies here, in the tag check over the request
+            // header: the server never reads a plaintext byte. Returning
+            // drops the socket, which the client sees as EOF -- the
+            // silent-discard behaviour the spec describes.
+            let Ok(dest) = s.handshake().await else {
+                return;
+            };
+            let payload = drain_briefly(&mut s).await;
+            let answerable = parse_dns_question(&payload).is_ok();
+            let _ = tx.send(Probed {
+                dest,
+                payload: payload.clone(),
+            });
+            if !answerable {
+                return;
+            }
+            // Any bytes back through the cipher prove the relay works,
+            // which is all the probe reads for. The answer's own shape is
+            // beside the point.
+            let _ = s.write_all(&payload).await;
+            let _ = s.flush().await;
+            // Held open rather than dropped: a drop would surface at the
+            // client as an EOF, the *other* outcome the probe distinguishes.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+        (addr, rx)
+    }
+
+    async fn what_the_server_saw(rx: tokio::sync::oneshot::Receiver<Probed>) -> Probed {
+        tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .expect("the probe must have opened a relayed stream")
+            .expect("the server must have decrypted the request header")
+    }
+
+    /// Finding 2. Nothing in the repo asserted that `connect` can return
+    /// `Ok` at all: every call site in this module expected an error, and
+    /// `ShadowsocksTunnel` is referenced nowhere else in the workspace. A
+    /// probe that rejected *everything* -- including one whose query no
+    /// resolver would answer -- left the suite entirely green, and the suite
+    /// could not tell that from a probe that correctly rejects bad
+    /// credentials.
+    #[tokio::test]
+    async fn connect_succeeds_against_a_server_that_relays_for_these_credentials() {
+        let (server, probed) = a_shadowsocks_server_keyed_with("aes-256-gcm", PW).await;
+        let p = profile_at("aes-256-gcm", &server.ip().to_string(), server.port());
+
+        let mut t = ShadowsocksTunnel::new();
+        t.connect(&p, &FixedSecret(PW))
+            .await
+            .expect("a server that relays for these credentials is a connection");
+
+        assert_eq!(
+            t.stats().state,
+            ConnectionState::Connected,
+            "a probe the server answered must settle on Connected"
+        );
+        let seen = what_the_server_saw(probed).await;
+        assert_eq!(
+            parse_dns_question(&seen.payload).map(|(t, _)| t),
+            Ok(1),
+            "precondition: the server answered because the question parsed"
+        );
+    }
+
+    /// Finding 2, the other half, and the bug this task is named after: a
+    /// server keyed differently cannot produce a readable byte -- every
+    /// chunk goes through an AEAD tag check -- so `connect` must refuse.
+    /// Nothing in the suite exercised a wrong password at all.
+    #[tokio::test]
+    async fn connect_fails_when_the_password_is_wrong() {
+        let (server, _probed) =
+            a_shadowsocks_server_keyed_with("aes-256-gcm", "the-servers-actual-password").await;
+        let p = profile_at("aes-256-gcm", &server.ip().to_string(), server.port());
+
+        let mut t = ShadowsocksTunnel::new();
+        let err = t
+            .connect(&p, &FixedSecret(PW))
+            .await
+            .expect_err("a server that cannot decrypt for us is not a connection");
+
+        assert!(matches!(err, TunnelError::Auth(_)), "got {err:?}");
+        assert!(
+            !format!("{err:?}").contains(PW),
+            "it leaks the password: {err:?}"
+        );
+        assert_eq!(t.stats().state, ConnectionState::Failed);
+        let flow = flow_error(
+            t.open_tcp_stream(dest()).await,
+            "the tunnel must not have retained a config the probe disproved",
+        );
+        assert!(
+            format!("{flow}").contains("not connected"),
+            "nothing may be retained from a connect the probe refused: {flow}"
+        );
+    }
+
+    /// Finding 1. The probe's query declared a 15-byte message that was
+    /// header(12) + root label(1) + QTYPE(2) -- one field short, because a
+    /// question is QNAME + QTYPE + QCLASS. It appeared to work only because
+    /// most resolvers answer FORMERR and the probe accepts any two bytes; a
+    /// resolver that drops a malformed message instead answers nothing, and
+    /// a *correct* password is then reported as an auth failure.
+    ///
+    /// Decoded from what the probe actually put on the wire, not compared
+    /// against a copy of the literal that produced it.
+    #[tokio::test]
+    async fn the_probe_asks_a_question_a_resolver_can_parse() {
+        let (server, probed) = a_shadowsocks_server_keyed_with("aes-256-gcm", PW).await;
+        let p = profile_at("aes-256-gcm", &server.ip().to_string(), server.port());
+
+        let mut t = ShadowsocksTunnel::new();
+        let _ = t.connect(&p, &FixedSecret(PW)).await;
+
+        let seen = what_the_server_saw(probed).await;
+        let (qtype, qclass) = parse_dns_question(&seen.payload).unwrap_or_else(|why| {
+            panic!("the probe sent {seen:?}, which is not a question: {why}")
+        });
+        assert_eq!(qtype, 1, "QTYPE must be A");
+        assert_eq!(qclass, 1, "QCLASS must be IN -- the field that was missing");
+    }
+
+    /// Finding 3. The probe hardcoded `servers[0]:53` and never looked at
+    /// `profile.dns.mode`. In `DnsMode::Https` the resolver is contacted at
+    /// `servers[0]:443` (`dns/over_https.rs`) and need not serve plain DNS
+    /// on 53 at all -- so a DoH profile with *correct* credentials stalled
+    /// for the whole probe timeout and was then reported as an auth failure.
+    ///
+    /// The proof the probe wants from a DoH resolver is a completed TLS
+    /// handshake: bytes came back through the cipher, which is the same
+    /// proof a DNS answer gives. Nothing here speaks TLS, so the probe
+    /// fails -- what this asserts is *where it went and what it said*.
+    #[cfg(feature = "doh")]
+    #[tokio::test]
+    async fn a_doh_profile_is_probed_at_the_resolvers_https_port_not_53() {
+        let (server, probed) = a_shadowsocks_server_keyed_with("aes-256-gcm", PW).await;
+        let p = doh_profile_at(&server.ip().to_string(), server.port(), "127.0.0.1");
+
+        let mut t = ShadowsocksTunnel::new();
+        let _ = t.connect(&p, &FixedSecret(PW)).await;
+
+        let seen = what_the_server_saw(probed).await;
+        let dest = match seen.dest {
+            Address::SocketAddress(a) => a,
+            ref other => panic!("the probe named a destination by name: {other}"),
+        };
+        assert_eq!(
+            dest.port(),
+            443,
+            "a DoH resolver is contacted at 443; port 53 need not answer at all"
+        );
+        assert_eq!(
+            seen.payload.first(),
+            Some(&0x16),
+            "the probe must open a TLS handshake (record type 0x16), not send a DNS query: {seen:?}"
+        );
+    }
+
+    /// Finding 3's config hole: `dns.mode == https` with no `dns.https`
+    /// block. `ServerProfile::validate` refuses that, but `connect` does not
+    /// call it, and a probe that cannot know which SNI to use must say so
+    /// rather than stall for the whole timeout first.
+    #[cfg(feature = "doh")]
+    #[tokio::test]
+    async fn a_https_profile_with_no_doh_block_is_a_config_error_not_a_stall() {
+        let (server, _probed) = a_shadowsocks_server_keyed_with("aes-256-gcm", PW).await;
+        let mut p = doh_profile_at(&server.ip().to_string(), server.port(), "127.0.0.1");
+        p.dns.https = None;
+
+        let mut t = ShadowsocksTunnel::new();
+        let err = tokio::time::timeout(Duration::from_secs(2), t.connect(&p, &FixedSecret(PW)))
+            .await
+            .expect("a missing DoH block is knowable up front, without waiting out the probe")
+            .expect_err("a https profile with no DoH block cannot be probed");
+
+        assert!(matches!(err, TunnelError::Config { .. }), "got {err:?}");
+        assert!(
+            format!("{err}").contains("dns.https"),
+            "name the offending field: {err}"
+        );
+        assert_eq!(t.stats().state, ConnectionState::Failed);
+    }
+
     /// Task 3 (`task-3-brief.md`), Step 1: the failing test this task
     /// exists to fix. Before the probe, `connect` built a `ServerConfig` and
     /// never spoke to anything, so a connection to a server that accepts
@@ -828,7 +1294,14 @@ mod tests {
     /// this module's other tests already avoid (see the removed 192.0.2.1
     /// flow test above). A listener that genuinely accepts and stays silent
     /// is deterministic on every machine and is what the bug looks like.
-    #[tokio::test]
+    ///
+    /// Finding 6: `start_paused`. The runtime auto-advances to the probe's
+    /// deadline while `read_exact` is parked, so this costs no wall clock
+    /// where it used to cost 8s -- essentially the whole module's runtime.
+    /// It is not vacuous: an implementation that treats the timeout as
+    /// success fails at `expect_err` below, and one with no timeout at all
+    /// never returns.
+    #[tokio::test(start_paused = true)]
     async fn connect_fails_when_the_server_does_not_answer() {
         let server = a_server_that_accepts_and_answers_nothing().await;
         let p = profile_at("aes-256-gcm", &server.ip().to_string(), server.port());
@@ -837,14 +1310,29 @@ mod tests {
             .connect(&p, &FixedSecret("pw"))
             .await
             .expect_err("a server that never answers is not a connection");
+        // Finding 4. A probe that ran out of time says nothing about the
+        // password: an exit that cannot reach the configured resolver, or a
+        // network that stalls for eight seconds, produces exactly this. The
+        // user must not be told their credentials are wrong.
+        assert!(matches!(err, TunnelError::Transport(_)), "got {err:?}");
         assert!(
-            matches!(err, TunnelError::Auth(_) | TunnelError::Transport(_)),
-            "got {err:?}"
+            !format!("{err}").contains("authentication"),
+            "a transport stall must not be reported as an auth failure: {err}"
         );
         assert_eq!(
             t.stats().state,
             ConnectionState::Failed,
             "a failed probe must not leave the tunnel looking Connected"
+        );
+        // Finding 5. `Failed` is only half the contract -- the other half is
+        // that nothing is retained, mirroring the failed-reconnect test.
+        let flow = flow_error(
+            t.open_tcp_stream(dest()).await,
+            "the tunnel must no longer be connected",
+        );
+        assert!(
+            format!("{flow}").contains("not connected"),
+            "the config the probe disproved must be gone, not still relaying: {flow}"
         );
     }
 }
