@@ -238,26 +238,26 @@ mod tests {
 
     #[test]
     fn a_file_owned_by_another_uid_is_refused() {
-        // THE ESCALATION. A root-owned file that this uid does not own must be
-        // refused even though the helper, running as root, could trivially read
-        // it. /etc/shadow is the canonical target: name it as your private key
-        // and its contents leave via an auth attempt or an error message.
+        // THE ESCALATION. A file that the given uid does not own must be
+        // refused even though the helper, running as root, could trivially
+        // read it. We do not need a real foreign-owned fixture (there is no
+        // system file whose ownership is guaranteed across macOS, Linux, and
+        // root/non-root): `secret_readable_by` takes the uid as a parameter,
+        // so a file we own plus a deliberately mismatched uid exercises the
+        // exact same `meta.uid() != uid` branch, deterministically, on any
+        // platform and any caller identity.
+        let d = scratch("not-owned");
+        let p = write_owned(&d, 0o600);
         let me = unsafe { libc::getuid() };
-        if me == 0 {
-            eprintln!("skipped: running as root, every file is 'ours'");
-            return;
-        }
-        let target = std::path::Path::new("/etc/shadow");
-        if !target.exists() {
-            eprintln!("skipped: /etc/shadow absent on this platform");
-            return;
-        }
-        let err = secret_readable_by(target, me)
-            .expect_err("a file owned by another uid must be refused");
+        let mismatched = me.wrapping_add(1);
+
+        let err = secret_readable_by(&p, mismatched)
+            .expect_err("a file not owned by the given uid must be refused");
         assert!(
             matches!(err, AuthError::SecretNotOwned { .. }),
             "expected SecretNotOwned, got {err:?}"
         );
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
@@ -280,25 +280,39 @@ mod tests {
 
     #[test]
     fn a_symlink_is_judged_by_its_target_not_the_link() {
-        // A symlink the caller owns pointing at a file they do not is the
-        // obvious bypass. `metadata` follows the link, which is what we want —
-        // this test pins that we did not reach for `symlink_metadata`.
-        let me = unsafe { libc::getuid() };
-        if me == 0 {
-            eprintln!("skipped: running as root");
-            return;
-        }
-        let target = std::path::Path::new("/etc/shadow");
-        if !target.exists() {
-            eprintln!("skipped: /etc/shadow absent");
-            return;
-        }
+        // A symlink whose *link* looks acceptable but whose *target* fails
+        // the gate must still be refused. We build a real target file
+        // (owned by us, mode 0600, via `write_owned`) and a symlink to it,
+        // then call with a deliberately mismatched uid.
+        //
+        // This distinguishes `metadata` (follows symlinks) from
+        // `symlink_metadata` (does not), rather than merely asserting
+        // `.is_err()`, which both implementations would satisfy for
+        // different and wrong reasons:
+        //   - `metadata` on the link resolves to the *target*: a regular
+        //     file, mode 0600 (passes the mode check), owned by us but not
+        //     by `mismatched` -> `SecretNotOwned`. This is the behavior we
+        //     want to pin.
+        //   - `symlink_metadata` on the link resolves to the *link itself*:
+        //     its file type is a symlink, not a regular file, so it would be
+        //     rejected by the earlier `is_file()` check with
+        //     `SecretRejected { reason: "not a regular file" }` — an error,
+        //     but never reaching the ownership branch this test exists to
+        //     exercise.
         let d = scratch("symlink");
+        let target = write_owned(&d, 0o600);
         let link = d.join("link");
-        std::os::unix::fs::symlink(target, &link).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let me = unsafe { libc::getuid() };
+        let mismatched = me.wrapping_add(1);
+
+        let err = secret_readable_by(&link, mismatched)
+            .expect_err("a symlink to a file the given uid does not own must be refused");
         assert!(
-            secret_readable_by(&link, me).is_err(),
-            "a symlink to a file the caller does not own must be refused"
+            matches!(err, AuthError::SecretNotOwned { .. }),
+            "expected SecretNotOwned (proving the target's ownership was checked, \
+             not the link's mode or type), got {err:?}"
         );
         std::fs::remove_dir_all(&d).ok();
     }
