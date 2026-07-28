@@ -83,6 +83,17 @@ fn split_host_port(s: &str) -> Result<(String, u16), TunnelError> {
     if port == 0 {
         return Err(bad("the port is zero"));
     }
+    // `rsplit_once(':')` above takes the LAST colon, so an IPv6 literal
+    // either keeps its brackets (`h == "[2001:db8::1]"`) or, unbracketed,
+    // silently donates its trailing hextet to `port`. Refused here, plainly,
+    // rather than left to fail much later at resolution with an unrelated
+    // message. This is a clarity fix, not a capability loss: the stack is
+    // IPv4-only regardless.
+    if h.contains(':') || h.contains('[') {
+        return Err(bad(
+            "IPv6 hosts are not supported; this build only speaks IPv4",
+        ));
+    }
     Ok((h.to_string(), port))
 }
 
@@ -91,6 +102,10 @@ fn split_host_port(s: &str) -> Result<(String, u16), TunnelError> {
 /// Total on `&str`: no byte indexing anywhere, because the input is a paste and
 /// half of one is a normal thing to receive.
 pub fn parse_ss_uri(uri: &str) -> Result<SsUri, TunnelError> {
+    // A pasted link routinely carries a leading/trailing newline or space;
+    // `trim` is total on any `&str` (it works on whitespace, not byte
+    // offsets), so this adds no panic surface.
+    let uri = uri.trim();
     let rest = uri
         .strip_prefix("ss://")
         .ok_or_else(|| bad("not an ss:// link"))?;
@@ -104,6 +119,15 @@ pub fn parse_ss_uri(uri: &str) -> Result<SsUri, TunnelError> {
 
     if let Some((creds, hostport)) = body.rsplit_once('@') {
         // SIP002: base64(method:password) @ host:port
+        //
+        // SIP002's ABNF allows an optional trailing `/` after the port
+        // (every Outline access key carries one). Stripped here, scoped to
+        // this already-`@`-split `hostport` -- NOT from `body` above. A fix
+        // that instead treats `/` as a generic path separator on the shared
+        // `body` (e.g. truncating at the first `/`) happens to still work
+        // for SIP002 but silently corrupts a legacy blob whose base64
+        // (standard alphabet) contains `/` as an ordinary data character.
+        let hostport = hostport.strip_suffix('/').unwrap_or(hostport);
         let (method, password) = split_creds(&decode(creds)?)?;
         let (host, port) = split_host_port(hostport)?;
         Ok(SsUri {
@@ -182,6 +206,87 @@ mod tests {
     }
 
     #[test]
+    fn a_sip002_uri_with_the_optional_path_and_query_parses() {
+        // SIP002's ABNF is `"ss://" userinfo "@" hostname ":" port [ "/" ]
+        // [ "?" plugin ] [ "#" tag ]` -- every Outline access key carries the
+        // trailing `/`. Without handling it, the query strip at `?` leaves
+        // `host:port/`, and the port parse fails on `port/`, misreporting a
+        // conformant link as having a non-numeric port.
+        let uri = format!(
+            "ss://{}@198.51.100.7:8388/?outline=1#Home",
+            b64("aes-256-gcm:hunter2")
+        );
+        let p = parse_ss_uri(&uri).unwrap();
+        assert_eq!(p.host, "198.51.100.7");
+        assert_eq!(p.port, 8388);
+        assert_eq!(p.tag.as_deref(), Some("Home"));
+    }
+
+    #[test]
+    fn a_sip002_uri_with_a_trailing_slash_and_no_query_parses() {
+        // The trailing-slash-without-query form of the same defect.
+        let uri = format!("ss://{}@198.51.100.7:8388/", b64("aes-256-gcm:hunter2"));
+        let p = parse_ss_uri(&uri).unwrap();
+        assert_eq!(p.host, "198.51.100.7");
+        assert_eq!(p.port, 8388);
+    }
+
+    #[test]
+    fn a_legacy_link_using_padded_standard_alphabet_with_a_slash_parses() {
+        // Legacy links are conventionally emitted standard-alphabet and often
+        // padded -- `decode`'s dual-alphabet/padding tolerance has no coverage
+        // otherwise, since every other fixture goes through `b64`/`b64_bytes`
+        // (URL_SAFE_NO_PAD only). This body's base64 also contains a literal
+        // `/`, which pins that the SIP002 fix for the optional trailing slash
+        // must not strip `/` from `body` before the `@` split: the standard
+        // alphabet uses `/` as a real data character, and a body-wide strip
+        // (rather than one scoped to the SIP002 branch's already-split
+        // `hostport`) would silently truncate a legacy blob like this one.
+        let plaintext = "aes-256-gcm:.NnOB?FXL4k@198.51.100.7:8388";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(plaintext);
+        assert!(encoded.contains('/'), "fixture must contain a literal /");
+        assert!(encoded.ends_with('='), "fixture must be padded");
+        let uri = format!("ss://{encoded}");
+        let p = parse_ss_uri(&uri).unwrap();
+        assert_eq!(p.host, "198.51.100.7");
+        assert_eq!(p.port, 8388);
+        assert_eq!(p.password.expose(), ".NnOB?FXL4k");
+    }
+
+    #[test]
+    fn a_sip002_uri_using_padded_standard_alphabet_parses() {
+        // The SIP002-form counterpart of the test above: standard-alphabet,
+        // padded, and containing a character (`+`) outside the URL-safe
+        // alphabet, so deleting either `STANDARD_NO_PAD` from the engine list
+        // or the `=`-trim breaks it.
+        let plaintext = "aes-256-gcm:(Jr3(J1T~W";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(plaintext);
+        assert!(encoded.contains('+'), "fixture must contain a literal +");
+        assert!(encoded.ends_with('='), "fixture must be padded");
+        let uri = format!("ss://{encoded}@198.51.100.7:8388");
+        let p = parse_ss_uri(&uri).unwrap();
+        assert_eq!(p.host, "198.51.100.7");
+        assert_eq!(p.port, 8388);
+        assert_eq!(p.password.expose(), "(Jr3(J1T~W");
+    }
+
+    #[test]
+    fn surrounding_whitespace_from_a_paste_is_tolerated() {
+        // A trailing newline is the single most common paste accident, and
+        // without a trim it is refused as "the encoded section is not valid
+        // base64" -- the least helpful message in the module, since the link
+        // itself was fine.
+        let uri = format!(
+            "  ss://{}@198.51.100.7:8388#Home\n",
+            b64("aes-256-gcm:hunter2")
+        );
+        let p = parse_ss_uri(&uri).unwrap();
+        assert_eq!(p.host, "198.51.100.7");
+        assert_eq!(p.port, 8388);
+        assert_eq!(p.password.expose(), "hunter2");
+    }
+
+    #[test]
     fn a_uri_that_is_not_shadowsocks_is_refused() {
         assert!(parse_ss_uri("https://example.com").is_err());
         // A body that would parse perfectly under `ss://`, so the only thing
@@ -190,7 +295,12 @@ mod tests {
         // because `example.com` fails to base64-decode for unrelated reasons.
         let body = format!("{}@198.51.100.7:8388", b64("aes-256-gcm:pw"));
         assert!(parse_ss_uri(&format!("ssh://{body}")).is_err());
-        assert!(parse_ss_uri(&format!("//{body}")).is_err());
+        // No `"//{body}"` case: under a scheme-ignoring mutation that string
+        // has length ≡ 1 (mod 4) and fails base64 decode for reasons wholly
+        // unrelated to the scheme check, so it would pass against the exact
+        // defect this test exists to catch. Only the `ssh://` case above
+        // carries signal; a second assertion that reads as a witness but
+        // isn't is worse than no assertion.
     }
 
     #[test]
@@ -236,6 +346,11 @@ mod tests {
                 "ss://{}@198.51.100.7:99999",
                 b64(&format!("aes-256-gcm:{marker}"))
             ),
+            // the port is zero
+            format!(
+                "ss://{}@198.51.100.7:0",
+                b64(&format!("aes-256-gcm:{marker}"))
+            ),
             // decodes to bytes that are not text
             format!("ss://{}@198.51.100.7:8388", b64_bytes(&[0xff, 0xfe, 0xfd])),
         ];
@@ -271,6 +386,15 @@ mod tests {
             !rendered.contains("SECRET"),
             "password leaked into Debug: {rendered}"
         );
+        // Deliberate policy choice, not an oversight: `SsUri` is a parse
+        // result a developer inspects directly, so its non-secret fields
+        // (including `host`) stay in `Debug` for debuggability -- only the
+        // password is redacted, via its own type. This is NOT a precedent
+        // for DTOs downstream: Task 6's import path nests `SsUri` and other
+        // profile data into its own types, and a Task 4 fix wave already had
+        // to remove `profile.host` from exactly those logging sinks. A Task
+        // 6 reviewer should check that its DTO does not itself derive (or
+        // hand-roll) a `Debug`/`Display` that gets logged with `{:?}`/`{}`.
         assert!(
             rendered.contains("198.51.100.7"),
             "the non-secret fields should still be debuggable: {rendered}"
@@ -290,6 +414,26 @@ mod tests {
         // a link. Refusing it here names the thing they can actually fix.
         let uri = format!("ss://{}@198.51.100.7:0", b64("aes-256-gcm:pw"));
         assert!(parse_ss_uri(&uri).is_err());
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_host_is_refused_with_an_accurate_message() {
+        // Accepted with brackets intact today, producing a profile that only
+        // fails much later at resolution with an unrelated message. This
+        // stack is IPv4-only, so refuse it here, clearly, instead of later.
+        let uri = format!("ss://{}@[2001:db8::1]:8388", b64("aes-256-gcm:pw"));
+        let err = parse_ss_uri(&uri).unwrap_err();
+        assert!(format!("{err}").contains("IPv4"));
+    }
+
+    #[test]
+    fn an_unbracketed_ipv6_host_is_refused_not_silently_misparsed() {
+        // Without a check, `rsplit_once(':')` takes the LAST colon, silently
+        // accepting the trailing segment as the port and everything before
+        // it -- `2001:db8::1` -- as the host.
+        let uri = format!("ss://{}@2001:db8::1:8388", b64("aes-256-gcm:pw"));
+        let err = parse_ss_uri(&uri).unwrap_err();
+        assert!(format!("{err}").contains("IPv4"));
     }
 
     #[test]
