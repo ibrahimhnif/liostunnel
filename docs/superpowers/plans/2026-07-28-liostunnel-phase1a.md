@@ -443,21 +443,42 @@ mod tests {
     }
 
     #[test]
-    fn peer_uid_is_not_silently_zero() {
-        // Guards the specific bug where an unchecked getsockopt leaves the
-        // output buffer zeroed and every caller is authorised as root.
-        let (a, _b) = UnixStream::pair().unwrap();
-        let got = peer_uid(a.as_raw_fd()).unwrap();
-        let expected = unsafe { libc::getuid() };
-        if expected != 0 {
-            assert_ne!(got, 0, "a non-root test process must not report peer uid 0");
-        }
+    fn peer_uid_on_getsockopt_failure_does_not_silently_report_uid_zero() {
+        // THE zero-buffer guard. It must use an fd where the syscall really
+        // fails: /dev/null is not a socket, so getsockopt returns ENOTSOCK on
+        // macOS and nix's PeerCredentials errors on Linux. An implementation
+        // that ignores the failure falls through to the zeroed xucred and
+        // hands back Ok(0) -- every caller authorised as root.
+        //
+        // A socketpair CANNOT test this. getsockopt always succeeds there and
+        // fills the buffer correctly whether or not the caller checks the
+        // return code, so a test on that fixture passes against both the
+        // correct and the broken implementation.
+        let f = std::fs::File::open("/dev/null").unwrap();
+        let result = peer_uid(f.as_raw_fd());
+        assert!(result.is_err(), "must be an error, not Ok(0); got {result:?}");
     }
 
     #[test]
-    fn peer_uid_on_a_non_socket_fd_is_an_error_not_a_panic() {
-        let f = std::fs::File::open("/dev/null").unwrap();
-        assert!(peer_uid(f.as_raw_fd()).is_err());
+    fn authorize_accepts_our_own_uid() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        let ours = unsafe { libc::getuid() };
+        assert!(authorize(a.as_raw_fd(), ours).is_ok());
+    }
+
+    #[test]
+    fn authorize_rejects_a_mismatched_uid() {
+        // The function P1a-5 is actually about. Without this, an inverted
+        // comparison passes every other test in the file.
+        let (a, _b) = UnixStream::pair().unwrap();
+        let ours = unsafe { libc::getuid() };
+        match authorize(a.as_raw_fd(), ours.wrapping_add(1)) {
+            Err(AuthError::WrongUid { expected, actual }) => {
+                assert_eq!(expected, ours.wrapping_add(1));
+                assert_eq!(actual, ours);
+            }
+            other => panic!("expected WrongUid, got {other:?}"),
+        }
     }
 }
 ```
@@ -539,18 +560,24 @@ pub fn authorize(fd: RawFd, expected: u32) -> Result<(), AuthError> {
 }
 ```
 
-Add `thiserror.workspace = true` to `crates/liostunnel-helper/Cargo.toml`, and `pub mod auth;` to `main.rs`.
+Add `thiserror.workspace = true` to `crates/liostunnel-helper/Cargo.toml`, and `pub mod auth;` to `main.rs` — **in Step 1**, not here, or the RED run fails on a missing module instead of the missing function.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p liostunnel-helper auth`
-Expected: PASS — 3 passed.
+Expected: PASS — 5 passed.
 
-- [ ] **Step 5: A/B the zero-check test**
+- [ ] **Step 5: A/B both guards**
 
-Temporarily change the macOS (or Linux) implementation to ignore the return code and return `Ok(0)`. Run the tests again and confirm `peer_uid_is_not_silently_zero` and `peer_uid_of_a_socketpair_is_our_own_uid` both FAIL. Restore the implementation and confirm they pass. Paste both outputs in your report.
+The two arms fail through different mechanisms, so the injected defect is not the same edit on both. Do each on its own platform and paste all four transcripts.
 
-This matters because "authorises everyone as root" is the exact failure mode an unchecked `getsockopt` produces, and it is invisible to a test that only asserts success.
+**The zero-buffer guard.** On macOS, delete the `if rc != 0` check so the zeroed `xucred` falls through. On Linux, swallow the `?` and default to `0`. Confirm `peer_uid_on_getsockopt_failure_does_not_silently_report_uid_zero` FAILS with `got Ok(0)`. Restore, confirm green.
+
+Note what does *not* move: `peer_uid_of_a_socketpair_is_our_own_uid` stays green through both breaks, because `getsockopt` always succeeds on a socketpair and fills the buffer correctly whether or not the caller checks the return code. That test proves the happy path is wired; it cannot prove the guard exists. Keeping the distinction visible is the point.
+
+**The authorization comparison.** Invert `actual != expected` to `==`. Confirm `authorize_rejects_a_mismatched_uid` FAILS. Restore, confirm green.
+
+This matters because "authorises everyone as root" is the exact failure mode an unchecked `getsockopt` produces, and it is invisible to a test that only asserts success on a fixture where the syscall never fails.
 
 - [ ] **Step 6: Commit**
 
