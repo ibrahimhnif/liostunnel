@@ -469,9 +469,31 @@ this phase exists.
 | macOS `utun` and Linux TUN diverge more than expected | D2 forces both from the first commit rather than discovering the gap in Phase 1 |
 | DoH pulls significant TLS/HTTP weight into the core | Feature-gated so DNS-over-TCP builds stay lean; matters for the PRD §8 mobile binary size target |
 
-Not a Phase 0 risk but worth restating from PRD §11: **the Apple `networkextension`
-entitlement should be applied for now, during Phase 0** — not at Phase 3. Approval lead time
-is unpredictable and it is the single largest schedule risk in the programme.
+**Correction — the Apple entitlement is not a schedule risk.** An earlier version of
+this section, following PRD §11, said the `com.apple.developer.networking.networkextension`
+entitlement had to be requested from Apple with unpredictable lead time, and called it the
+single largest schedule risk in the programme. That is false.
+
+The packet-tunnel-provider entitlement is **self-serve**. Apple DTS engineer Quinn
+"The Eskimo!" states it plainly on the developer forums: *"There is no approval process for
+creating an NE packet tunnel provider. Any paid developer can do that"* — footnoted with
+*"Other than approval to join the Apple Developer Program itself"* and *"That wasn't always
+the case."* It was approval-gated historically and became self-serve around 2016. In Xcode
+it is: Signing & Capabilities → Network Extension → tick Packet Tunnel, on both the app and
+the extension target.
+
+The stale belief is easy to acquire — Apple's old `/contact/request/network-extension/` URL
+now redirects to the **hotspot-helper** request form, a different entitlement that does still
+require approval.
+
+The genuine Phase 3 risk is not obtaining the entitlement but the rules governing its use:
+[TN3120 — Expected use cases for packet tunnel providers](https://developer.apple.com/documentation/technotes/tn3120-expected-use-cases-for-network-extension-packet-tunnel-providers)
+(*"Do not try to use a packet tunnel provider for something other than VPN"*),
+[TN3134 — Network Extension provider deployment](https://developer.apple.com/documentation/technotes/tn3134-network-extension-provider-deployment),
+and App Store Review Guideline §5.4 on VPN apps. PRD §11 flags the App Store review stance
+separately, and that part stands. Read both technotes before committing to Phase 3's design.
+
+Source: [Apple Developer Forums thread 819032](https://developer.apple.com/forums/thread/819032).
 
 ## 15. Next step
 
