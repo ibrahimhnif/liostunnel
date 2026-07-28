@@ -234,11 +234,18 @@ more detail in the referenced task report under `.superpowers/sdd/`.
 
 ## Phase 0 exit criteria
 
-Six of the seven are verified. They were run in a disposable Linux container
-granted `NET_ADMIN`, `NET_RAW` and `/dev/net/tun`, against the live Docker SSH
-fixture — a real TUN device, a real routing table, a real `/etc/resolv.conf`,
-and a real packet capture. Only EC6 still needs a human, because it needs a
-real server and sustained traffic.
+**All seven are verified.** They were run in a disposable Linux container
+granted `NET_ADMIN`, `NET_RAW` and `/dev/net/tun` — a real TUN device, a real
+routing table, a real `/etc/resolv.conf`, and a real packet capture. EC1–EC5
+and EC7 were verified against a local Docker SSH fixture; EC6, and a second
+pass over host key verification, were verified against a real remote SSH
+server across the public internet.
+
+> **Benchmark with `--release`.** EC6 measured **3.77x** slower than `ssh -D`
+> on a debug build and **1.15x** on a release build — the same code, the same
+> server, minutes apart. The engine's hot path is smoltcp checksum computation
+> and per-packet buffer handling, which optimisation transforms. A debug-build
+> benchmark will tell you this architecture is unviable, and it will be wrong.
 
 | Criterion | Status | Verified by |
 |---|---|---|
@@ -247,15 +254,20 @@ real server and sustained traffic.
 | EC3 — `default` mode plus all three cleanup paths | **verified** | Split-default (`0.0.0.0/1` + `128.0.0.0/1`), IPv6 split-default, server pin via the original gateway, and the DNS override all installed; traffic flowed through the tunnel; on shutdown every route was removed, `/etc/resolv.conf` was restored **byte-identical**, and connectivity returned. The `kill -9` state-file path has unit coverage but was not exercised live |
 | EC4 — DNS leak test | **verified on Linux** | Packet capture on the physical interface during a `default`-mode session: **zero UDP:53 packets** while three names resolved correctly through the tunnel. This was the known-failing criterion until Linux gained a DNS override; it now passes by measurement, not by construction. Not re-run on macOS |
 | EC5 — idle CPU ≈ 0% | **verified** | Task 14: 0.00 user + 0.00 sys CPU over a 6.67s window, ~2 poll passes/s idle-connected, and 2 passes/s under zero-window backpressure. The instrumented counter was validated in both directions — it read ~200,000 passes/0.5s with a deliberate spin reintroduced |
-| EC6 — within 20% of `ssh -D` | **needs human** (real SSH server, sustained traffic) | `testing/gates/throughput_test.sh`, never executed |
+| EC6 — within 20% of `ssh -D` | **verified** | Against a real remote SSH server, 20 MB per run, best of 3 each, both paths egressing the same VPS so the comparison isolates engine overhead from network variance: `ssh -D` 82.32 Mbit/s vs liostunnel 71.83 Mbit/s = **1.146x**, inside the 1.20x ceiling. Release build — see the note above |
 | EC7 — same code path on macOS utun and Linux TUN | **verified** | The full workspace builds and all tests pass identically on both platforms, and the root-gated `tun_e2e.rs` tests pass against a real Linux TUN device. Note the E2E tests themselves are narrow — they open a device and read a packet back, proving the AF-prefix codec (Decision D2); the broader "same code path" claim rests on the identical test results across platforms, plus EC1/EC3 exercising smoltcp, the `Engine`, and a proxied flow through a real Linux device |
 
-What this does **not** establish: EC6 is unmeasured, so throughput is unknown.
-EC2 was verified for DNS-over-TCP only — DoH has not run through a real device.
-EC4 was measured on Linux only. The `kill -9` crash-recovery path has unit
-coverage but has never been triggered for real. And every verification above
-ran against a Docker SSH fixture on a local bridge, not a remote VPS over a
-real network.
+Host key verification was additionally proven against a genuinely unknown
+remote host: first connect learned and recorded the key (trust-on-first-use,
+with a warning), the second validated against it silently, and a tampered
+recorded key was rejected naming the offending file and line.
+
+What this does **not** establish: EC2 was verified for DNS-over-TCP only — the
+DoH backend has unit coverage and one network-gated test, but has not run
+through a real device. EC4's packet capture was taken on Linux only. The
+`kill -9` crash-recovery path has unit coverage but has never been triggered
+for real. Throughput was measured on one route to one Singapore VPS, not
+across varied networks or on constrained mobile links.
 
 ## License
 
