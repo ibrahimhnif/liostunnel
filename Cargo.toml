@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/liostunnel-core", "crates/liostunnel-cli"]
+members = [
+    "crates/liostunnel-core",
+    "crates/liostunnel-cli",
+    "crates/liostunnel-ffi",
+    "crates/liostunnel-helper",
+]
 resolver = "3"
 
 [workspace.package]

@@ -1278,6 +1278,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "liostunnel-ffi"
+version = "0.1.0"
+dependencies = [
+ "liostunnel-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "liostunnel-helper"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "liostunnel-core",
+ "liostunnel-ffi",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
