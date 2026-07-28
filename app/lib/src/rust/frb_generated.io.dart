@@ -5,6 +5,7 @@
 
 import 'api/config.dart';
 import 'api/probe.dart';
+import 'api/protocol.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
@@ -27,10 +28,28 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool dco_decode_bool(dynamic raw);
 
   @protected
+  ConnectParamsDto dco_decode_box_autoadd_connect_params_dto(dynamic raw);
+
+  @protected
   ProbeDto dco_decode_box_autoadd_probe_dto(dynamic raw);
 
   @protected
   ProfileDto dco_decode_box_autoadd_profile_dto(dynamic raw);
+
+  @protected
+  RequestDto dco_decode_box_autoadd_request_dto(dynamic raw);
+
+  @protected
+  ConnectParamsDto dco_decode_connect_params_dto(dynamic raw);
+
+  @protected
+  ErrorKindDto dco_decode_error_kind_dto(dynamic raw);
+
+  @protected
+  int dco_decode_i_32(dynamic raw);
+
+  @protected
+  IncomingDto dco_decode_incoming_dto(dynamic raw);
 
   @protected
   List<String> dco_decode_list_String(dynamic raw);
@@ -51,10 +70,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ProfileDto dco_decode_profile_dto(dynamic raw);
 
   @protected
+  RequestDto dco_decode_request_dto(dynamic raw);
+
+  @protected
   int dco_decode_u_16(dynamic raw);
 
   @protected
   int dco_decode_u_32(dynamic raw);
+
+  @protected
+  BigInt dco_decode_u_64(dynamic raw);
 
   @protected
   int dco_decode_u_8(dynamic raw);
@@ -69,10 +94,30 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   bool sse_decode_bool(SseDeserializer deserializer);
 
   @protected
+  ConnectParamsDto sse_decode_box_autoadd_connect_params_dto(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   ProbeDto sse_decode_box_autoadd_probe_dto(SseDeserializer deserializer);
 
   @protected
   ProfileDto sse_decode_box_autoadd_profile_dto(SseDeserializer deserializer);
+
+  @protected
+  RequestDto sse_decode_box_autoadd_request_dto(SseDeserializer deserializer);
+
+  @protected
+  ConnectParamsDto sse_decode_connect_params_dto(SseDeserializer deserializer);
+
+  @protected
+  ErrorKindDto sse_decode_error_kind_dto(SseDeserializer deserializer);
+
+  @protected
+  int sse_decode_i_32(SseDeserializer deserializer);
+
+  @protected
+  IncomingDto sse_decode_incoming_dto(SseDeserializer deserializer);
 
   @protected
   List<String> sse_decode_list_String(SseDeserializer deserializer);
@@ -93,10 +138,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ProfileDto sse_decode_profile_dto(SseDeserializer deserializer);
 
   @protected
+  RequestDto sse_decode_request_dto(SseDeserializer deserializer);
+
+  @protected
   int sse_decode_u_16(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_32(SseDeserializer deserializer);
+
+  @protected
+  BigInt sse_decode_u_64(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_8(SseDeserializer deserializer);
@@ -105,13 +156,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_decode_unit(SseDeserializer deserializer);
 
   @protected
-  int sse_decode_i_32(SseDeserializer deserializer);
-
-  @protected
   void sse_encode_String(String self, SseSerializer serializer);
 
   @protected
   void sse_encode_bool(bool self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_connect_params_dto(
+    ConnectParamsDto self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_probe_dto(
@@ -124,6 +178,27 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     ProfileDto self,
     SseSerializer serializer,
   );
+
+  @protected
+  void sse_encode_box_autoadd_request_dto(
+    RequestDto self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_connect_params_dto(
+    ConnectParamsDto self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_error_kind_dto(ErrorKindDto self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_i_32(int self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_incoming_dto(IncomingDto self, SseSerializer serializer);
 
   @protected
   void sse_encode_list_String(List<String> self, SseSerializer serializer);
@@ -147,19 +222,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_profile_dto(ProfileDto self, SseSerializer serializer);
 
   @protected
+  void sse_encode_request_dto(RequestDto self, SseSerializer serializer);
+
+  @protected
   void sse_encode_u_16(int self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_32(int self, SseSerializer serializer);
 
   @protected
+  void sse_encode_u_64(BigInt self, SseSerializer serializer);
+
+  @protected
   void sse_encode_u_8(int self, SseSerializer serializer);
 
   @protected
   void sse_encode_unit(void self, SseSerializer serializer);
-
-  @protected
-  void sse_encode_i_32(int self, SseSerializer serializer);
 }
 
 // Section: wire_class
