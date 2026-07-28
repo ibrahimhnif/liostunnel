@@ -627,15 +627,24 @@ Add to `ShadowsocksTunnel`, and call it at the end of `connect` before setting
     async fn probe(&self, dns: SocketAddr) -> Result<(), TunnelError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // A minimal A query for "." — the smallest well-formed thing a
+        // A minimal A/IN query for "." -- the smallest well-formed thing a
         // resolver will answer. RFC 7766 framing: two-byte length prefix.
-        let query: [u8; 17] = [
-            0x00, 0x0f, // length
+        //
+        // CORRECTED 2026-07-29, after the Task 3 review. This literal
+        // originally declared length 0x000f and omitted QCLASS, so the
+        // question was one field short and the message unparseable. A
+        // resolver that drops malformed messages rather than returning
+        // FORMERR would have answered nothing, the probe would have timed
+        // out after 8s, and connect() would have reported a CORRECT password
+        // as an auth failure -- the task's own bug, inverted.
+        let query: [u8; 19] = [
+            0x00, 0x11, // length: 17 bytes follow
             0xAB, 0xCD, // id
             0x01, 0x00, // standard query, recursion desired
             0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, // root name
-            0x00, 0x01, // A
+            0x00, 0x01, // QTYPE  = A
+            0x00, 0x01, // QCLASS = IN
         ];
 
         let fut = async {
