@@ -42,37 +42,64 @@ impl AppliedState {
 
 /// Whether `pid` refers to a currently-running process.
 ///
-/// This is deliberately a **bare** PID check, not a check that also confirms
-/// the process is actually a liostunnel instance (e.g. by matching its
-/// executable name or start time). Two things make that an acceptable
-/// tradeoff for Phase 0 rather than a latent safety hole:
+/// This is deliberately a **bare** PID check — it does not also confirm the
+/// process is a liostunnel instance (by executable name or start time). What
+/// makes that acceptable for Phase 0 is not that the check is always right,
+/// but that every way it can be wrong lands on the side of refusing to act:
 ///
-/// - `kill(pid, 0)` succeeding is the *only* branch that treats the previous
-///   run as "still alive and off-limits" (see `recover_if_stale` below); when
-///   it succeeds for an unrelated process that happens to have inherited a
-///   recycled PID, the result is `recover_if_stale` returning `Err` and
-///   refusing to touch anything. That is a false refusal (annoying: the
-///   operator must intervene, e.g. by confirming the old process is gone and
-///   deleting the state file by hand), never a false deletion. The dangerous
-///   direction — deciding a still-live instance's routes are safe to revert —
-///   cannot happen through this path, because it requires `kill` to report
-///   "not alive" for a PID that is in fact alive, which does not happen for a
-///   root-owned liostunnel signalling another root-owned process (the normal
-///   case, since route mutation requires root on both ends).
-/// - A stricter check (matching `/proc/<pid>/comm` on Linux, `ps -p <pid> -o
-///   comm=` on macOS, or a stored start-time) would reduce how often a
-///   genuinely stale state file gets misjudged as live, but adds
-///   platform-specific process introspection for a failure mode whose only
-///   cost, as things stand, is an extra manual step by the operator — not a
-///   connectivity-destroying one. That refinement is deferred past Phase 0.
+/// - Reporting a dead PID as alive (a recycled PID now owned by an unrelated
+///   process, or a corrupt record) makes `recover_if_stale` return `Err` and
+///   touch nothing. The operator must confirm the old process is gone and
+///   remove the state file by hand — annoying, never destructive.
+/// - Reporting a *live* PID as dead is the dangerous direction: it would let
+///   one process revert a running instance's routes and delete its crash
+///   record. Only `ESRCH` is read as dead, precisely so this cannot happen.
+///
+/// An earlier version of this comment claimed the dangerous direction was
+/// unreachable "because route mutation requires root on both ends". That was
+/// wrong, and worth recording so it is not reintroduced: `kill` also fails
+/// with `EPERM` when the target exists but cannot be signalled, and the code
+/// treated any failure as death. Measured: `kill(1, 0)` as an ordinary user
+/// returns `EPERM`, so PID 1 — unambiguously alive — read as dead. Reachable
+/// whenever the recovering process can mutate routes but not signal the
+/// recorded PID: `setcap cap_net_admin+ep` without root, or a root-owned
+/// record sitting in a user-owned state directory.
+///
+/// A stricter check (`/proc/<pid>/comm`, `ps -p <pid> -o comm=`, or a stored
+/// start time) would narrow how often a genuinely stale file is misjudged as
+/// live. That is a convenience refinement, not a safety one, and is deferred
+/// past Phase 0.
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
+    // POSIX gives pid 0 the meaning "every process in my process group", so
+    // `kill(0, 0)` succeeds and would report a corrupt record as live. Reject
+    // it before asking the kernel anything.
     if pid == 0 {
         return false;
     }
+    // A pid beyond i32::MAX wraps negative through the cast below, which POSIX
+    // reads as a process-group broadcast. Treat a corrupt record as live so we
+    // refuse rather than tear down something we cannot identify.
+    let Ok(raw) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+
     // Signal 0 tests for existence without delivering anything.
     // SAFETY: `kill` with signal 0 has no effect beyond returning a status.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    if unsafe { libc::kill(raw, 0) } == 0 {
+        return true;
+    }
+
+    // `kill` fails two ways and they mean opposite things:
+    //   ESRCH — no such process. Genuinely dead; recovering is correct.
+    //   EPERM — the process exists but we may not signal it.
+    // Collapsing EPERM into "dead" is the dangerous direction: a recovering
+    // process holding CAP_NET_ADMIN but not root (`setcap cap_net_admin+ep`),
+    // or reading a root-owned record from a user-owned state directory, would
+    // tear down a *live* instance's routes and delete its crash record. Only
+    // ESRCH may be read as dead; everything else errs toward "still running",
+    // whose worst outcome is a refusal the operator can resolve by hand.
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 #[cfg(not(unix))]
@@ -89,9 +116,14 @@ pub fn recover_if_stale(path: &Path) -> Result<bool, TunnelError> {
     let state = AppliedState::load(path)?;
 
     if process_is_alive(state.pid) && state.pid != std::process::id() {
+        // Name the state file: this refusal is also what a recycled PID looks
+        // like, and without the path the operator has no way to resolve it.
         return Err(TunnelError::Route(format!(
-            "another liostunnel (pid {}) is holding routes on {}",
-            state.pid, state.interface
+            "another liostunnel (pid {}) is holding routes on {}. If that \
+             process is gone, delete {} and retry.",
+            state.pid,
+            state.interface,
+            path.display()
         )));
     }
     if state.pid == std::process::id() {

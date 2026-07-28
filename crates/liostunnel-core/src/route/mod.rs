@@ -350,11 +350,71 @@ mod tests {
             let r = rendered(&cmds);
             assert!(r.iter().any(|c| c.contains("0.0.0.0/1")), "{name}: {r:?}");
             assert!(r.iter().any(|c| c.contains("128.0.0.0/1")), "{name}: {r:?}");
+            assert_no_default_route_deletion(name, &r);
+        }
+    }
+
+    /// The apply arm is the obvious place to look for a stray `delete default`,
+    /// and it is the less dangerous one. The revert arm runs on every clean
+    /// exit, every unwinding panic, and every crash recovery — so a deletion
+    /// there strips the operator's real default route constantly rather than
+    /// once. Both arms, both platforms, both route modes are checked.
+    fn assert_no_default_route_deletion(name: &str, rendered: &[String]) {
+        for c in rendered {
             assert!(
-                !r.iter()
-                    .any(|c| c.contains("delete default") || c.contains("del default")),
-                "{name} must not remove the real default route: {r:?}"
+                !(c.contains("delete default") || c.contains("del default")),
+                "{name} must never remove the real default route: {c}"
             );
+            // `route delete 0.0.0.0/0` / `ip route del 0.0.0.0/0` are the same
+            // act spelled as a prefix. The split-default technique works by
+            // being *more specific* than 0.0.0.0/0 and leaving it untouched,
+            // so naming it at all in a delete is a bug.
+            assert!(
+                !((c.contains("delete") || c.contains(" del "))
+                    && (c.contains("0.0.0.0/0") || c.contains("::/0"))),
+                "{name} must never remove the real default route: {c}"
+            );
+        }
+    }
+
+    #[test]
+    fn reverting_default_mode_never_removes_the_real_default_route() {
+        for (name, cmds) in [
+            (
+                "macos",
+                macos::MacOsRoutes.revert_commands(&default_plan()).unwrap(),
+            ),
+            (
+                "linux",
+                linux::LinuxRoutes.revert_commands(&default_plan()).unwrap(),
+            ),
+        ] {
+            let r = rendered(&cmds);
+            // The split-default routes must come back out...
+            assert!(r.iter().any(|c| c.contains("0.0.0.0/1")), "{name}: {r:?}");
+            assert!(r.iter().any(|c| c.contains("128.0.0.0/1")), "{name}: {r:?}");
+            // ...and nothing may touch the real default route on the way.
+            assert_no_default_route_deletion(name, &r);
+        }
+    }
+
+    #[test]
+    fn reverting_test_mode_never_removes_the_real_default_route() {
+        for (name, cmds) in [
+            (
+                "macos",
+                macos::MacOsRoutes
+                    .revert_commands(&plan(test_mode(true)))
+                    .unwrap(),
+            ),
+            (
+                "linux",
+                linux::LinuxRoutes
+                    .revert_commands(&plan(test_mode(true)))
+                    .unwrap(),
+            ),
+        ] {
+            assert_no_default_route_deletion(name, &rendered(&cmds));
         }
     }
 
@@ -392,12 +452,25 @@ mod tests {
         // Ordering matters: install 0/1 first and the SSH connection can drop
         // before its own pin exists.
         let cmds = rendered(&linux::LinuxRoutes.apply_commands(&default_plan()).unwrap());
+        assert_pin_precedes_both_halves("linux", &cmds);
+    }
+
+    /// Checking the pin against only `0.0.0.0/1` leaves the other half
+    /// unconstrained: an ordering of `[128.0.0.0/1, pin, 0.0.0.0/1]` would pass
+    /// while still installing a default-beating route before the escape route
+    /// exists. Both halves must come after the pin.
+    fn assert_pin_precedes_both_halves(name: &str, cmds: &[String]) {
         let pin = cmds
             .iter()
             .position(|c| c.contains("198.51.100.7"))
-            .unwrap();
-        let half = cmds.iter().position(|c| c.contains("0.0.0.0/1")).unwrap();
-        assert!(pin < half, "server pin must come first: {cmds:?}");
+            .unwrap_or_else(|| panic!("{name}: no server pin found: {cmds:?}"));
+        for half in ["0.0.0.0/1", "128.0.0.0/1"] {
+            let at = cmds
+                .iter()
+                .position(|c| c.contains(half))
+                .unwrap_or_else(|| panic!("{name}: no {half} route found: {cmds:?}"));
+            assert!(pin < at, "{name}: server pin must precede {half}: {cmds:?}");
+        }
     }
 
     #[test]
@@ -406,12 +479,7 @@ mod tests {
         // (deadlock avoidance, spec §10) is just as load-bearing on macOS, so
         // it needs the same regression coverage on that platform too.
         let cmds = rendered(&macos::MacOsRoutes.apply_commands(&default_plan()).unwrap());
-        let pin = cmds
-            .iter()
-            .position(|c| c.contains("198.51.100.7"))
-            .unwrap();
-        let half = cmds.iter().position(|c| c.contains("0.0.0.0/1")).unwrap();
-        assert!(pin < half, "server pin must come first: {cmds:?}");
+        assert_pin_precedes_both_halves("macos", &cmds);
     }
 
     #[test]
@@ -461,6 +529,29 @@ mod tests {
                 "{name}: every destination Default mode applies must have exactly one \
                  matching revert, and vice versa: applied={applied:?} reverted={reverted:?}"
             );
+
+            // Matching destinations alone would pass if the revert arm re-issued
+            // `add` for every route it was supposed to remove — the routes would
+            // then survive teardown, wedging the operator's network for exactly
+            // as long as the interface outlives the process.
+            for cmd in &reverted {
+                if cmd.program == "networksetup" {
+                    continue;
+                }
+                assert!(
+                    cmd.args.iter().any(|a| a == "delete" || a == "del"),
+                    "{name}: every revert command must actually delete: {cmd:?}"
+                );
+            }
+            for cmd in &applied {
+                if cmd.program == "networksetup" {
+                    continue;
+                }
+                assert!(
+                    cmd.args.iter().any(|a| a == "add"),
+                    "{name}: every apply command must actually add: {cmd:?}"
+                );
+            }
         }
     }
 
