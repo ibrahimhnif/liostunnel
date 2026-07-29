@@ -9,6 +9,8 @@
 known_hosts
 
 testing/docker/sshd/keys/
+testing/docker/ss/conf/
+testing/docker/.env
 
 .DS_Store
 
