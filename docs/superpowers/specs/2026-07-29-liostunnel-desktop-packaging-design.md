@@ -112,53 +112,67 @@ rejected.
 # bundle's binary, not whatever is stale in target/.
 ```
 
-## 5. First launch
+## 5. First launch installs the helper
 
-The app already distinguishes the two failures it can get from the socket:
+**Automatic, on the first detection, with the operating system's own password
+dialog as the consent gate.** No button in front of it: the OS prompt is the
+real gate, and an app-drawn confirmation ahead of it is friction that adds
+nothing a user reads.
+
+The app already distinguishes the two failures the socket can give it:
 `HelperUnavailable` (ENOENT — never installed) and `HelperForbidden`
-(EACCES/EPERM — installed for a different user). **The offer appears only for
-the first.** Reinstalling because someone else owns the socket is a different
-decision with a different consequence, and it keeps its current message.
+(EACCES/EPERM — installed for a different user). **The install runs only for
+the first.** Installing over a helper someone else owns is a different
+decision with a different consequence, and that case keeps its current
+message.
 
-On `HelperUnavailable`, the connection screen shows a panel, not a modal:
-
-1. **What is missing and why** — the app needs a privileged helper to create
-   the tunnel device and change the routing table, which a normal program
-   cannot do.
-2. **Exactly what will run as root**, by path, with the authorized uid named:
-   *"`…/helper/install-helper.sh --uid 501` — installs the helper to
-   `/usr/local/libexec` and registers it as a system daemon serving uid 501."*
-   The user reads what they are approving before the OS dialog appears, which
-   is the half of "read the script first" that survives automation.
-3. **An Install button**, and a line saying it can also be run by hand.
-
-Pressing it runs, with no shell interpolation of any path:
+So, at startup, after the first attach fails with `HelperUnavailable`:
 
 - **macOS:** `osascript -e 'do shell script "…" with administrator privileges'`
 - **Linux:** `pkexec …`
 
-Both raise the operating system's own password dialog. Neither needs signing.
+Both raise the OS password dialog. Neither needs signing. On success the
+client retries the socket and the screen shows Disconnected.
+
+While the dialog is up the screen says what is happening — *"Installing the
+privileged helper. macOS is asking for your password."* — so a prompt that
+appears the instant the app opens is explained rather than mysterious.
+
+### Once per launch, and this is not negotiable
+
+`HelperClient` retries a dropped or absent socket on a timer. Wiring the
+prompt to that would re-raise the password dialog every few seconds after a
+cancel — a loop the user cannot escape without force-quitting the app.
+
+**The attempt is made at most once per process launch.** After a cancel or a
+failure the screen falls back to a panel that names the exact command
+(`…/helper/install-helper.sh --uid 501`) and offers a button to try again, and
+no further prompt appears on its own. A user who cancels has said no; asking
+again unprompted is how an app becomes something you close.
 
 ### Failure modes, each with its own message
 
 | | |
 |---|---|
-| User cancels | `osascript` exits 1 with `User canceled` (error `-128`); `pkexec` exits **126**. Not an error — the panel stays, no toast |
+| User cancels | `osascript` exits 1 with `User canceled` (error `-128`); `pkexec` exits **126**. Not an error — the panel appears, no toast, nothing red |
 | Wrong password | The OS retries and then fails. Reported as "authorization failed", not as an install failure |
-| `pkexec` absent | Exit **127**, or the process fails to spawn. Message names the manual command instead |
-| Script fails | Its stderr is shown verbatim. It is our own script and its messages are ours, so quoting it is safe — unlike the helper's, whose wording the app never renders |
-| Succeeds | The client retries the socket; on success the panel goes and the screen shows Disconnected |
+| `pkexec` absent | Exit **127**, or the spawn fails. The panel names the manual command instead |
+| Script fails | Its stderr shown verbatim. It is our script and its messages are fixed strings we wrote — unlike the helper's, whose wording the app never renders |
+| Succeeds | The client retries the socket; the panel never appears |
 
-**A path with a space breaks `do shell script`** if built by string
-concatenation — and `/Applications/` is not the only place an app lands.
-Every path is quoted for the shell before interpolation, and a test covers a
+**A path containing a space breaks `do shell script`** if built by string
+concatenation, and `/Applications/` is not the only place an app lands. Every
+path is quoted for the shell before interpolation, and a test covers a
 directory whose name contains a space.
 
-### What is not automatic
+### What this costs, recorded because it was a deliberate choice
 
-The helper is **not** installed silently on launch. The panel appears, the
-user reads what will run, and presses a button. An app that escalates to root
-without being asked is a different product.
+Running the script by hand means reading it before it runs as root. This
+replaces that with an OS dialog and trust that the app chose what runs. For an
+unsigned binary that is the weaker posture — and it is the same line the
+audience decision drew, so it is consistent rather than new. The panel's
+command text is what remains of "see it before it runs", available after a
+cancel and in the README.
 
 ## 6. The CI job
 
@@ -220,9 +234,12 @@ runnable locally:
 **Dart tests** for the first-launch path, with the privileged runner injected
 as a function so no test ever escalates:
 
-- the panel appears on `HelperUnavailable` and **not** on `HelperForbidden`;
-- the command shown names the resolved script path and the real uid;
-- a cancel (exit 126 / `User canceled`) leaves the panel and raises no error;
+- the install runs on `HelperUnavailable` and **not** on `HelperForbidden`;
+- **it runs at most once per launch** — the covering test drives several
+  socket-retry cycles and asserts the privileged runner was invoked exactly
+  once. This is the assertion that stops a password-prompt loop;
+- the panel's command text names the resolved script path and the real uid;
+- a cancel (exit 126 / `User canceled`) shows the panel and raises no error;
 - a failure shows the script's stderr;
 - success re-tries the socket;
 - `helperBundleDir()` resolves correctly for both platforms' executable
@@ -252,8 +269,9 @@ the alternative is a failure the user cannot act on.
 | PKG-3 | `install-helper.sh` accepts a uid from `SUDO_UID`, `PKEXEC_UID` or `--uid`, still refuses uid 0, and still refuses when it cannot tell |
 | PKG-4 | `install-helper.sh` finds the bundled binary, and still finds `target/release` in a checkout |
 | PKG-5 | The bundled helper is a working executable for its platform |
-| PKG-6 | First launch with no helper shows the panel, names the exact command, and installs on approval |
-| PKG-7 | Cancelling leaves the app usable and raises no error; a path containing a space still works |
+| PKG-6 | First launch with no helper raises the OS password dialog automatically and installs on approval |
+| PKG-7 | Cancelling leaves the app usable, raises no error, and **produces no second prompt** for the life of the process |
+| PKG-8 | A path containing a space still works; `pkexec` being absent names the manual command |
 
 **PKG-3 is the one to care about.** The others make the artifact usable; that
 one is the security boundary surviving a new way of being invoked. A helper
