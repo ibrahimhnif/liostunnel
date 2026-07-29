@@ -121,20 +121,27 @@ fn encode_tag(tag: &str) -> String {
 /// Links in circulation carry raw tags -- `#My Server` is ordinary -- so a
 /// strict decoder would reject or mangle every link a provider has issued.
 /// `%` followed by two hex digits decodes; anything else, including a bare
-/// `%`, is literal. Total on any `&str`: iterates bytes, never indexes.
+/// `%`, is literal.
+///
+/// Total on any `&str`. The lookahead uses `slice::get` rather than a
+/// hand-written bounds check: the check was correct, but it was the only
+/// thing standing between a pasted `#100%A` and an out-of-bounds index, and
+/// a single `<` to `<=` would have restored the panic with the whole suite
+/// still green. `get` moves that guarantee to the compiler.
 fn decode_tag(tag: &str) -> String {
     let b = tag.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            let hi = (b[i + 1] as char).to_digit(16);
-            let lo = (b[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                b.get(i + 1).and_then(|c| (*c as char).to_digit(16)),
+                b.get(i + 2).and_then(|c| (*c as char).to_digit(16)),
+            )
+        {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;
@@ -214,6 +221,15 @@ pub fn parse_ss_uri(uri: &str) -> Result<SsUri, TunnelError> {
 /// boundary, for the same reason `ss_uri_password` is a separate FFI call
 /// from `import_ss_uri`: a credential inside a value that gets rendered is the
 /// thing this module exists to prevent.
+///
+/// **Inverse of [`parse_ss_uri`] for any profile this build accepts.** Total
+/// on every input, but not every input round-trips: an empty method or
+/// password, port 0, and a bracketed or IPv6 host all render a link that this
+/// build's own parser then refuses. `ServerProfile::validate` blocks the empty
+/// host and port 0 but none of the others, so a caller rendering an
+/// unvalidated profile can produce a link nothing here will read back.
+/// `Some("")` renders no fragment and parses back as `None` — idempotent,
+/// since the parser maps an empty fragment to `None` too.
 pub fn render_ss_uri(
     method: &str,
     password: &str,
@@ -554,9 +570,11 @@ mod tests {
     }
 
     /// The round trip is the whole point: a link this build renders must parse
-    /// back to what it was rendered from. A password containing `@` and `:` is
-    /// the case that makes the parser's `rsplit_once`/`split_once` choices
-    /// non-obvious, so it is the case the test uses.
+    /// back to what it was rendered from. The `:` in the password is the
+    /// load-bearing half: `split_creds` must split on the FIRST colon, and
+    /// mutating it to `rsplit_once` fails here. The `@` cannot hide a defect
+    /// -- the password lives inside base64, whose alphabet has no `@`, so a
+    /// rendered link contains exactly one and both split directions agree.
     #[test]
     fn a_rendered_link_parses_back_to_what_it_was_rendered_from() {
         let link = render_ss_uri(
@@ -587,6 +605,16 @@ mod tests {
         // does not -- unencoded, `%41BC` decodes to `ABC`.
         for name in [
             "%41BC",
+            // Whitespace is the other half, and it is not decoration.
+            // `parse_ss_uri` trims the WHOLE uri, so an unencoded trailing
+            // space is eaten; a name that is only whitespace trims to an
+            // empty fragment, which the parser maps to `None` -- the name
+            // does not come back wrong, it disappears. `ServerProfile::
+            // validate` puts no constraint on `name` at all, not even
+            // non-empty, so a typed trailing space is an everyday accident.
+            "Home ",
+            " ",
+            "Home\n",
             "Home #2",
             "a?b",
             "100%",
@@ -610,6 +638,52 @@ mod tests {
         // A bare `%` is not an escape and must not be swallowed.
         let back = parse_ss_uri(&format!("ss://{creds}@h:1#100% done")).unwrap();
         assert_eq!(back.tag.as_deref(), Some("100% done"));
+
+        // The lookahead boundary. `#100%A` is the only shape that reaches
+        // past the end -- `%` at len-2 with one byte after it -- and it was
+        // the shape no test produced, so the hand-written bounds check that
+        // used to guard it could have been flipped to `<=` with the whole
+        // suite still green. A paste is exactly where this arrives.
+        for (tag, want) in [
+            ("100%", "100%"),
+            ("100%A", "100%A"),
+            ("%ZZ", "%ZZ"),
+            // "%4" specifically: a decoder that treated the missing second
+            // digit as zero would yield 0x40 ("@"), which is valid UTF-8 and
+            // so slips past the from_utf8 fallback that masks the other
+            // truncated cases. Without this row that mutation stays green.
+            ("%4", "%4"),
+            ("%", "%"),
+            ("%%41", "%A"),
+        ] {
+            let back = parse_ss_uri(&format!("ss://{creds}@h:1#{tag}")).unwrap();
+            assert_eq!(back.tag.as_deref(), Some(want), "tag was {tag}");
+        }
+    }
+
+    /// SIP002 requires websafe base64. `decode` accepts the standard alphabet
+    /// and stray padding too, deliberately, so that legacy links parse -- but
+    /// that inbound leniency must not be what certifies our OUTBOUND links. A
+    /// regression to `+`/`/`/`=` would ship links other clients may reject and
+    /// no round-trip test here would notice.
+    #[test]
+    fn a_rendered_link_uses_the_websafe_alphabet() {
+        // A password whose bytes hit the alphabets' only differing positions.
+        let link = render_ss_uri("aes-256-gcm", "\u{fb}\u{ff}\u{be}", "h", 1, None);
+        let creds = link
+            .strip_prefix("ss://")
+            .and_then(|r| r.split_once('@'))
+            .expect("rendered links have a creds section")
+            .0;
+        for c in ['+', '/', '='] {
+            assert!(!creds.contains(c), "not websafe: {creds}");
+        }
+        assert!(
+            creds
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+            "outside the websafe alphabet: {creds}"
+        );
     }
 
     #[test]
