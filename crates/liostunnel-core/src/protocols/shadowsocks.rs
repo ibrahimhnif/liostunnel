@@ -362,15 +362,28 @@ impl ShadowsocksTunnel {
     async fn probe(&self, dns: &DnsConfig) -> Result<(), TunnelError> {
         match tokio::time::timeout(self.probe_timeout, self.probe_once(dns)).await {
             Ok(r) => r,
-            // Deliberately not `Auth`. Running out of time says nothing
-            // about the credentials: an exit that cannot reach the
-            // configured resolver, or a network that stalls for eight
-            // seconds, produces exactly this, and telling that user their
-            // password is wrong sends them to change the one thing that was
-            // never at fault.
+            // Deliberately not `Auth`, and the message names both causes,
+            // because from here they are genuinely indistinguishable.
+            //
+            // The integration suite established which one is actually
+            // common: given a wrong password OR a wrong cipher, a real
+            // ss-libev server does not close the connection -- it accepts
+            // the bytes and silently discards them, which is the behaviour
+            // the whole probe exists to work around. So a bad credential
+            // against a real server arrives HERE, as a timeout, not at the
+            // `read_exact` arm below. The loopback fixtures reach that arm
+            // only because they hang up.
+            //
+            // Calling it `Auth` would still be wrong: an exit that cannot
+            // reach the configured resolver produces exactly this too, and
+            // telling that user their password is wrong sends them to change
+            // the one thing that was never at fault. So the message carries
+            // both, in the order of likelihood a real server implies.
             Err(_) => Err(TunnelError::Transport(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "the tunnel did not carry a probe query to the configured resolver in time; \
+                "nothing came back through the tunnel in time: the cipher or password may be \
+                 wrong (a Shadowsocks server given either accepts the connection and discards \
+                 it silently), or the exit cannot reach the resolver this profile names; \
                  the exit may not be able to reach it",
             ))),
         }
