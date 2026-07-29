@@ -21,30 +21,44 @@ Branch `phase1b-shadowsocks`. Fixture: `make -C testing/docker up` brings up
 
 ```
 $ cargo test -p liostunnel-core --test shadowsocks_integration -- --ignored
+test the_probe_reaches_a_resolver_only_the_relay_can_reach ... ok
 test connects_to_the_c_reference_implementation ... ok
 test connects_to_the_rust_server_with_a_chacha_cipher ... ok
 test relays_a_real_http_request_to_a_target_only_it_can_reach ... ok
 test a_wrong_password_fails_at_connect ... ok
 test the_wrong_cipher_against_a_real_server_also_fails_at_connect ... ok
-test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.00s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.27s
 ```
 
 `relays_a_real_http_request_to_a_target_only_it_can_reach` is the one that
 carries traffic. It targets the fixture's nginx on the compose network, whose
-port the host does not publish, and asserts **first** that a direct connection
-to that address fails — so the fetch succeeding is proof the bytes traversed
-the relay rather than taking a direct route. It then requires the response to
-contain `tunnel-target-ok` and both byte counters to have moved.
+port the host does not publish, requires the response to contain
+`tunnel-target-ok`, and asserts the byte counters moved **by a delta measured
+after `connect`**. The delta matters: `connect` runs the probe, which moves 19
+bytes up and 2 down through the same counters, so the absolute values are
+non-zero before the HTTP exchange begins and asserting `> 0` on them said
+nothing at all.
+
+**The counter delta, not reachability, is what proves the relay carried the
+bytes.** `CountingStream` wraps only streams that came out of
+`ProxyClientStream`, so a byte counted is a byte the Shadowsocks server
+relayed. An earlier version asserted the target is unreachable from the host;
+that is a property of the platform, not of the code — Docker Desktop does not
+route compose networks to the host, native Linux Docker does — so it passed
+here and would have failed in CI for a reason having nothing to do with the
+tunnel. It is now reported, not asserted.
 
 The plan named `93.184.216.34` for this. That was example.com's address and has
 since been retired, so the test would have failed for a reason having nothing
 to do with the tunnel — and would have made the result depend on the machine's
 own internet access. The compose address is discovered with `docker inspect`,
-not hardcoded: it moves on every `make down`/`make up`.
+not hardcoded: it moves on every `make down`/`make up`. The fixture also
+carries its own resolver, so no test here needs outbound internet from the
+machine running it.
 
-**A/B.** With `probe` short-circuited to `Ok(())`, the three connect tests stay
-green and both credential tests fail. With the relay test pointed at a
-directly-reachable address, its own reachability precondition fails.
+**A/B.** With `probe` short-circuited to `Ok(())`, the connect tests stay green
+and both credential tests fail. With the probe's stream detached from the
+counters, both relay-proof tests fail.
 
 ## P1b-2 — interoperates with libev
 
@@ -86,10 +100,17 @@ server implies:
 > wrong (a Shadowsocks server given either accepts the connection and discards
 > it silently), or the exit cannot reach the resolver this profile names
 
-**Open question for the review — see §6.** `dispatch::connect_failed` maps
-every non-`Auth` `TunnelError` to `ErrorKind::Internal`, which the app renders
-as *"The helper hit an internal error. Check its log."* Given the above, that
-is what a user with a wrong Shadowsocks password sees.
+**Resolved after the whole-branch review.** `dispatch::connect_failed` maps
+every non-`Auth` `TunnelError` to `ErrorKind::Internal`, rendered as *"The
+helper hit an internal error. Check its log."* — so the most common user error
+in this protocol read as a helper fault. The timeout arm now returns
+`TunnelError::Config { field: "auth", … }`, which the same dispatch already
+routes to `ErrorKind::BadRequest`. No new `ErrorKind`, no FFI change.
+
+The probe also now tries **every** resolver in `dns.servers` rather than only
+the first, dividing its ceiling across them — with a single outer ceiling a
+first resolver that swallows the query spends the whole budget and the loop
+never reaches the second.
 
 ## P1b-4 — `ss://` imports; malformed refused without echo
 
@@ -205,6 +226,25 @@ fn peer_addr(&self) -> Option<SocketAddr> { None }
 
 That is a spec decision, not something this phase enacted.
 
+**Two more holes in the same trait, found by the whole-branch review and not by
+the P1b-6 exercise itself** — recorded because the omission is part of the
+answer:
+
+- **`disconnect(&mut self)` is unreachable through `Arc<dyn Protocol>`**, which
+  is what the factory returns. No shipping teardown path calls it at all. This
+  is the same question one method over — "what can the factory's return type
+  express?" — and the exercise that found `peer_addr` should have found it.
+- **`open_tcp_stream_named` / `open_dns_stream_named` are inherent `SshTunnel`
+  methods with no trait counterpart.** Relaying by name keeps the destination
+  lookup inside the tunnel, and Shadowsocks supports it natively
+  (`Address::DomainNameAddress`) — so this is a capability both protocols have
+  that the trait cannot express. It is why the CLI's `probe` stays SSH-only and
+  why the Shadowsocks relay test has to discover an IP with `docker inspect`.
+
+So the honest answer to P1b-6 is: the abstraction held for the thing the phase
+set out to test, and the second protocol revealed three separate places where
+`Protocol` cannot say what both implementations know.
+
 ---
 
 ## §7 — end-to-end through the helper (needs root)
@@ -229,18 +269,30 @@ Expected: 14 passed, 0 failed.
 
 ## Decisions this phase defers to the review
 
-1. **`ErrorKind` for a probe timeout.** Established by P1b-3: a wrong
-   Shadowsocks credential arrives as `Transport(TimedOut)`, and every non-`Auth`
-   error becomes `ErrorKind::Internal`, rendered as *"The helper hit an internal
-   error."* No existing variant fits a transport failure, and adding one crosses
-   the FFI and the Dart UI.
+1. **`ErrorKind` for a probe timeout — RESOLVED, no new variant.** The probe's
+   timeout arm now returns `TunnelError::Config { field: "auth", … }`, which
+   `dispatch.rs` already routes to `ErrorKind::BadRequest` — the arm added this
+   phase for exactly this reasoning, "a profile the user can fix, not a helper
+   fault". The message names both causes. Zero FFI change, zero Dart change.
 
-2. **`disconnect` leaves open flows relaying.** Each `ProxyClientStream` owns
-   its own config clone, so `disconnect` — and a failed reconnect — clear the
-   retained state but do not stop traffic already in flight. `SshTunnel` gets
-   this for free by sending `SSH_MSG_DISCONNECT`, which EOFs every channel.
-   Fixing it needs live-stream tracking, which no task covers.
+2. **`Protocol::disconnect` is not called on any shipping teardown path** —
+   **corrected after the whole-branch review.** This was recorded as
+   "`disconnect` leaves open flows relaying, while `SshTunnel` gets teardown
+   for free from `SSH_MSG_DISCONNECT`". That comparison is false as shipped.
+   `Tunnel::drop` reverts routes, shuts down the stack and aborts the engine
+   task; it never touches the protocol, and `Engine` holds
+   `Arc<dyn Protocol>`, through which `disconnect(&mut self)` cannot be called
+   at all. The only callers in the tree are `cli/commands/probe.rs` and the
+   SSH integration tests. So **both** protocols behave identically on
+   teardown: nothing is signalled, and in-flight flows end only because the
+   stack shutdown kills their `LocalStream`.
+   The decision is therefore not "build live-stream tracking" but "either drop
+   `disconnect` from `Protocol` or give the teardown path a handle through
+   which it can be called". Recorded, not enacted — it is a trait change with
+   no user-visible symptom now that flows are bounded in time.
 
-3. **The probe contacts `dns.servers[0]` only**, while both resolvers iterate
-   every entry. A profile whose first resolver is down fails `connect` outright
-   even though DNS would work at runtime.
+3. **The probe contacts `dns.servers[0]` only — RESOLVED.** It now iterates
+   every entry and succeeds on the first that answers, dividing the 8s ceiling
+   across them: with only an outer ceiling, a first resolver that swallows the
+   query spends the whole budget and the loop never reaches the second, which
+   is the exact failure it exists to fix.
