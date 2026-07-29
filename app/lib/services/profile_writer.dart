@@ -110,6 +110,15 @@ class ProfileWriter {
   /// becomes `profile`. Two profiles therefore shared one secret file, and
   /// the second silently overwrote the first's credential. An id is unique by
   /// construction.
+  /// Where [writeSecret] would put this profile's secret, without writing
+  /// anything.
+  ///
+  /// Exists so a caller can name the file in a profile it is still checking.
+  /// Writing the secret first and validating after meant a refused save had
+  /// already overwritten the credential the on-disk profile pointed at.
+  String secretPathFor(String profileId) =>
+      '$secretsDirectory/${_slug(profileId)}';
+
   Future<String> writeSecret(String profileId, String secret) async {
     final dir = Directory(secretsDirectory);
     dir.createSync(recursive: true);

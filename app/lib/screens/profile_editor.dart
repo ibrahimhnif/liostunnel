@@ -162,7 +162,11 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       // `dto.id` unconditionally left an orphan 0600 file behind every single
       // import — nothing collects those, and deletion deliberately never
       // touches a secret file.
-      final id = widget.existing?.profile?.id ?? dto.id;
+      // `_importedId` and not just `dto.id`: on a new profile, a second
+      // paste (to correct a typo'd link) would otherwise mint a fresh id and
+      // orphan the first import's 0600 file — the very case the paragraph
+      // above claims to close, reached one gesture later.
+      final id = widget.existing?.profile?.id ?? _importedId ?? dto.id;
       // Straight to a 0600 file. The password is never held in widget state
       // and never reaches the profile document.
       final ref = await widget.writer.writeSecret(id, password);
@@ -204,12 +208,12 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       _busy = true;
       _error = null;
       _saved = null;
-      // The paste box holds a live credential and is not an input to this
-      // save — the import already took everything it carries. Clearing it
-      // here, rather than only on a successful import, is what stops a failed
-      // import or a toggle of the Authentication dropdown leaving the whole
-      // link legible on screen.
-      _uri.clear();
+      // Cleared only when an import actually consumed a link. Clearing it
+      // unconditionally meant a user who pasted a NEW link to rotate a
+      // password and then pressed Save instead of Import got a successful
+      // save of the OLD credential, with the link vanishing and nothing
+      // saying it had been ignored.
+      if (_importedId != null) _uri.clear();
     });
     try {
       final old = widget.existing?.profile;
@@ -227,9 +231,14 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
         replacingPath: widget.existing?.path,
       );
 
-      // A typed password becomes a 0600 file and the profile keeps the path.
+      // Where the secret WILL live, before anything is written. `writeSecret`
+      // overwrites the file keyed to this id, so running it before the
+      // profile is checked meant a refused save could destroy the credential
+      // the profile on disk still points at — an imported Shadowsocks
+      // password wiped by a typed one on a save the UI then reported as
+      // failed. Same shape as the name-collision bug, one field over.
       final source = _secretMode == 'typed'
-          ? await widget.writer.writeSecret(id, _secret.text)
+          ? 'file:${widget.writer.secretPathFor(id)}'
           : 'file:${_secretPath.text.trim()}';
 
       final dto = ProfileDto(
@@ -270,8 +279,12 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       );
 
       // Checked by the same Rust that will read it back, so a profile the
-      // app accepts is one the helper can parse.
+      // app accepts is one the helper can parse. Everything above this line
+      // is reversible; nothing below it should run if this throws.
       await checkProfile(dto: dto);
+      if (_secretMode == 'typed') {
+        await widget.writer.writeSecret(id, _secret.text);
+      }
       final file = await widget.writer.writeProfile(
         dto,
         sshUser: _user.text,
