@@ -499,6 +499,30 @@ void main() {
     dir.deleteSync(recursive: true);
   });
 
+  test('the list is ordered by name, not by filename', () async {
+    // Spec §4: "Ordering stays alphabetical by name." Sorting by path put
+    // every copy ABOVE the profile it was copied from — `home-vps-copy.json`
+    // sorts before `home-vps.json` because `-` is below `.` — so `duplicate`,
+    // whose whole point is a profile that sits beside its original, produced a
+    // list in which it never did.
+    //
+    // Case-insensitively, which the fixture pins: `Home VPS` and a broken
+    // `aaa-broken.json` order the other way round under `compareTo`, where
+    // every capital sorts before every lower-case letter.
+    final dir = Directory.systemTemp.createTempSync('lios-store-order');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    File('${dir.path}/home-vps-copy.json')
+        .writeAsStringSync(sample.replaceAll('Home VPS', 'Home VPS copy'));
+    File('${dir.path}/home-vps.json').writeAsStringSync(sample);
+    // A profile that did not parse has no name to sort on. The filename is
+    // what the row shows for one, so it is what the row sorts on too.
+    File('${dir.path}/aaa-broken.json').writeAsStringSync('{ not a profile');
+
+    final loaded = await ProfileStore(directory: dir.path).load();
+    expect(loaded.map((p) => p.name).toList(),
+        ['aaa-broken.json', 'Home VPS', 'Home VPS copy']);
+  });
+
   testWidgets('a search that matches nothing says so', (tester) async {
     // Without this the list falls through to an empty ListView, which reads
     // exactly like "your profiles are gone" — the same failure the

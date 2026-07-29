@@ -963,6 +963,67 @@ void duplicateTests() {
     dir.deleteSync(recursive: true);
   });
 
+  // A credential this app did not write is not this app's to copy. The copy
+  // rule exists because `writeSecret` keys the file on the profile id, so two
+  // profiles naming ONE managed file are one edit away from destroying each
+  // other's password. Nothing of the sort is true of a file outside
+  // `secretsDirectory`: `_writeSecretBytes` can only write inside it, and for
+  // `private_key` the editor removes the "Type it" mode entirely, so
+  // `writeSecret` is never called for an SSH key profile at all. This is the
+  // reasoning `duplicate` already applies one field over to an `env:`
+  // passphrase — "two profiles reading it destroy nothing".
+  test('a secret file outside the secrets directory is carried, not copied',
+      () async {
+    final dir = Directory.systemTemp.createTempSync('lios-dup-external');
+    final w = ProfileWriter(directory: dir.path);
+    final key = '${dir.path}/id_ed25519';
+    File(key).writeAsStringSync('-----BEGIN OPENSSH PRIVATE KEY-----');
+    final original = await w.writeProfile(keyProfile(source: 'file:$key'));
+
+    final copy = await w.duplicate(await loaded(original));
+
+    final copyDto = await parseProfile(json: copy.readAsStringSync());
+    expect(copyDto.authSecretSource, 'file:$key',
+        reason: 'a copy of your ~/.ssh key under a UUID in the app\'s own '
+            'directory is a second copy of a private key you never asked '
+            'for, and one `delete` deliberately never collects');
+    expect(Directory(w.secretsDirectory).existsSync(), isFalse,
+        reason: 'nothing may be written into the managed directory for a '
+            'credential that does not live there');
+    expect(File(key).readAsStringSync(),
+        '-----BEGIN OPENSSH PRIVATE KEY-----',
+        reason: 'and the original file is untouched either way');
+    dir.deleteSync(recursive: true);
+  });
+
+  test('a passphrase file outside the secrets directory is carried too',
+      () async {
+    // The same rule, one field over. The key here IS managed, so the copy gets
+    // its own — which is what stops this passing on a `duplicate` that simply
+    // stopped copying everything.
+    final dir = Directory.systemTemp.createTempSync('lios-dup-external2');
+    final w = ProfileWriter(directory: dir.path);
+    const id = '11111111-1111-1111-1111-111111111111';
+    final keyRef = await w.writeSecret(id, 'PRIVATE KEY');
+    final phrase = '${dir.path}/key-passphrase';
+    File(phrase).writeAsStringSync('original-phrase');
+    final original = await w
+        .writeProfile(keyProfile(source: keyRef, passphrase: 'file:$phrase'));
+
+    final copy = await w.duplicate(await loaded(original));
+
+    final copyDto = await parseProfile(json: copy.readAsStringSync());
+    expect(copyDto.authPassphraseSource, 'file:$phrase',
+        reason: 'the passphrase lives where the user put it');
+    expect(copyDto.authSecretSource, isNot(keyRef),
+        reason: 'while the managed key is still copied — the rule is where '
+            'the file lives, not which field it is');
+    expect(Directory(w.secretsDirectory).listSync().length, 2,
+        reason: "the original's key and the copy's, and no third file for a "
+            'passphrase that was never this app\'s to copy');
+    dir.deleteSync(recursive: true);
+  });
+
   test('duplicating a profile that did not parse is refused', () async {
     // Reachable: the list deliberately shows files it could not read, so
     // whatever menu offers Duplicate can be pointed at one. `source.profile!`

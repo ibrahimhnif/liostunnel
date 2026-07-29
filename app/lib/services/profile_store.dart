@@ -50,13 +50,11 @@ class ProfileStore {
     final dir = Directory(directory);
     if (!dir.existsSync()) return const [];
 
-    final files =
-        dir
-            .listSync()
-            .whereType<File>()
-            .where((f) => f.path.endsWith('.json'))
-            .toList()
-          ..sort((a, b) => a.path.compareTo(b.path));
+    final files = dir
+        .listSync()
+        .whereType<File>()
+        .where((f) => f.path.endsWith('.json'))
+        .toList();
 
     final out = <LoadedProfile>[];
     for (final f in files) {
@@ -76,6 +74,20 @@ class ProfileStore {
         out.add(LoadedProfile(path: f.path, error: 'not a valid profile'));
       }
     }
+    // Spec §4: "Ordering stays alphabetical by name." By NAME, and not by the
+    // filename it slugs to: `home-vps-copy.json` sorts before `home-vps.json`
+    // — `-` is below `.` — so every duplicate appeared above the profile it
+    // was copied from, which is the one place it should never be.
+    //
+    // [LoadedProfile.name] falls back to the filename for a profile that did
+    // not parse, which is also what its row shows, so a broken file sorts
+    // where the user reads it. Case-insensitively, because "alphabetical" is
+    // not "every capital first"; the path breaks a tie, so the order is
+    // total and stable whatever `listSync` returns.
+    out.sort((a, b) {
+      final byName = a.name.toLowerCase().compareTo(b.name.toLowerCase());
+      return byName != 0 ? byName : a.path.compareTo(b.path);
+    });
     return out;
   }
 }
