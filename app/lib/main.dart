@@ -4,10 +4,12 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import 'screens/connection.dart';
+import 'screens/dialogs.dart';
 import 'screens/profile_editor.dart';
 import 'screens/profiles.dart';
 import 'services/connection_model.dart';
 import 'services/helper_client.dart';
+import 'services/link_export.dart';
 import 'services/profile_store.dart';
 import 'services/profile_writer.dart';
 import 'src/rust/api/protocol.dart';
@@ -38,7 +40,25 @@ class LiosApp extends StatelessWidget {
 }
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+  const HomePage({
+    super.key,
+    this.profilesDirectory,
+    this.socketPath = kSocketPath,
+  });
+
+  /// Where profiles live. Null means the operator's own `~/.liostunnel`.
+  ///
+  /// A seam for tests and nothing else. This page deletes files, and a widget
+  /// test that pumped it without one would do that in the directory the person
+  /// running the suite keeps their real profiles in.
+  final String? profilesDirectory;
+
+  /// Where the helper listens.
+  ///
+  /// Overridable for the same reason: a test points it at a path nobody is
+  /// listening on, so [_attach] fails into the error banner instead of
+  /// reaching a helper that may genuinely be running on this machine.
+  final String socketPath;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -46,7 +66,7 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   final _client = HelperClient();
-  final _store = ProfileStore();
+  late final _store = ProfileStore(directory: widget.profilesDirectory);
   late final _writer = ProfileWriter(directory: _store.directory);
   List<LoadedProfile> _profiles = const [];
   LoadedProfile? _selected;
@@ -87,6 +107,10 @@ class _HomePageState extends State<HomePage> {
     if (mounted) setState(() => _profiles = loaded);
   }
 
+  void _toast(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
   /// Connects to the helper and mirrors everything it pushes into the model.
   ///
   /// Asking for status immediately is what makes a relaunched app re-sync to
@@ -96,7 +120,7 @@ class _HomePageState extends State<HomePage> {
     final model = context.read<ConnectionModel>();
     _client.events.listen(model.applyEvent);
     try {
-      await _client.connect(kSocketPath);
+      await _client.connect(widget.socketPath);
       await _client.hello();
       await _client.getStatus();
     } catch (e) {
@@ -158,6 +182,40 @@ class _HomePageState extends State<HomePage> {
         }),
         onCreate: () => _openEditor(null),
         onEdit: _openEditor,
+        onDuplicate: (p) async {
+          try {
+            await _writer.duplicate(p);
+            await _reload();
+          } catch (e) {
+            if (mounted) _toast('$e');
+          }
+        },
+        // The producer is passed unevaluated: Cancel then returns without the
+        // secret file having been opened at all.
+        onCopyLink: (p) => confirmAndCopyLink(context, () => ssLinkFor(p)),
+        // The only destructive entry in this menu, and the profile document is
+        // the only copy: it asks first, through the same dialog the editor's
+        // Delete button uses.
+        onDelete: (p) async {
+          if (!await confirmDeleteProfile(context, p.name)) return;
+          try {
+            await _writer.delete(p.path);
+            // A profile that was deleted is no longer the one the connection
+            // screen is holding — the same rule, and the same two lines, as
+            // `_openEditor`'s `onSaved`. Without this the Connection tab still
+            // named it and Connect was still enabled, because that guard is
+            // `selected?.profile == null` and the DTO is still in memory.
+            if (_selected?.path == p.path) setState(() => _selected = null);
+            await _reload();
+          } catch (e) {
+            // `_deleteQuietly` checks `existsSync` and then calls
+            // `deleteSync`, which still throws on a permission failure or a
+            // file removed between the two. Unhandled, that escaped an
+            // unawaited async callback: no toast, no reload, the row stayed,
+            // and the user got no signal at all. Same shape as `onDuplicate`.
+            if (mounted) _toast('$e');
+          }
+        },
       ),
       ConnectionScreen(
         selected: _selected,

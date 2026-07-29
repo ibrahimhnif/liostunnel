@@ -86,7 +86,13 @@ impl SecretStore for FileSecretStore {
 /// content, not editor residue. Blindly trimming every trailing `\n` (the
 /// previous behaviour) silently corrupted such keys on every read, and on
 /// CRLF files left a stray `\r` glued to the end of the secret.
-fn strip_one_trailing_line_ending(body: &str) -> &str {
+///
+/// Public because this rule *defines* what a `file:` secret's value is, and
+/// anything that has to agree with the helper about the user's password has
+/// to call it rather than restate it. The app's copy-as-link path is the
+/// second caller: it read the file itself, skipped this, and copied a link
+/// whose password was `hunter2\n` for a tunnel that connects with `hunter2`.
+pub fn strip_one_trailing_line_ending(body: &str) -> &str {
     body.strip_suffix("\r\n")
         .or_else(|| body.strip_suffix('\n'))
         .unwrap_or(body)

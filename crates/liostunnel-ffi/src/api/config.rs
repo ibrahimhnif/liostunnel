@@ -234,6 +234,103 @@ pub fn ss_uri_password(uri: String) -> Result<String, String> {
     Ok(parse(&uri)?.password.expose().clone())
 }
 
+/// What a `file:` secret's *value* is, given the file's bytes.
+///
+/// Not the raw bytes. `FileSecretStore::resolve` — the thing the helper
+/// actually connects with — strips one trailing line ending, because a
+/// password written by `echo hunter2 > pw` means `hunter2` while a PEM private
+/// key's own final newline is content. That rule has exactly one owner, in the
+/// core, and this hands it to Dart rather than letting a second copy grow
+/// there. A second copy is free to drift, on a rule whose entire purpose is
+/// that two components agree about the user's password: the app read the file
+/// itself and copied an `ss://` link carrying `hunter2\n`, which every other
+/// client then derives a different key from, and Shadowsocks has no handshake
+/// in which to report it.
+///
+/// Bytes in, because a credential is bytes: a binary pre-shared key or a
+/// DER-encoded private key is not text, and `read_to_string` — like Dart's
+/// `readAsStringSync` — answers one with a decoder's complaint about byte
+/// offsets. A refusal is the honest outcome for anything that needs a
+/// `String`, but it should be a sentence the app wrote. Nothing of the file
+/// appears in it.
+pub fn file_secret_value(bytes: Vec<u8>) -> Result<String, String> {
+    let body = String::from_utf8(bytes)
+        .map_err(|_| "this secret file is not text, so it cannot be read as a password")?;
+    Ok(liostunnel_core::config::secret::strip_one_trailing_line_ending(&body).to_string())
+}
+
+/// Renders a Shadowsocks profile as an `ss://` link the user can copy.
+///
+/// **The returned String carries the password.** It is what every other
+/// Shadowsocks client accepts, which is the point, and there is no
+/// secret-free form of an `ss://` link. The caller is responsible for asking
+/// before putting it anywhere shared.
+///
+/// The password comes in as a parameter: the app runs as the user and the
+/// secret file is the user's own, so Dart reads it. This crate does not open
+/// files on the app's behalf.
+///
+/// Refusals name no field of the profile. Every one of them is
+/// caller-supplied and this error crosses back over the wire.
+///
+/// **This is the well-formedness guard.** `render_ss_uri` is total, but not
+/// every input renders something a Shadowsocks client can read: an empty host,
+/// port 0, an IPv6 or bracketed host, an empty cipher and an empty password
+/// each produce a link that this build's own `parse_ss_uri` then refuses.
+/// `ProfileDto` enforces none of those — its fields are a `String`, a `u16` and
+/// an `Option<String>` — and nothing upstream is guaranteed to have screened
+/// them. Without these checks the user copies something no client can use.
+///
+/// It is deliberately NOT a round-trip guard, and that is the one asymmetry
+/// with [`import_ss_uri`], which calls [`check_cipher`]. A profile written by
+/// the CLI may name `2022-blake3-aes-256-gcm` — today's default server cipher —
+/// and the link this renders for it is perfectly well formed and perfectly
+/// usable in Outline or shadowsocks-rust. That it will not import back into
+/// *this* build is a limitation of this build's cipher feature set, not a
+/// defect in the link, and "copy as a link" exists precisely so a profile can
+/// be used in another client. Refusing here would withhold a working link from
+/// a profile this app cannot connect with OR edit — a dead end, in place of the
+/// one gesture that still gets the user's own credential out. The cipher name
+/// is not secret and the link says it plainly, so nothing is hidden by letting
+/// it through. `a_link_is_rendered_for_a_cipher_this_build_cannot_speak` pins
+/// this decision, including the half that makes it a decision: our own import
+/// still refuses it.
+pub fn export_ss_uri(dto: ProfileDto, password: String) -> Result<String, String> {
+    if dto.auth_kind != "shadowsocks" || dto.protocol != "shadowsocks" {
+        return Err("only a shadowsocks profile can be rendered as an ss:// link".into());
+    }
+    let method = dto
+        .cipher
+        .as_deref()
+        .filter(|c| !c.is_empty())
+        .ok_or("a shadowsocks profile without a cipher cannot be rendered")?;
+    if password.is_empty() {
+        return Err("a link needs the profile's password, and this one is empty".into());
+    }
+    if dto.host.is_empty() {
+        return Err("a link needs a host, and this profile has none".into());
+    }
+    // `parse_ss_uri` splits `host:port` on the last colon and refuses IPv6
+    // outright — the packet stack is IPv4-only. A bracketed literal renders a
+    // link that only this build's own parser would have to unpick, so it is
+    // refused here rather than emitted.
+    if dto.host.contains(':') || dto.host.contains('[') {
+        return Err("an IPv6 host cannot be written as an ss:// link this build reads".into());
+    }
+    if dto.port == 0 {
+        return Err("a link needs a port, and this profile's is zero".into());
+    }
+    Ok(liostunnel_core::protocols::ss_uri::render_ss_uri(
+        method,
+        &password,
+        &dto.host,
+        dto.port,
+        // `render_ss_uri` maps `Some("")` to no fragment itself, so this is
+        // just the `&str`.
+        Some(dto.name.as_str()),
+    ))
+}
+
 /// Shared by both entry points so the link is parsed by one implementation.
 ///
 /// Note the error is `e.to_string()` on a `TunnelError::Config` whose reason
@@ -246,6 +343,176 @@ fn parse(uri: &str) -> Result<liostunnel_core::protocols::ss_uri::SsUri, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SAMPLE_SSH: &str = r#"{
+        "id":"b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f","name":"Home VPS",
+        "protocol":"ssh","host":"198.51.100.7","port":22,
+        "auth":{"type":"password","password":{"source":"file","path":"/tmp/k"}},
+        "dns":["1.1.1.1"],"split_tunnel":{"type":"all_traffic"},
+        "kill_switch":false}"#;
+
+    #[test]
+    fn a_shadowsocks_profile_exports_to_a_link_that_imports_back() {
+        use base64::Engine;
+        let creds = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("aes-256-gcm:pw");
+        let dto = import_ss_uri(format!("ss://{creds}@198.51.100.7:8388#Home")).unwrap();
+        let link = export_ss_uri(dto.clone(), "pw".into()).unwrap();
+        let back = import_ss_uri(link).unwrap();
+        assert_eq!(back.host, dto.host);
+        assert_eq!(back.port, dto.port);
+        assert_eq!(back.cipher, dto.cipher);
+        assert_eq!(back.name, "Home");
+    }
+
+    #[test]
+    fn exporting_a_non_shadowsocks_profile_is_refused() {
+        // The cipher is set deliberately. Without it this test could not tell
+        // the protocol guard from the no-cipher fallback: an SSH profile has
+        // no cipher either, so dropping the protocol guard entirely still
+        // produced a refusal whose message also contains "shadowsocks", and
+        // the A/B that named the guard passed against its absence.
+        let mut dto = parse_profile(SAMPLE_SSH.into()).unwrap();
+        dto.cipher = Some("aes-256-gcm".into());
+        let e = export_ss_uri(dto, "pw".into()).unwrap_err();
+        assert!(
+            e.contains("only a shadowsocks profile"),
+            "must be the protocol guard, not the cipher fallback: {e}"
+        );
+    }
+
+    /// Every shape that passes the protocol and cipher guards but renders a
+    /// link this build's own parser refuses.
+    ///
+    /// Found by a reviewer running the real functions rather than reasoning
+    /// about them: five of these reached `render_ss_uri` and produced a link
+    /// that `parse_ss_uri` then rejected. The user copies a link, pastes it
+    /// back, and it does not import.
+    #[test]
+    fn a_profile_that_would_render_an_unreadable_link_is_refused() {
+        use base64::Engine;
+        let creds = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("aes-256-gcm:pw");
+        let good = import_ss_uri(format!("ss://{creds}@198.51.100.7:8388#Home")).unwrap();
+
+        // Concrete DTOs rather than a table of boxed closures: that shape is
+        // exactly what clippy's `type_complexity` is for, and the mutations
+        // read better inline anyway.
+        let host = |h: &str| {
+            let mut d = good.clone();
+            d.host = h.into();
+            d
+        };
+        let mut zero_port = good.clone();
+        zero_port.port = 0;
+        let mut empty_cipher = good.clone();
+        empty_cipher.cipher = Some(String::new());
+
+        for (what, dto, password) in [
+            ("empty host", host(""), "pw"),
+            ("ipv6 host", host("2001:db8::1"), "pw"),
+            ("bracketed ipv6 host", host("[2001:db8::1]"), "pw"),
+            ("port zero", zero_port, "pw"),
+            ("empty cipher", empty_cipher, "pw"),
+            ("empty password", good.clone(), ""),
+        ] {
+            assert!(
+                export_ss_uri(dto, password.into()).is_err(),
+                "{what} must be refused, not rendered into a link nothing reads"
+            );
+        }
+    }
+
+    /// The other half: everything the guard lets through must survive the
+    /// round trip. A guard that refused everything would pass the test above.
+    #[test]
+    fn every_link_this_guard_lets_through_imports_back() {
+        use base64::Engine;
+        for (cipher, host, port, name) in [
+            ("aes-256-gcm", "198.51.100.7", 8388u16, "Home"),
+            ("aes-128-gcm", "example.com", 1u16, "a?b#c"),
+            ("chacha20-ietf-poly1305", "h", 65535u16, ""),
+        ] {
+            let creds =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{cipher}:pw"));
+            let mut dto = import_ss_uri(format!("ss://{creds}@{host}:{port}")).unwrap();
+            dto.name = name.into();
+            let link = export_ss_uri(dto.clone(), "pw".into())
+                .unwrap_or_else(|e| panic!("{cipher}/{host}:{port} refused: {e}"));
+            let back = import_ss_uri(link).expect("our own link must import");
+            assert_eq!(back.host, dto.host);
+            assert_eq!(back.port, dto.port);
+            assert_eq!(back.cipher, dto.cipher);
+            if !name.is_empty() {
+                assert_eq!(back.name, name);
+            }
+        }
+    }
+
+    /// The decision the export guard makes about a cipher, stated once.
+    ///
+    /// `import_ss_uri` refuses `2022-blake3-aes-256-gcm`; this deliberately
+    /// does not. A CLI-written profile can name it — `method` is a free
+    /// `String` in the schema — and the link rendered for one is well formed
+    /// and usable in Outline or shadowsocks-rust, which is the entire point of
+    /// "copy as a link". Refusing would leave a profile this build can neither
+    /// connect with nor edit with no way at all to get the user's own
+    /// credential out.
+    ///
+    /// Both halves are asserted, because the second is what makes this a
+    /// decision rather than an oversight: the link is real, and our own import
+    /// still says no to it. If that ever becomes intolerable, the fix is
+    /// `check_cipher` here AND the doc comment above losing its second
+    /// paragraph — not one without the other.
+    #[test]
+    fn a_link_is_rendered_for_a_cipher_this_build_cannot_speak() {
+        use base64::Engine;
+        let creds = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("aes-256-gcm:pw");
+        let mut dto = import_ss_uri(format!("ss://{creds}@198.51.100.7:8388#Home")).unwrap();
+        dto.cipher = Some("2022-blake3-aes-256-gcm".into());
+
+        let link = export_ss_uri(dto, "pw".into())
+            .expect("a link for another client is not this build's to refuse");
+
+        // Parsed by the core, which deliberately does not check the method --
+        // the cipher list has one owner. This is what any other client sees.
+        let seen = liostunnel_core::protocols::ss_uri::parse_ss_uri(&link).unwrap();
+        assert_eq!(seen.method, "2022-blake3-aes-256-gcm");
+        assert_eq!(seen.password.expose(), "pw");
+        assert_eq!(seen.host, "198.51.100.7");
+        assert_eq!(seen.port, 8388);
+
+        // And the asymmetry, on purpose: this build will not take it back.
+        assert!(
+            import_ss_uri(link).is_err(),
+            "if this ever imports, the export guard is no longer the looser of \
+             the two and the doc comment above needs rewriting"
+        );
+    }
+
+    /// The refusal must not quote the profile. Every field of it is
+    /// caller-supplied and this error crosses back over the wire.
+    #[test]
+    fn an_export_refusal_never_echoes_the_profile() {
+        let mut dto = parse_profile(SAMPLE_SSH.into()).unwrap();
+        dto.host = "MARKER-HOST".into();
+        dto.name = "MARKER-NAME".into();
+        // `protocol` and `auth_kind` are the two fields the guard actually
+        // reads, so they are the two most likely to end up interpolated into
+        // its message -- and they were the two this test did not mark.
+        dto.protocol = "MARKER-PROTOCOL".into();
+        dto.auth_kind = "MARKER-AUTHKIND".into();
+        dto.cipher = Some("MARKER-CIPHER".into());
+        let e = export_ss_uri(dto, "MARKER-PASSWORD".into()).unwrap_err();
+        for marker in [
+            "MARKER-HOST",
+            "MARKER-NAME",
+            "MARKER-PROTOCOL",
+            "MARKER-AUTHKIND",
+            "MARKER-CIPHER",
+            "MARKER-PASSWORD",
+        ] {
+            assert!(!e.contains(marker), "echoed {marker}: {e}");
+        }
+    }
 
     #[test]
     fn an_ss_uri_imports_to_a_usable_profile() {
@@ -436,5 +703,69 @@ mod tests {
         let b = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("no-colon-SECRET");
         let e = import_ss_uri(format!("ss://{b}")).unwrap_err();
         assert!(!e.contains("SECRET"), "echoed: {e}");
+    }
+
+    /// A `file:` secret's value is the core's, not the file's raw bytes.
+    ///
+    /// Asserted against `FileSecretStore` itself rather than against a second
+    /// statement of the rule. That is the whole point of this function
+    /// existing: the helper resolves the secret one way, and anything in the
+    /// app that reads the same file must land on the same string or the two
+    /// components disagree about what the user's password is. `_copyLink` read
+    /// the file itself and handed the raw bytes to `export_ss_uri`, so a
+    /// password written by `echo hunter2 > pw` -- the case the core's helper
+    /// is documented for -- produced a link whose password was `hunter2\n`.
+    /// The tunnel connects with `hunter2`; the link derives a different key,
+    /// the server drops the ciphertext, and Shadowsocks has no handshake in
+    /// which to say why.
+    #[test]
+    fn a_file_secrets_value_is_whatever_the_core_resolves() {
+        use liostunnel_core::config::secret::{FileSecretStore, SecretRef, SecretStore};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("lios-ffi-secret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Every shape the core's own helper distinguishes, so this cannot pass
+        // by trimming more (or less) than the core does.
+        for raw in [
+            &b"hunter2\n"[..],
+            b"hunter2\r\n",
+            b"hunter2",
+            b"hunter2\n\n",
+            b"-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END-----\n",
+        ] {
+            let p = dir.join("pw");
+            std::fs::write(&p, raw).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+            let resolved = FileSecretStore
+                .resolve(&SecretRef::File { path: p.clone() })
+                .unwrap();
+            let ours = file_secret_value(raw.to_vec()).unwrap();
+            assert_eq!(
+                &ours,
+                resolved.expose(),
+                "the app must read {raw:?} as the helper does"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A credential is bytes, and not every credential is text.
+    ///
+    /// The refusal has to be ours. `readAsStringSync` in Dart answers a binary
+    /// pre-shared key with a UTF-8 decoder's complaint about byte offsets,
+    /// from a gesture that said "copy link", for a profile with nothing wrong
+    /// with it -- the lesson `ProfileWriter._readSecretFile` already records
+    /// one menu item over.
+    #[test]
+    fn a_secret_file_that_is_not_text_is_refused_in_our_own_words() {
+        let e = file_secret_value(vec![0x00, 0xff, 0xfe, 0x80]).unwrap_err();
+        assert!(
+            e.contains("not text"),
+            "the app's own sentence, not a decoder's: {e}"
+        );
+        // It reads a credential, so it may not quote one back.
+        assert!(!e.contains("0xff") && !e.contains("byte"), "{e}");
     }
 }

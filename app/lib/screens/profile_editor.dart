@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../services/profile_store.dart';
 import '../services/profile_writer.dart';
 import '../src/rust/api/config.dart';
+import 'dialogs.dart';
 import '../src/rust/dto/profile.dart';
 
 /// The cipher names the editor offers for Shadowsocks.
@@ -112,7 +113,54 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
   /// second case is any non-empty box at all.
   String? _importedUri;
 
+  /// The profile this editor has written, once it has written one.
+  ///
+  /// A save used to leave [ProfileEditorScreen.existing] null forever, so the
+  /// NEXT save was a second creation rather than an edit of the same profile.
+  /// Under a different name that wrote a second `.json` carrying the same
+  /// `id` and the same `authSecretSource` — two profiles sharing one secret
+  /// file, so editing either one's password in "Type it" mode silently
+  /// changed both, which is the failure `duplicate` writes its own secret file
+  /// to avoid. Under the SAME name it was refused outright, with
+  /// `checkNameFree` naming "a different profile" that was in fact the one in
+  /// front of the user.
+  ///
+  /// Held in state because `existing` is a widget field: what the editor is
+  /// editing genuinely changes when it writes a profile, and nothing above
+  /// rebuilds this route.
+  LoadedProfile? _adopted;
+
+  /// The profile the next save will replace, adopted or given.
+  LoadedProfile? get _current => _adopted ?? widget.existing;
+
+  /// Whether this editor OPENED on a profile that parsed.
+  ///
+  /// Deliberately [ProfileEditorScreen.existing] and not [_current]: this
+  /// decides the shape of the form — the title, the Delete button, and
+  /// through [_linkRowVisible] the `ss://` paste box. Rearranging the form
+  /// under the user the instant they press Save would take the paste box away
+  /// mid-session, and with it the one gesture that repairs a link typed
+  /// wrong. What a save adopts is which profile is being *written*, which is
+  /// [_current] and is asked for in [_save] alone.
   bool get _editing => widget.existing?.profile != null;
+
+  /// Whether the `ss://` paste box is on screen.
+  ///
+  /// One predicate, named once. `_save`'s guard against a pasted-but-not-
+  /// imported link and the box's own render condition have to agree exactly —
+  /// a guard that fires while the box is hidden refuses a save over a field
+  /// the user cannot see, and one that does not fire while the box is visible
+  /// discards a credential under a green "Saved to …". They were two separate
+  /// literals of `!_editing`, which is the arrangement this file has already
+  /// been bitten by: a change landed on one of two branches because
+  /// `dart format` had rewrapped the other.
+  bool get _linkRowVisible => !_editing;
+
+  /// Opens and closes the Advanced section from code.
+  ///
+  /// Held here so [_save] can open it when the helper refuses something it
+  /// hides — see [_namesSomethingAdvanced].
+  final _advanced = ExpansibleController();
 
   @override
   void initState() {
@@ -169,6 +217,9 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
     ]) {
       c.dispose();
     }
+    // Ours, not the tile's: ExpansionTile only disposes a controller it made
+    // itself.
+    _advanced.dispose();
     super.dispose();
   }
 
@@ -203,7 +254,7 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       // paste (to correct a typo'd link) would otherwise mint a fresh id and
       // orphan the first import's 0600 file — the very case the paragraph
       // above claims to close, reached one gesture later.
-      final id = widget.existing?.profile?.id ?? _importedId ?? dto.id;
+      final id = _current?.profile?.id ?? _importedId ?? dto.id;
 
       if (!mounted) return;
       setState(() {
@@ -277,9 +328,12 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
   /// dropdown would only move the same incoherence one control over. A new
   /// profile is cheap and is the thing the user actually wants.
   ///
-  /// Applies to edits only. A NEW profile has no protocol to change.
+  /// Applies to edits only. A NEW profile has no protocol to change — but a
+  /// new one this editor has already SAVED is no longer new, and rewriting it
+  /// under another protocol is the same incoherence, which is why this asks
+  /// [_current] rather than the widget field.
   void _refuseAProtocolChange(String authKind) {
-    final old = widget.existing?.profile;
+    final old = _current?.profile;
     if (old == null) return;
     final wanted = _protocolFor(authKind);
     if (wanted == old.protocol) return;
@@ -306,10 +360,19 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       // permanently true after the first import, so the profile was written
       // with the OLD password under a green "Saved to …".
       //
-      // Only when the box is on screen: `_uri` keeps its text after the
-      // Authentication dropdown moves away from Shadowsocks, and refusing a
-      // save over a field the user cannot see would be its own trap.
-      if (_authKind == 'shadowsocks' &&
+      // Only when the box is on screen, and that is [_linkRowVisible] — the
+      // very getter the box is rendered under, rather than a second literal
+      // of the same condition — rather than "the Authentication dropdown says
+      // Shadowsocks". The paste box no longer lives behind that dropdown —
+      // importing is what decides the protocol — so keying on `_authKind`
+      // would have let the commonest case through untouched: paste a link
+      // into a brand-new profile whose authentication still reads Password,
+      // fill the rest in by hand, press Save, and the credential in front of
+      // the user is discarded under a green "Saved to …".
+      //
+      // Refusing a save over a field the user cannot see
+      // would be its own trap, which is why this is still conditional at all.
+      if (_linkRowVisible &&
           _uri.text.trim().isNotEmpty &&
           _uri.text.trim() != _importedUri) {
         throw StateError(
@@ -319,7 +382,11 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
         );
       }
 
-      final old = widget.existing?.profile;
+      // [_current], not the widget field: after a save this editor is editing
+      // the profile it wrote, and every line below that says "the profile
+      // being replaced" has to mean that one.
+      final replacing = _current;
+      final old = replacing?.profile;
       // An edit keeps its id. Minting a new one would make the profile a
       // different server as far as anything keyed on id is concerned.
       // An import keeps the id its secret file will be written under, for the
@@ -331,7 +398,7 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       // failure, so the user believed nothing had happened.
       widget.writer.checkNameFree(
         _name.text.trim(),
-        replacingPath: widget.existing?.path,
+        replacingPath: replacing?.path,
       );
 
       // Where the secret WILL live, before anything is written. `writeSecret`
@@ -343,6 +410,41 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       final source = _secretMode == 'typed'
           ? 'file:${widget.writer.secretPathFor(id)}'
           : 'file:${_secretPath.text.trim()}';
+
+      // An imported password with nowhere left to go. `writeSecret` keys the
+      // file on the profile id, so the ONE path this app can put it at is
+      // `secretPathFor(id)` — the path `_import` filled in. Point the field
+      // somewhere else and the save used to succeed with the write skipped,
+      // under a green "Saved to …": the profile named a file that does not
+      // exist and the password, which came from a link and cannot be retyped,
+      // went with the widget. It surfaced at connect time, from another
+      // process, as "secret file … cannot read". Verbatim the defect this
+      // branch fixed one field over for a pasted-but-not-imported link.
+      //
+      // Refused rather than written. Two reasons, and they point the same
+      // way: `_writeSecretBytes` can only write inside `secretsDirectory`, so
+      // there is no honest way to put the password in the file the user
+      // named; and the redirect may be deliberate — a file that ALREADY holds
+      // this password, in which case discarding it is exactly right. The app
+      // cannot tell those apart, so it says so and lets the user decide,
+      // rather than guessing and destroying one of them.
+      //
+      // `_secretMode == 'typed'` is not this case: a typed password is an
+      // explicit replacement, and it lands in the managed file below.
+      if (_secretMode == 'file' && _importedPassword != null) {
+        final managed = widget.writer.secretPathFor(id);
+        if (_secretPath.text.trim() != managed) {
+          throw StateError(
+            'The password from the imported link has not been written '
+            'anywhere yet, and this app can only write it to $managed. '
+            'Saving now would leave the profile naming a file nothing wrote, '
+            'and the password came from a link, so it cannot be retyped. Put '
+            'the path back to $managed. If the file you have named already '
+            'holds this password, save it that way first and point the '
+            'profile at your own file in a second edit.',
+          );
+        }
+      }
 
       final dto = ProfileDto(
         id: id,
@@ -392,63 +494,141 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       await checkProfile(dto: dto);
       if (_secretMode == 'typed') {
         await widget.writer.writeSecret(id, _secret.text);
-      } else if (_importedPassword != null &&
-          _secretPath.text.trim() == widget.writer.secretPathFor(id)) {
+      } else if (_importedPassword != null) {
         // The imported password, written only now that the profile has been
-        // accepted — see `_importedPassword`. Guarded on the path still being
-        // the managed one: if the user has since pointed the form at a file
-        // of their own, that file is what the profile names and writing
-        // elsewhere would leave an orphan.
+        // accepted — see `_importedPassword`. The path is the managed one by
+        // construction: the guard above refuses the save outright if the form
+        // names anything else, rather than skipping the write and leaving the
+        // profile pointing at a file nothing created.
         await widget.writer.writeSecret(id, _importedPassword!);
       }
+      // Shadowsocks has no username. Passing one wrote a `.user` sidecar
+      // beside a profile for a protocol that has nowhere to send it.
+      final sshUser =
+          _authKind == 'shadowsocks' ? null : _user.text.trim();
       final file = await widget.writer.writeProfile(
         dto,
-        // Shadowsocks has no username. Passing one wrote a `.user` sidecar
-        // beside a profile for a protocol that has nowhere to send it.
-        sshUser: _authKind == 'shadowsocks' ? null : _user.text,
-        replacingPath: widget.existing?.path,
+        sshUser: sshUser,
+        replacingPath: replacing?.path,
       );
       if (!mounted) return;
-      setState(() => _saved = file.path);
+      setState(() {
+        _saved = file.path;
+        // What this editor is editing has changed: the profile now exists.
+        // Without this the next Save was a second CREATE — a `.json` under
+        // the new name carrying the same id and the same secret file, or, if
+        // the name had not changed, `checkNameFree` refusing over the profile
+        // this very editor had just written. The path comes from the file
+        // that was actually written, so a rename is adopted too.
+        _adopted = LoadedProfile(
+          path: file.path,
+          profile: dto,
+          sshUser: (sshUser == null || sshUser.isEmpty) ? null : sshUser,
+        );
+        // Its job is done: the password is in a 0600 file the saved profile
+        // names. Holding it past that would have the next save write it a
+        // second time — over a password typed in the meantime, or over the
+        // file the user has since pointed the profile at — and would keep the
+        // guard above refusing a redirect the user is now entitled to make,
+        // since the credential is safely on disk.
+        _importedPassword = null;
+      });
       widget.onSaved();
     } catch (e) {
       if (!mounted) return;
+      // A refusal about a field behind the collapse has to bring the field
+      // with it. The message lands in the card at the top of the form, and
+      // "the DoH path must start with `/`" over a form with no DoH path on it
+      // is advice the user cannot act on.
+      if (_namesSomethingAdvanced('$e')) _advanced.expand();
       setState(() => _error = '$e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
+  /// Whether a refusal is about a field the Advanced section hides.
+  ///
+  /// Deliberately NOT `maintainState: true` on the section instead. Keeping
+  /// the children alive behind the collapse would put the form's own
+  /// validators back in play from somewhere invisible, so Save would do
+  /// nothing at all and say nothing either — strictly worse than an error card
+  /// naming a field you then have to go and find.
+  ///
+  /// Matched on the message rather than on which check failed, because the
+  /// messages come from Rust — `check_profile`'s DoH rules and the DTO
+  /// conversion's field names (`dns_mode`, `dns_servers`, `doh_sni/doh_path`)
+  /// — and there is no structured error to switch on. Opening the section for
+  /// a message that merely happens to contain "dns" costs the user nothing.
+  static bool _namesSomethingAdvanced(String message) =>
+      RegExp('dns|doh', caseSensitive: false).hasMatch(message);
+
+  /// Deletes, after asking.
+  ///
+  /// The question itself lives in [confirmDeleteProfile], shared with the
+  /// profiles list's menu entry. Two copies of a confirmation drift, and the
+  /// one that drifts is the one nothing asserts — which is how the list's
+  /// entry came to have no confirmation at all while this one did.
   Future<void> _confirmDelete() async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text('Delete "${_name.text}"?'),
-        // The secret file is deliberately left alone: it may be an SSH key
-        // the user relies on elsewhere, and deleting a profile is not consent
-        // to destroy a credential.
-        content: const Text(
-          'The profile is removed. Any key or password file it points at is '
-          'left where it is.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            key: const Key('confirm-delete'),
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-    if (ok != true || !mounted) return;
-    await widget.writer.delete(widget.existing!.path);
+    final ok = await confirmDeleteProfile(context, _name.text);
+    if (!ok || !mounted) return;
+    // [_current], so a profile renamed during this session is deleted where it
+    // now is rather than where it was opened from — `delete` is quiet about a
+    // path that is not there, so the stale one would report success and leave
+    // the file.
+    await widget.writer.delete(_current!.path);
     widget.onSaved();
     if (mounted) Navigator.of(context).pop();
   }
+
+  /// What the credential field is called, for the protocol in play.
+  ///
+  /// The same two widgets serve an SSH private key, a WireGuard pre-shared key
+  /// and a Shadowsocks password, which is fine — but labelling either key
+  /// "Password" is not. `preshared_key` fell to the `else` of a ternary and
+  /// was called a password, which is the same mislabelling one credential
+  /// over.
+  String get _secretLabel => switch (_authKind) {
+        'private_key' => 'Private key',
+        'preshared_key' => 'Pre-shared key',
+        _ => 'Password',
+      };
+
+  /// What the *path* field is called, and what it suggests.
+  ///
+  /// Split from [_secretLabel] because "Path to the private key file" reads
+  /// worse than the name the field has always had, and because the hint is a
+  /// third thing again: an unconditional `/Users/you/.ssh/id_ed25519` told a
+  /// Shadowsocks profile to point its password at an SSH key, which is advice
+  /// rather than a placeholder.
+  String get _secretPathLabel => switch (_authKind) {
+        'private_key' => 'Path to the key file',
+        'preshared_key' => 'Path to the pre-shared key file',
+        _ => 'Path to the password file',
+      };
+
+  String get _secretPathHint => switch (_authKind) {
+        'private_key' => '/Users/you/.ssh/id_ed25519',
+        'preshared_key' => '/Users/you/.liostunnel/secrets/wg-psk',
+        _ => '/Users/you/.liostunnel/secrets/password',
+      };
+
+  /// Whether the credential in play is a key file rather than something a
+  /// person can type.
+  ///
+  /// [_text] builds a one-line field, and it cannot be made multi-line while
+  /// it is obscured — `TextField` asserts `!obscureText || maxLines == 1`, so
+  /// the alternative to hiding the typed mode is rendering key material
+  /// legibly on screen. An OpenSSH private key is a multi-line PEM document:
+  /// offering "Type it" for one invites a paste whose newlines do not survive,
+  /// [ProfileWriter.writeSecret] writes the mangled blob, `check_profile` sees
+  /// a perfectly well-formed `(Ssh, PrivateKey)` pairing, the save reports
+  /// success, and the failure arrives at connect time from another process.
+  ///
+  /// Nothing is lost by removing it: a key you already have IS a file, which
+  /// is exactly what the other mode is for. A WireGuard pre-shared key is one
+  /// line of base64 and keeps both modes.
+  bool get _secretIsAKeyFile => _authKind == 'private_key';
 
   @override
   Widget build(BuildContext context) {
@@ -488,6 +668,44 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
                   child: Text('Saved to $_saved'),
                 ),
               ),
+            // A provider hands you a link; nobody creates a Shadowsocks
+            // profile by typing a cipher name. So this goes first, and it is
+            // NOT gated on picking Shadowsocks from a dropdown -- importing
+            // is what decides the protocol.
+            //
+            // Shown whenever the editor is not editing a profile that parsed
+            // — which is NOT the same as "there is no file". `_editing` is
+            // `existing?.profile != null`, and the profiles list offers Edit
+            // on a broken row too, deliberately and under test. So opening an
+            // unreadable profile to repair it lands here with a path, no
+            // profile, and the link row on screen. That is the right answer:
+            // re-importing is a plausible repair for a Shadowsocks profile
+            // nothing can read, and the save replaces the file it came from.
+            //
+            // On an edit proper you are not re-importing, and a link sitting
+            // here on a save is what let a rotation be silently discarded —
+            // which is why [_linkRowVisible], and not a second copy of this
+            // condition, is what `_save`'s guard keys on.
+            //
+            // Obscured: an `ss://` link IS the password, so it is a
+            // credential field like any other.
+            if (_linkRowVisible) ...[
+              _text(_uri, 'Paste an ss:// link', key: 'f-uri',
+                  hint: 'ss://...',
+                  obscure: true,
+                  help: 'Fills in the form. The password is written to a 0600 '
+                      'file and never stored in the profile.',
+                  validator: (_) => null),
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: FilledButton.tonal(
+                  key: const Key('import-button'),
+                  onPressed: _busy ? null : _import,
+                  child: const Text('Import from link'),
+                ),
+              ),
+              const Divider(height: 32),
+            ],
             _text(_name, 'Name', key: 'f-name'),
             _text(_host, 'Host', key: 'f-host', hint: 'example.com or an IP'),
             _text(
@@ -521,30 +739,18 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
                 DropdownMenuItem(
                     value: 'shadowsocks', child: Text('Shadowsocks')),
               ],
-              onChanged: (v) => setState(() => _authKind = v!),
+              onChanged: (v) => setState(() {
+                _authKind = v!;
+                // The mode dropdown below drops "Type it" for a key file, and
+                // DropdownButtonFormField asserts that exactly one of its
+                // items matches its value: leaving `_secretMode` on `typed`
+                // here turned the whole form into an ErrorWidget. Same
+                // assertion the Cipher dropdown already has to dodge.
+                if (_secretIsAKeyFile) _secretMode = 'file';
+              }),
             ),
             if (_authKind == 'shadowsocks') ...[
               const SizedBox(height: 8),
-              // Obscured: an `ss://` link IS the password, so it is a
-              // credential field like any other. It used to be cleared only by
-              // a *successful* import, which left a failed one — or a toggle
-              // of the Authentication dropdown away and back — showing the
-              // whole thing in plain text.
-              _text(_uri, 'Paste an ss:// link', key: 'f-uri',
-                  hint: 'ss://...',
-                  obscure: true,
-                  help: 'Fills in the form from the link. The password is '
-                      'written to a 0600 file and never stored in the '
-                      'profile.',
-                  validator: (_) => null),
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 6),
-                child: FilledButton.tonal(
-                  key: const Key('import-button'),
-                  onPressed: _busy ? null : _import,
-                  child: const Text('Import from link'),
-                ),
-              ),
               DropdownButtonFormField<String>(
                 key: const Key('f-cipher'),
                 initialValue: _cipher,
@@ -561,11 +767,16 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
               key: const Key('f-secret-mode'),
               initialValue: _secretMode,
               decoration: const InputDecoration(labelText: 'Where the secret lives'),
-              items: const [
-                DropdownMenuItem(
+              items: [
+                const DropdownMenuItem(
                     value: 'file', child: Text('A file I already have')),
-                DropdownMenuItem(
-                    value: 'typed', child: Text('Type it — save to a 0600 file')),
+                // Not offered for a key file — see [_secretIsAKeyFile]. The
+                // option, not just the field: a label that invites a gesture
+                // the widget silently mangles is the defect.
+                if (!_secretIsAKeyFile)
+                  const DropdownMenuItem(
+                      value: 'typed',
+                      child: Text('Type it — save to a 0600 file')),
               ],
               onChanged: (v) => setState(() => _secretMode = v!),
             ),
@@ -573,54 +784,69 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
             if (_secretMode == 'typed')
               _text(
                 _secret,
-                'Password',
+                _secretLabel,
                 key: 'f-secret',
                 obscure: true,
                 help: 'Written to ${widget.writer.secretsDirectory}, mode 0600. '
-                    'The profile stores the path, never the password.',
+                    'The profile stores the path, never the $_secretLabel.',
               )
             else
               _text(
                 _secretPath,
-                'Path to the file',
+                _secretPathLabel,
                 key: 'f-secret-path',
-                hint: '/Users/you/.ssh/id_ed25519',
+                hint: _secretPathHint,
                 help: 'Must be owned by you and mode 0600, or the helper will '
                     'refuse it.',
               ),
 
             const SizedBox(height: 16),
-            DropdownButtonFormField<String>(
-              key: const Key('f-dns-mode'),
-              initialValue: _dnsMode,
-              decoration: const InputDecoration(labelText: 'DNS'),
-              items: const [
-                DropdownMenuItem(value: 'tcp', child: Text('DNS over TCP')),
-                DropdownMenuItem(value: 'https', child: Text('DNS over HTTPS')),
+            // Split by how often you touch it, not by protocol. DNS is set
+            // once and forgotten, and having it on screen means it competes
+            // with the fields you actually edit.
+            ExpansionTile(
+              key: const Key('advanced-section'),
+              // So a refusal naming a DNS or DoH field can open the section
+              // that holds it — see [_namesSomethingAdvanced].
+              controller: _advanced,
+              title: const Text('Advanced'),
+              subtitle: const Text('DNS and DNS-over-HTTPS'),
+              children: [
+                DropdownButtonFormField<String>(
+                  key: const Key('f-dns-mode'),
+                  initialValue: _dnsMode,
+                  decoration: const InputDecoration(labelText: 'DNS'),
+                  items: const [
+                    DropdownMenuItem(value: 'tcp', child: Text('DNS over TCP')),
+                    DropdownMenuItem(
+                        value: 'https', child: Text('DNS over HTTPS')),
+                  ],
+                  onChanged: (v) => setState(() => _dnsMode = v!),
+                ),
+                _text(
+                  _dns,
+                  'DNS servers',
+                  key: 'f-dns',
+                  hint: '1.1.1.1, 1.0.0.1',
+                  help: _dnsMode == 'https'
+                      ? 'The IP of the DoH endpoint. No bootstrap lookup is '
+                          'done, so this must be an address, not a name.'
+                      : 'Tried in order, five seconds each. Many tunnel '
+                          'providers block outbound port 53 — if lookups are '
+                          'slow or fail, switch to DNS over HTTPS, which uses '
+                          '443.',
+                ),
+                if (_dnsMode == 'https') ...[
+                  _text(_dohSni, 'DoH server name', key: 'f-doh-sni',
+                      hint: 'cloudflare-dns.com'),
+                  _text(_dohPath, 'DoH path', key: 'f-doh-path',
+                      hint: '/dns-query',
+                      validator: (v) => (v == null || !v.startsWith('/'))
+                          ? 'must start with /'
+                          : null),
+                ],
               ],
-              onChanged: (v) => setState(() => _dnsMode = v!),
             ),
-            _text(
-              _dns,
-              'DNS servers',
-              key: 'f-dns',
-              hint: '1.1.1.1, 1.0.0.1',
-              help: _dnsMode == 'https'
-                  ? 'The IP of the DoH endpoint. No bootstrap lookup is done, '
-                      'so this must be an address, not a name.'
-                  : 'Tried in order, five seconds each. Many tunnel providers '
-                      'block outbound port 53 — if lookups are slow or fail, '
-                      'switch to DNS over HTTPS, which uses 443.',
-            ),
-            if (_dnsMode == 'https') ...[
-              _text(_dohSni, 'DoH server name', key: 'f-doh-sni',
-                  hint: 'cloudflare-dns.com'),
-              _text(_dohPath, 'DoH path', key: 'f-doh-path',
-                  hint: '/dns-query',
-                  validator: (v) => (v == null || !v.startsWith('/'))
-                      ? 'must start with /'
-                      : null),
-            ],
 
             const SizedBox(height: 24),
             FilledButton(

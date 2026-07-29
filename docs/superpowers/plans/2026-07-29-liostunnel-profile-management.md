@@ -82,7 +82,10 @@ Add to `ss_uri.rs`'s tests module:
     /// strips -- so the name comes back truncated or wrong.
     #[test]
     fn a_name_with_uri_syntax_in_it_survives_the_round_trip() {
-        for name in ["Home #2", "a?b", "100%", "My Server", "café", "a&b=c"] {
+        // `%41BC` is the case that makes encoding load-bearing. The others
+        // survive an UNENCODED tag by accident: the parser splits on the
+        // first `#` only and scopes the `?`-strip to the pre-fragment body.
+        for name in ["%41BC", "Home #2", "a?b", "100%", "My Server", "café", "a&b=c"] {
             let link = render_ss_uri("aes-256-gcm", "pw", "h", 1, Some(name));
             let back = parse_ss_uri(&link).expect("must parse");
             assert_eq!(back.tag.as_deref(), Some(name), "link was {link}");
@@ -235,7 +238,7 @@ Run each, capture the failure, revert:
 | `encode_tag` returns `tag.to_string()` unchanged | `a_name_with_uri_syntax_in_it_survives_the_round_trip` |
 | `decode_tag` returns `tag.to_string()` unchanged | same |
 | `decode_tag` decodes `%` unconditionally (drop the hex check) | `a_raw_tag_from_an_existing_link_still_reads_literally` |
-| `render_ss_uri` uses `STANDARD` (padded) instead of `URL_SAFE_NO_PAD` | `a_rendered_link_parses_back_to_what_it_was_rendered_from` |
+| `render_ss_uri` emits the creds unencoded instead of base64 | `a_rendered_link_parses_back_to_what_it_was_rendered_from` |
 | `render_ss_uri` emits `#` even when `tag` is `None` | `an_untagged_link_renders_without_a_fragment` |
 
 - [ ] **Step 8: Verify the lean build**
