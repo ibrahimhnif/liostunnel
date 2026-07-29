@@ -234,6 +234,36 @@ pub fn ss_uri_password(uri: String) -> Result<String, String> {
     Ok(parse(&uri)?.password.expose().clone())
 }
 
+/// Renders a Shadowsocks profile as an `ss://` link the user can copy.
+///
+/// **The returned String carries the password.** It is what every other
+/// Shadowsocks client accepts, which is the point, and there is no
+/// secret-free form of an `ss://` link. The caller is responsible for asking
+/// before putting it anywhere shared.
+///
+/// The password comes in as a parameter: the app runs as the user and the
+/// secret file is the user's own, so Dart reads it. This crate does not open
+/// files on the app's behalf.
+///
+/// Refusals name no field of the profile. Every one of them is
+/// caller-supplied and this error crosses back over the wire.
+pub fn export_ss_uri(dto: ProfileDto, password: String) -> Result<String, String> {
+    if dto.auth_kind != "shadowsocks" || dto.protocol != "shadowsocks" {
+        return Err("only a shadowsocks profile can be rendered as an ss:// link".into());
+    }
+    let method = dto
+        .cipher
+        .as_deref()
+        .ok_or("a shadowsocks profile without a cipher cannot be rendered")?;
+    Ok(liostunnel_core::protocols::ss_uri::render_ss_uri(
+        method,
+        &password,
+        &dto.host,
+        dto.port,
+        Some(dto.name.as_str()).filter(|n| !n.is_empty()),
+    ))
+}
+
 /// Shared by both entry points so the link is parsed by one implementation.
 ///
 /// Note the error is `e.to_string()` on a `TunnelError::Config` whose reason
@@ -246,6 +276,49 @@ fn parse(uri: &str) -> Result<liostunnel_core::protocols::ss_uri::SsUri, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SAMPLE_SSH: &str = r#"{
+        "id":"b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f","name":"Home VPS",
+        "protocol":"ssh","host":"198.51.100.7","port":22,
+        "auth":{"type":"password","password":{"source":"file","path":"/tmp/k"}},
+        "dns":["1.1.1.1"],"split_tunnel":{"type":"all_traffic"},
+        "kill_switch":false}"#;
+
+    #[test]
+    fn a_shadowsocks_profile_exports_to_a_link_that_imports_back() {
+        use base64::Engine;
+        let creds = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("aes-256-gcm:pw");
+        let dto = import_ss_uri(format!("ss://{creds}@198.51.100.7:8388#Home")).unwrap();
+        let link = export_ss_uri(dto.clone(), "pw".into()).unwrap();
+        let back = import_ss_uri(link).unwrap();
+        assert_eq!(back.host, dto.host);
+        assert_eq!(back.port, dto.port);
+        assert_eq!(back.cipher, dto.cipher);
+        assert_eq!(back.name, "Home");
+    }
+
+    #[test]
+    fn exporting_a_non_shadowsocks_profile_is_refused() {
+        let dto = parse_profile(SAMPLE_SSH.into()).unwrap();
+        let e = export_ss_uri(dto, "pw".into()).unwrap_err();
+        assert!(
+            e.contains("shadowsocks"),
+            "must say which protocol this is for: {e}"
+        );
+    }
+
+    /// The refusal must not quote the profile. Every field of it is
+    /// caller-supplied and this error crosses back over the wire.
+    #[test]
+    fn an_export_refusal_never_echoes_the_profile() {
+        let mut dto = parse_profile(SAMPLE_SSH.into()).unwrap();
+        dto.host = "MARKER-HOST".into();
+        dto.name = "MARKER-NAME".into();
+        let e = export_ss_uri(dto, "MARKER-PASSWORD".into()).unwrap_err();
+        for marker in ["MARKER-HOST", "MARKER-NAME", "MARKER-PASSWORD"] {
+            assert!(!e.contains(marker), "echoed {marker}: {e}");
+        }
+    }
 
     #[test]
     fn an_ss_uri_imports_to_a_usable_profile() {

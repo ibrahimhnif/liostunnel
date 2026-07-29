@@ -92,3 +92,24 @@ Future<ProfileDto> importSsUri({required String uri}) =>
 /// inside a struct that anything renders.
 Future<String> ssUriPassword({required String uri}) =>
     RustLib.instance.api.crateApiConfigSsUriPassword(uri: uri);
+
+/// Renders a Shadowsocks profile as an `ss://` link the user can copy.
+///
+/// **The returned String carries the password.** It is what every other
+/// Shadowsocks client accepts, which is the point, and there is no
+/// secret-free form of an `ss://` link. The caller is responsible for asking
+/// before putting it anywhere shared.
+///
+/// The password comes in as a parameter: the app runs as the user and the
+/// secret file is the user's own, so Dart reads it. This crate does not open
+/// files on the app's behalf.
+///
+/// Refusals name no field of the profile. Every one of them is
+/// caller-supplied and this error crosses back over the wire.
+Future<String> exportSsUri({
+  required ProfileDto dto,
+  required String password,
+}) => RustLib.instance.api.crateApiConfigExportSsUri(
+  dto: dto,
+  password: password,
+);
