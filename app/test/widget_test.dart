@@ -1161,58 +1161,72 @@ void editorTests() {
     // import used to write its own default over it: a Quad9 profile kept its
     // mode and SNI but had its resolver replaced by 1.1.1.1, so the DoH probe
     // dialled Cloudflare presenting Quad9's name.
+    //
+    // Driven on a NEW profile because the paste box is create-only now (see
+    // 'an edit has no link row'). The DNS the import must not touch is
+    // therefore one the user typed rather than one `initState` loaded, which
+    // is the same value from `_import`'s point of view -- it reads `_dns`
+    // either way -- and it is what a user pasting a provider's link into a
+    // fresh profile actually has in front of them.
     final dir = Directory.systemTemp.createTempSync('lios-editor-dns');
     addTearDown(() => dir.deleteSync(recursive: true));
 
-    await pumpEditor(tester,
-        existing: ssProfile(dns: const ['9.9.9.9']), directory: dir.path);
+    await pumpEditor(tester, directory: dir.path);
+    await tester.tap(find.byKey(const Key('advanced-section')));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byKey(const Key('f-dns')), '9.9.9.9');
+
     await tester.enterText(find.byKey(const Key('f-uri')), ssLink());
     await pressAndSettle(tester, const Key('import-button'));
 
     expect(find.byKey(const Key('editor-error')), findsNothing);
-    // Asserting on f-host would prove nothing: `ssProfile` and `ssLink` name
-    // the same host, so `initState` had already put it there. The name is
-    // what the import actually changes -- `SS` becomes the link's own label.
+    // The name is what the import demonstrably changes -- the default
+    // 'My server' becomes the link's own label.
     expect(fieldText(tester, const Key('f-name')), '198.51.100.7:8388',
         reason: 'the import did happen');
     expect(fieldText(tester, const Key('f-dns')), '9.9.9.9',
         reason: 'the link says nothing about DNS');
-    // The other half of the orphaned-secret defect: an edit keeps its own id,
-    // so the secret has to be written under that one and not under the fresh
-    // id the import minted.
-    expect(fieldText(tester, const Key('f-secret-path')),
-        endsWith('b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f'),
-        reason: 'the secret file is keyed on the id the profile will carry');
+    // This test used to also pin "an edit reuses its own id rather than the
+    // one the import minted", by asserting `f-secret-path` ended with
+    // `ssProfileId`. An edit can no longer reach `_import` at all, so that
+    // assertion had no gesture behind it. The surviving half of the same
+    // invariant -- one id, and so one secret file, across repeated imports --
+    // is held by 're-importing to fix a typo keeps one id, and one secret
+    // file'.
   });
 
   testWidgets('an import that is never saved leaves the live credential alone',
       (tester) async {
-    // `writeSecret` truncates `secrets/<slug(id)>`, and on an EDIT that id is
-    // the existing profile's -- the very file the on-disk profile points at.
-    // Running it inside `_import` destroyed that credential the instant the
-    // button was pressed: before `checkNameFree`, before `checkProfile`,
-    // before Save. Paste what you believe is the rotated link, see that the
-    // host is wrong, press Back: nothing was saved and the original password
-    // is gone, unrecoverably, because it came from a link.
+    // `writeSecret` truncates `secrets/<slug(id)>`, and `_importedId` is held
+    // across imports -- so the second import in this test names the very file
+    // the profile just saved points at. Running the write inside `_import`
+    // destroyed that credential the instant the button was pressed: before
+    // `checkNameFree`, before `checkProfile`, before Save. Paste what you
+    // believe is the rotated link, see that the host is wrong, press Back:
+    // nothing was saved and the original password is gone, unrecoverably,
+    // because it came from a link.
     //
     // This is verbatim the defect the Save button already had (see 'a refused
     // save does not destroy the credential it points at'); the fix was never
     // applied one button over.
+    //
+    // Reached by saving first rather than by opening an existing profile: the
+    // paste box is create-only now (see 'an edit has no link row'), so the
+    // one way to have `_import` aim at a live secret file is to have this
+    // editor write one. The state the defect needs is identical -- a 0600
+    // file on disk that `_importedId` resolves to -- and this route is one a
+    // user reaches by correcting a link right after saving it.
     final dir = Directory.systemTemp.createTempSync('lios-editor-import-live');
     addTearDown(() => dir.deleteSync(recursive: true));
 
-    // Written synchronously rather than through `writeSecret`: that shells out
-    // to chmod, and a real subprocess never completes inside a `testWidgets`
-    // fake-async zone.
-    final secretPath = ProfileWriter(directory: dir.path)
-        .secretPathFor(ssProfileId);
-    File(secretPath).parent.createSync(recursive: true);
-    File(secretPath).writeAsStringSync('the-live-password');
-
-    await pumpEditor(tester,
-        directory: dir.path,
-        existing: ssProfile(
-            path: '${dir.path}/ss.json', source: 'file:$secretPath'));
+    await pumpEditor(tester, directory: dir.path);
+    await tester.enterText(find.byKey(const Key('f-uri')), ssLink());
+    await pressAndSettle(tester, const Key('import-button'));
+    await pressAndSettle(tester, const Key('save-button'));
+    expect(find.byKey(const Key('editor-saved')), findsOneWidget,
+        reason: 'precondition: there is a live credential on disk to lose');
+    final secretPath = fieldText(tester, const Key('f-secret-path'));
+    expect(File(secretPath).readAsStringSync(), 'hunter2');
 
     // A link the user believes is a rotation but which names the wrong host.
     await tester.enterText(
@@ -1223,10 +1237,12 @@ void editorTests() {
     expect(find.byKey(const Key('editor-error')), findsNothing);
     expect(fieldText(tester, const Key('f-host')), '203.0.113.9',
         reason: 'the import did happen; without this the rest is vacuous');
-    // ...and the user presses Back rather than Save.
-    expect(find.byKey(const Key('editor-saved')), findsNothing);
+    expect(fieldText(tester, const Key('f-secret-path')), secretPath,
+        reason: 'and it is aimed at the live file; without this the '
+            'assertion below is about a path nothing writes to');
 
-    expect(File(secretPath).readAsStringSync(), 'the-live-password',
+    // ...and the user presses Back rather than Save.
+    expect(File(secretPath).readAsStringSync(), 'hunter2',
         reason: 'an import that was never saved must not have replaced the '
             'credential the on-disk profile still points at');
   });
@@ -1542,5 +1558,104 @@ void editorTests() {
     expect(find.byKey(const Key('editor-saved')), findsNothing);
     expect(File(secretPath).readAsStringSync(), 'hunter2',
         reason: 'a refused save must not have written the secret');
+  });
+
+  testWidgets('a new profile leads with the link row, without a dropdown first',
+      (tester) async {
+    final dir = Directory.systemTemp.createTempSync('lios-linkrow');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    await pumpEditor(tester, directory: dir.path);
+    // Present immediately: _authKind defaults to 'password', and requiring
+    // the user to find Shadowsocks in a dropdown before they can paste a
+    // link is backwards -- importing is what decides the protocol.
+    expect(find.byKey(const Key('f-uri')), findsOneWidget);
+    expect(find.byKey(const Key('import-button')), findsOneWidget);
+  });
+
+  testWidgets('an edit has no link row', (tester) async {
+    final dir = Directory.systemTemp.createTempSync('lios-linkrow2');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    await pumpEditor(tester, directory: dir.path, existing: ssProfile());
+    expect(find.byKey(const Key('f-uri')), findsNothing,
+        reason: 'you are not re-importing a profile that exists');
+  });
+
+  testWidgets('importing works without touching the auth dropdown',
+      (tester) async {
+    final dir = Directory.systemTemp.createTempSync('lios-linkrow3');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    await pumpEditor(tester, directory: dir.path);
+    await tester.enterText(find.byKey(const Key('f-uri')), ssLink());
+    await pressAndSettle(tester, const Key('import-button'));
+    expect(find.byKey(const Key('editor-error')), findsNothing);
+    expect(fieldText(tester, const Key('f-host')), '198.51.100.7');
+    // And the cipher control is now present, because the import chose the
+    // protocol.
+    expect(find.byKey(const Key('f-cipher')), findsOneWidget);
+  });
+
+  testWidgets('a link nobody imported refuses the save, whatever the auth '
+      'dropdown says', (tester) async {
+    // The guard that catches a pasted-but-not-imported link was written when
+    // the box only existed under `_authKind == 'shadowsocks'`, and it tested
+    // for exactly that. The box is now on screen for every new profile, so
+    // that condition would let the commonest case through: paste a link,
+    // fill nothing else in, press Save -- and the link is silently dropped
+    // while a green "Saved to ..." says otherwise. The box being visible is
+    // what the guard has to key on.
+    final dir = Directory.systemTemp.createTempSync('lios-linkrow4');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    await pumpEditor(tester, directory: dir.path);
+    // Everything the form needs to save as a plain SSH/password profile...
+    await tester.enterText(find.byKey(const Key('f-host')), '198.51.100.9');
+    await tester.enterText(find.byKey(const Key('f-user')), 'someone');
+    await tester.enterText(
+        find.byKey(const Key('f-secret-path')), '${dir.path}/key');
+    // ...and a link the user pasted and expected to be used.
+    await tester.enterText(
+        find.byKey(const Key('f-uri')), ssLink(password: 'never-imported'));
+    await pressAndSettle(tester, const Key('save-button'));
+
+    expect(find.byKey(const Key('editor-saved')), findsNothing,
+        reason: 'a save that would ignore a pasted credential must not '
+            'report success');
+    expect(find.byKey(const Key('editor-error')), findsOneWidget);
+    final message = tester
+        .widget<Text>(find.descendant(
+          of: find.byKey(const Key('editor-error')),
+          matching: find.byType(Text),
+        ))
+        .data!;
+    expect(message, contains('Import from link'),
+        reason: 'it must name the button that would use it');
+    expect(message, isNot(contains('never-imported')),
+        reason: 'the link IS the password; the message may not quote it');
+  });
+
+  testWidgets('DNS settings are collapsed until asked for', (tester) async {
+    final dir = Directory.systemTemp.createTempSync('lios-adv');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    await pumpEditor(tester, directory: dir.path);
+    expect(find.byKey(const Key('f-dns')), findsNothing,
+        reason: 'set once and forgotten; it should not compete with the '
+            'fields you actually edit');
+    await tester.tap(find.byKey(const Key('advanced-section')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('f-dns')), findsOneWidget);
+  });
+
+  testWidgets('the credential field names what it actually is', (tester) async {
+    final dir = Directory.systemTemp.createTempSync('lios-label');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    await pumpEditor(tester, directory: dir.path);
+
+    await choose(tester, const Key('f-auth'), 'Private key');
+    await choose(
+        tester, const Key('f-secret-mode'), 'Type it — save to a 0600 file');
+    expect(find.widgetWithText(TextFormField, 'Private key'), findsOneWidget,
+        reason: 'calling an SSH key "Password" is wrong');
+
+    await choose(tester, const Key('f-auth'), 'Shadowsocks');
+    expect(find.widgetWithText(TextFormField, 'Password'), findsOneWidget);
   });
 }

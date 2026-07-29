@@ -307,10 +307,16 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       // permanently true after the first import, so the profile was written
       // with the OLD password under a green "Saved to …".
       //
-      // Only when the box is on screen: `_uri` keeps its text after the
-      // Authentication dropdown moves away from Shadowsocks, and refusing a
-      // save over a field the user cannot see would be its own trap.
-      if (_authKind == 'shadowsocks' &&
+      // Only when the box is on screen, and that is now `!_editing` rather
+      // than "the Authentication dropdown says Shadowsocks". The paste box no
+      // longer lives behind that dropdown — importing is what decides the
+      // protocol — so keying on `_authKind` would have let the commonest case
+      // through untouched: paste a link into a brand-new profile whose
+      // authentication still reads Password, fill the rest in by hand, press
+      // Save, and the credential in front of the user is discarded under a
+      // green "Saved to …". Refusing a save over a field the user cannot see
+      // would be its own trap, which is why this is still conditional at all.
+      if (!_editing &&
           _uri.text.trim().isNotEmpty &&
           _uri.text.trim() != _importedUri) {
         throw StateError(
@@ -434,6 +440,13 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
     if (mounted) Navigator.of(context).pop();
   }
 
+  /// What the credential field is called, for the protocol in play.
+  ///
+  /// The same two widgets serve an SSH private key and a Shadowsocks
+  /// password, which is fine — but labelling a key file "Password" is not.
+  String get _secretLabel =>
+      _authKind == 'private_key' ? 'Private key' : 'Password';
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -472,6 +485,34 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
                   child: Text('Saved to $_saved'),
                 ),
               ),
+            // A provider hands you a link; nobody creates a Shadowsocks
+            // profile by typing a cipher name. So this goes first, and it is
+            // NOT gated on picking Shadowsocks from a dropdown -- importing
+            // is what decides the protocol.
+            //
+            // Create only. On an edit you are not re-importing, and a link
+            // sitting here on a save is what let a rotation be silently
+            // discarded.
+            //
+            // Obscured: an `ss://` link IS the password, so it is a
+            // credential field like any other.
+            if (!_editing) ...[
+              _text(_uri, 'Paste an ss:// link', key: 'f-uri',
+                  hint: 'ss://...',
+                  obscure: true,
+                  help: 'Fills in the form. The password is written to a 0600 '
+                      'file and never stored in the profile.',
+                  validator: (_) => null),
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: FilledButton.tonal(
+                  key: const Key('import-button'),
+                  onPressed: _busy ? null : _import,
+                  child: const Text('Import from link'),
+                ),
+              ),
+              const Divider(height: 32),
+            ],
             _text(_name, 'Name', key: 'f-name'),
             _text(_host, 'Host', key: 'f-host', hint: 'example.com or an IP'),
             _text(
@@ -509,26 +550,6 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
             ),
             if (_authKind == 'shadowsocks') ...[
               const SizedBox(height: 8),
-              // Obscured: an `ss://` link IS the password, so it is a
-              // credential field like any other. It used to be cleared only by
-              // a *successful* import, which left a failed one — or a toggle
-              // of the Authentication dropdown away and back — showing the
-              // whole thing in plain text.
-              _text(_uri, 'Paste an ss:// link', key: 'f-uri',
-                  hint: 'ss://...',
-                  obscure: true,
-                  help: 'Fills in the form from the link. The password is '
-                      'written to a 0600 file and never stored in the '
-                      'profile.',
-                  validator: (_) => null),
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 6),
-                child: FilledButton.tonal(
-                  key: const Key('import-button'),
-                  onPressed: _busy ? null : _import,
-                  child: const Text('Import from link'),
-                ),
-              ),
               DropdownButtonFormField<String>(
                 key: const Key('f-cipher'),
                 initialValue: _cipher,
@@ -557,54 +578,70 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
             if (_secretMode == 'typed')
               _text(
                 _secret,
-                'Password',
+                _secretLabel,
                 key: 'f-secret',
                 obscure: true,
                 help: 'Written to ${widget.writer.secretsDirectory}, mode 0600. '
-                    'The profile stores the path, never the password.',
+                    'The profile stores the path, never the $_secretLabel.',
               )
             else
               _text(
                 _secretPath,
-                'Path to the file',
+                _authKind == 'private_key'
+                    ? 'Path to the key file'
+                    : 'Path to the password file',
                 key: 'f-secret-path',
-                hint: '/Users/you/.ssh/id_ed25519',
+                hint: _authKind == 'private_key'
+                    ? '/Users/you/.ssh/id_ed25519'
+                    : '/Users/you/.liostunnel/secrets/password',
                 help: 'Must be owned by you and mode 0600, or the helper will '
                     'refuse it.',
               ),
 
             const SizedBox(height: 16),
-            DropdownButtonFormField<String>(
-              key: const Key('f-dns-mode'),
-              initialValue: _dnsMode,
-              decoration: const InputDecoration(labelText: 'DNS'),
-              items: const [
-                DropdownMenuItem(value: 'tcp', child: Text('DNS over TCP')),
-                DropdownMenuItem(value: 'https', child: Text('DNS over HTTPS')),
+            // Split by how often you touch it, not by protocol. DNS is set
+            // once and forgotten, and having it on screen means it competes
+            // with the fields you actually edit.
+            ExpansionTile(
+              key: const Key('advanced-section'),
+              title: const Text('Advanced'),
+              subtitle: const Text('DNS and DNS-over-HTTPS'),
+              children: [
+                DropdownButtonFormField<String>(
+                  key: const Key('f-dns-mode'),
+                  initialValue: _dnsMode,
+                  decoration: const InputDecoration(labelText: 'DNS'),
+                  items: const [
+                    DropdownMenuItem(value: 'tcp', child: Text('DNS over TCP')),
+                    DropdownMenuItem(
+                        value: 'https', child: Text('DNS over HTTPS')),
+                  ],
+                  onChanged: (v) => setState(() => _dnsMode = v!),
+                ),
+                _text(
+                  _dns,
+                  'DNS servers',
+                  key: 'f-dns',
+                  hint: '1.1.1.1, 1.0.0.1',
+                  help: _dnsMode == 'https'
+                      ? 'The IP of the DoH endpoint. No bootstrap lookup is '
+                          'done, so this must be an address, not a name.'
+                      : 'Tried in order, five seconds each. Many tunnel '
+                          'providers block outbound port 53 — if lookups are '
+                          'slow or fail, switch to DNS over HTTPS, which uses '
+                          '443.',
+                ),
+                if (_dnsMode == 'https') ...[
+                  _text(_dohSni, 'DoH server name', key: 'f-doh-sni',
+                      hint: 'cloudflare-dns.com'),
+                  _text(_dohPath, 'DoH path', key: 'f-doh-path',
+                      hint: '/dns-query',
+                      validator: (v) => (v == null || !v.startsWith('/'))
+                          ? 'must start with /'
+                          : null),
+                ],
               ],
-              onChanged: (v) => setState(() => _dnsMode = v!),
             ),
-            _text(
-              _dns,
-              'DNS servers',
-              key: 'f-dns',
-              hint: '1.1.1.1, 1.0.0.1',
-              help: _dnsMode == 'https'
-                  ? 'The IP of the DoH endpoint. No bootstrap lookup is done, '
-                      'so this must be an address, not a name.'
-                  : 'Tried in order, five seconds each. Many tunnel providers '
-                      'block outbound port 53 — if lookups are slow or fail, '
-                      'switch to DNS over HTTPS, which uses 443.',
-            ),
-            if (_dnsMode == 'https') ...[
-              _text(_dohSni, 'DoH server name', key: 'f-doh-sni',
-                  hint: 'cloudflare-dns.com'),
-              _text(_dohPath, 'DoH path', key: 'f-doh-path',
-                  hint: '/dns-query',
-                  validator: (v) => (v == null || !v.startsWith('/'))
-                      ? 'must start with /'
-                      : null),
-            ],
 
             const SizedBox(height: 24),
             FilledButton(
