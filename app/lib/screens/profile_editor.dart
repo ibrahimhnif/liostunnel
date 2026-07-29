@@ -113,6 +113,35 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
   /// second case is any non-empty box at all.
   String? _importedUri;
 
+  /// The profile this editor has written, once it has written one.
+  ///
+  /// A save used to leave [ProfileEditorScreen.existing] null forever, so the
+  /// NEXT save was a second creation rather than an edit of the same profile.
+  /// Under a different name that wrote a second `.json` carrying the same
+  /// `id` and the same `authSecretSource` — two profiles sharing one secret
+  /// file, so editing either one's password in "Type it" mode silently
+  /// changed both, which is the failure `duplicate` writes its own secret file
+  /// to avoid. Under the SAME name it was refused outright, with
+  /// `checkNameFree` naming "a different profile" that was in fact the one in
+  /// front of the user.
+  ///
+  /// Held in state because `existing` is a widget field: what the editor is
+  /// editing genuinely changes when it writes a profile, and nothing above
+  /// rebuilds this route.
+  LoadedProfile? _adopted;
+
+  /// The profile the next save will replace, adopted or given.
+  LoadedProfile? get _current => _adopted ?? widget.existing;
+
+  /// Whether this editor OPENED on a profile that parsed.
+  ///
+  /// Deliberately [ProfileEditorScreen.existing] and not [_current]: this
+  /// decides the shape of the form — the title, the Delete button, and
+  /// through [_linkRowVisible] the `ss://` paste box. Rearranging the form
+  /// under the user the instant they press Save would take the paste box away
+  /// mid-session, and with it the one gesture that repairs a link typed
+  /// wrong. What a save adopts is which profile is being *written*, which is
+  /// [_current] and is asked for in [_save] alone.
   bool get _editing => widget.existing?.profile != null;
 
   /// Whether the `ss://` paste box is on screen.
@@ -225,7 +254,7 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       // paste (to correct a typo'd link) would otherwise mint a fresh id and
       // orphan the first import's 0600 file — the very case the paragraph
       // above claims to close, reached one gesture later.
-      final id = widget.existing?.profile?.id ?? _importedId ?? dto.id;
+      final id = _current?.profile?.id ?? _importedId ?? dto.id;
 
       if (!mounted) return;
       setState(() {
@@ -299,9 +328,12 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
   /// dropdown would only move the same incoherence one control over. A new
   /// profile is cheap and is the thing the user actually wants.
   ///
-  /// Applies to edits only. A NEW profile has no protocol to change.
+  /// Applies to edits only. A NEW profile has no protocol to change — but a
+  /// new one this editor has already SAVED is no longer new, and rewriting it
+  /// under another protocol is the same incoherence, which is why this asks
+  /// [_current] rather than the widget field.
   void _refuseAProtocolChange(String authKind) {
-    final old = widget.existing?.profile;
+    final old = _current?.profile;
     if (old == null) return;
     final wanted = _protocolFor(authKind);
     if (wanted == old.protocol) return;
@@ -350,7 +382,11 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
         );
       }
 
-      final old = widget.existing?.profile;
+      // [_current], not the widget field: after a save this editor is editing
+      // the profile it wrote, and every line below that says "the profile
+      // being replaced" has to mean that one.
+      final replacing = _current;
+      final old = replacing?.profile;
       // An edit keeps its id. Minting a new one would make the profile a
       // different server as far as anything keyed on id is concerned.
       // An import keeps the id its secret file will be written under, for the
@@ -362,7 +398,7 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       // failure, so the user believed nothing had happened.
       widget.writer.checkNameFree(
         _name.text.trim(),
-        replacingPath: widget.existing?.path,
+        replacingPath: replacing?.path,
       );
 
       // Where the secret WILL live, before anything is written. `writeSecret`
@@ -374,6 +410,41 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       final source = _secretMode == 'typed'
           ? 'file:${widget.writer.secretPathFor(id)}'
           : 'file:${_secretPath.text.trim()}';
+
+      // An imported password with nowhere left to go. `writeSecret` keys the
+      // file on the profile id, so the ONE path this app can put it at is
+      // `secretPathFor(id)` — the path `_import` filled in. Point the field
+      // somewhere else and the save used to succeed with the write skipped,
+      // under a green "Saved to …": the profile named a file that does not
+      // exist and the password, which came from a link and cannot be retyped,
+      // went with the widget. It surfaced at connect time, from another
+      // process, as "secret file … cannot read". Verbatim the defect this
+      // branch fixed one field over for a pasted-but-not-imported link.
+      //
+      // Refused rather than written. Two reasons, and they point the same
+      // way: `_writeSecretBytes` can only write inside `secretsDirectory`, so
+      // there is no honest way to put the password in the file the user
+      // named; and the redirect may be deliberate — a file that ALREADY holds
+      // this password, in which case discarding it is exactly right. The app
+      // cannot tell those apart, so it says so and lets the user decide,
+      // rather than guessing and destroying one of them.
+      //
+      // `_secretMode == 'typed'` is not this case: a typed password is an
+      // explicit replacement, and it lands in the managed file below.
+      if (_secretMode == 'file' && _importedPassword != null) {
+        final managed = widget.writer.secretPathFor(id);
+        if (_secretPath.text.trim() != managed) {
+          throw StateError(
+            'The password from the imported link has not been written '
+            'anywhere yet, and this app can only write it to $managed. '
+            'Saving now would leave the profile naming a file nothing wrote, '
+            'and the password came from a link, so it cannot be retyped. Put '
+            'the path back to $managed. If the file you have named already '
+            'holds this password, save it that way first and point the '
+            'profile at your own file in a second edit.',
+          );
+        }
+      }
 
       final dto = ProfileDto(
         id: id,
@@ -423,24 +494,45 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       await checkProfile(dto: dto);
       if (_secretMode == 'typed') {
         await widget.writer.writeSecret(id, _secret.text);
-      } else if (_importedPassword != null &&
-          _secretPath.text.trim() == widget.writer.secretPathFor(id)) {
+      } else if (_importedPassword != null) {
         // The imported password, written only now that the profile has been
-        // accepted — see `_importedPassword`. Guarded on the path still being
-        // the managed one: if the user has since pointed the form at a file
-        // of their own, that file is what the profile names and writing
-        // elsewhere would leave an orphan.
+        // accepted — see `_importedPassword`. The path is the managed one by
+        // construction: the guard above refuses the save outright if the form
+        // names anything else, rather than skipping the write and leaving the
+        // profile pointing at a file nothing created.
         await widget.writer.writeSecret(id, _importedPassword!);
       }
+      // Shadowsocks has no username. Passing one wrote a `.user` sidecar
+      // beside a profile for a protocol that has nowhere to send it.
+      final sshUser =
+          _authKind == 'shadowsocks' ? null : _user.text.trim();
       final file = await widget.writer.writeProfile(
         dto,
-        // Shadowsocks has no username. Passing one wrote a `.user` sidecar
-        // beside a profile for a protocol that has nowhere to send it.
-        sshUser: _authKind == 'shadowsocks' ? null : _user.text,
-        replacingPath: widget.existing?.path,
+        sshUser: sshUser,
+        replacingPath: replacing?.path,
       );
       if (!mounted) return;
-      setState(() => _saved = file.path);
+      setState(() {
+        _saved = file.path;
+        // What this editor is editing has changed: the profile now exists.
+        // Without this the next Save was a second CREATE — a `.json` under
+        // the new name carrying the same id and the same secret file, or, if
+        // the name had not changed, `checkNameFree` refusing over the profile
+        // this very editor had just written. The path comes from the file
+        // that was actually written, so a rename is adopted too.
+        _adopted = LoadedProfile(
+          path: file.path,
+          profile: dto,
+          sshUser: (sshUser == null || sshUser.isEmpty) ? null : sshUser,
+        );
+        // Its job is done: the password is in a 0600 file the saved profile
+        // names. Holding it past that would have the next save write it a
+        // second time — over a password typed in the meantime, or over the
+        // file the user has since pointed the profile at — and would keep the
+        // guard above refusing a redirect the user is now entitled to make,
+        // since the credential is safely on disk.
+        _importedPassword = null;
+      });
       widget.onSaved();
     } catch (e) {
       if (!mounted) return;
@@ -480,7 +572,11 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
   Future<void> _confirmDelete() async {
     final ok = await confirmDeleteProfile(context, _name.text);
     if (!ok || !mounted) return;
-    await widget.writer.delete(widget.existing!.path);
+    // [_current], so a profile renamed during this session is deleted where it
+    // now is rather than where it was opened from — `delete` is quiet about a
+    // path that is not there, so the stale one would report success and leave
+    // the file.
+    await widget.writer.delete(_current!.path);
     widget.onSaved();
     if (mounted) Navigator.of(context).pop();
   }

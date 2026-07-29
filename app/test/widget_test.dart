@@ -1835,6 +1835,174 @@ void editorTests() {
             'them, editable');
   });
 
+  testWidgets('saving a new profile twice under one name saves it twice, not '
+      'once and then a refusal', (tester) async {
+    // The editor did not adopt the profile it had just written, so
+    // `widget.existing` stayed null and every Save was a CREATE. Pressing Save
+    // a second time — because a field was wrong, or because the button was
+    // tapped twice — therefore ran `checkNameFree` with no `replacingPath`,
+    // found the file the same editor had written a moment earlier, and refused
+    // with "a different profile is already called …" about the profile in
+    // front of the user.
+    final dir = Directory.systemTemp.createTempSync('lios-editor-twice-same');
+    addTearDown(() => dir.deleteSync(recursive: true));
+
+    await pumpEditor(tester, directory: dir.path);
+    await tester.enterText(find.byKey(const Key('f-uri')), ssLink(tag: 'Home'));
+    await pressAndSettle(tester, const Key('import-button'));
+    await pressAndSettle(tester, const Key('save-button'));
+    expect(find.byKey(const Key('editor-saved')), findsOneWidget,
+        reason: 'precondition: the first save went through');
+
+    await tester.enterText(find.byKey(const Key('f-host')), '203.0.113.9');
+    await pressAndSettle(tester, const Key('save-button'));
+
+    expect(find.byKey(const Key('editor-error')), findsNothing,
+        reason: 'saving the same profile again is an edit of it, not a '
+            'collision with it');
+    expect(find.byKey(const Key('editor-saved')), findsOneWidget);
+    final jsons = Directory(dir.path)
+        .listSync()
+        .whereType<File>()
+        .where((f) => f.path.endsWith('.json'))
+        .toList();
+    expect(jsons.length, 1);
+    final doc =
+        jsonDecode(jsons.single.readAsStringSync()) as Map<String, dynamic>;
+    expect(doc['host'], '203.0.113.9',
+        reason: 'and the second save is what landed');
+  });
+
+  testWidgets('saving a new profile twice under two names renames it, rather '
+      'than cloning it onto one id', (tester) async {
+    // Two `.json` files carrying the SAME `id` and the SAME
+    // `auth_secret_source`. Editing either one's password in "Type it" mode
+    // then silently changed both, because `writeSecret` keys the file on the
+    // profile id — which is verbatim the failure `duplicate` writes its own
+    // secret file to avoid, reached from the editor instead.
+    //
+    // The link-led flow is what makes the ids collide rather than merely
+    // producing two profiles: `_importedId` persists across saves, so the
+    // second save reuses it.
+    final dir = Directory.systemTemp.createTempSync('lios-editor-twice-diff');
+    addTearDown(() => dir.deleteSync(recursive: true));
+
+    await pumpEditor(tester, directory: dir.path);
+    await tester.enterText(find.byKey(const Key('f-uri')), ssLink(tag: 'Home'));
+    await pressAndSettle(tester, const Key('import-button'));
+    await pressAndSettle(tester, const Key('save-button'));
+    expect(find.byKey(const Key('editor-saved')), findsOneWidget,
+        reason: 'precondition: the first save went through');
+
+    await tester.enterText(find.byKey(const Key('f-name')), 'Renamed');
+    await pressAndSettle(tester, const Key('save-button'));
+    expect(find.byKey(const Key('editor-error')), findsNothing);
+
+    final jsons = Directory(dir.path)
+        .listSync()
+        .whereType<File>()
+        .where((f) => f.path.endsWith('.json'))
+        .toList();
+    expect(jsons.length, 1,
+        reason: 'a rename moves the profile; a second file carrying the same '
+            'id and the same secret file is two profiles that edit each '
+            "other's credential");
+    expect(jsons.single.path, endsWith('/renamed.json'));
+
+    final doc =
+        jsonDecode(jsons.single.readAsStringSync()) as Map<String, dynamic>;
+    final secrets = Directory('${dir.path}/secrets').listSync();
+    expect(secrets.length, 1, reason: 'one profile, one secret file');
+    expect(doc['auth']['password']['path'], secrets.single.path,
+        reason: 'and the profile that survived names it');
+    expect(secrets.single.path, endsWith(doc['id'] as String),
+        reason: 'writeSecret keys on the id, so the surviving profile must '
+            'carry the id its secret file is named after');
+  });
+
+  testWidgets('redirecting the secret path after an import refuses the save',
+      (tester) async {
+    // The password came out of an `ss://` link and is held in widget state
+    // until Save has somewhere safe to put it — and the only place this app
+    // can put it is the managed path `_import` filled in. Point the field at
+    // a file of your own, expecting the app to create it, and the save used to
+    // succeed with the write skipped: a green "Saved to …" over a profile
+    // naming a file that does not exist, and a password that cannot be
+    // retyped gone with the widget. It surfaced at connect time, from another
+    // process, as "secret file … cannot read".
+    //
+    // Refused rather than written blindly: `writeSecret` overwrites the file
+    // keyed to the id, and the user may well have redirected to a file that
+    // already holds this very password — in which case discarding it is
+    // correct. The app cannot tell, so it says so instead of guessing. Same
+    // shape as the pasted-but-not-imported refusal above.
+    final dir = Directory.systemTemp.createTempSync('lios-editor-redirect');
+    addTearDown(() => dir.deleteSync(recursive: true));
+
+    await pumpEditor(tester, directory: dir.path);
+    await tester.enterText(find.byKey(const Key('f-uri')), ssLink(tag: 'Home'));
+    await pressAndSettle(tester, const Key('import-button'));
+    expect(find.byKey(const Key('editor-error')), findsNothing,
+        reason: 'precondition: the import took the password out of the link');
+    final managed = fieldText(tester, const Key('f-secret-path'));
+    expect(managed, startsWith('${dir.path}/secrets/'),
+        reason: 'precondition: the field holds the path Import filled in');
+
+    // The user renames it to a file they intend the app to create.
+    final chosen = '${dir.path}/home-pw';
+    await tester.enterText(find.byKey(const Key('f-secret-path')), chosen);
+    await pressAndSettle(tester, const Key('save-button'));
+
+    expect(find.byKey(const Key('editor-saved')), findsNothing,
+        reason: 'a save that would discard the imported password must not '
+            'report success');
+    expect(find.byKey(const Key('editor-error')), findsOneWidget);
+    expect(
+        Directory(dir.path)
+            .listSync()
+            .whereType<File>()
+            .where((f) => f.path.endsWith('.json')),
+        isEmpty,
+        reason: 'no profile may be written naming a file nothing wrote');
+    expect(File(chosen).existsSync(), isFalse,
+        reason: 'and the refusal is a refusal: writing the password to the '
+            'file the user named would be a write to a path this app does '
+            'not manage');
+    expect(fieldText(tester, const Key('f-secret-path')), chosen,
+        reason: "the user's own text is not the form's to revert");
+
+    final message = tester
+        .widget<Text>(find.descendant(
+          of: find.byKey(const Key('editor-error')),
+          matching: find.byType(Text),
+        ))
+        .data!;
+    expect(message, contains(managed),
+        reason: 'it must name the path that would keep the password');
+    expect(message, isNot(contains('hunter2')),
+        reason: 'the message may not carry the credential it is about');
+    expect(message, isNot(contains('ss://')));
+  });
+
+  testWidgets('an import saved to the path it filled in still writes the '
+      'password', (tester) async {
+    // The other half of the guard above, and the reason it cannot simply be
+    // "refuse whenever a link has been imported": leaving the path alone is
+    // the ordinary case and it must go through, with the password on disk.
+    final dir = Directory.systemTemp.createTempSync('lios-editor-redirect2');
+    addTearDown(() => dir.deleteSync(recursive: true));
+
+    await pumpEditor(tester, directory: dir.path);
+    await tester.enterText(find.byKey(const Key('f-uri')), ssLink(tag: 'Home'));
+    await pressAndSettle(tester, const Key('import-button'));
+    final managed = fieldText(tester, const Key('f-secret-path'));
+    await pressAndSettle(tester, const Key('save-button'));
+
+    expect(find.byKey(const Key('editor-error')), findsNothing);
+    expect(find.byKey(const Key('editor-saved')), findsOneWidget);
+    expect(File(managed).readAsStringSync(), 'hunter2');
+  });
+
   testWidgets('a profile that does not parse is opened for repair, link row '
       'and all', (tester) async {
     // `_editing` is "this profile parsed", not "this file exists" — and the
