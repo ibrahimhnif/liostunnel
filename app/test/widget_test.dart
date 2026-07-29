@@ -583,6 +583,7 @@ void main() {
 
   copyLinkTests();
   deleteTests();
+  listActionTests();
   editorTests();
 
   test('a missing profiles directory is empty, not an error', () async {
@@ -919,6 +920,199 @@ void deleteTests() {
     await tester.tap(find.text('Cancel'));
     await tester.pumpAndSettle();
     expect(File(path).existsSync(), isTrue);
+  });
+}
+
+// --- duplicate and copy-link, through the real page ------------------------
+// `pumpHome` was used by `deleteTests` alone, so `onDuplicate` — including its
+// toast-on-failure catch — and `onCopyLink` had no test through `HomePage` at
+// all. Both halves matter and neither is either screen's: `ProfilesScreen`
+// only says which row was chosen, and `ProfileWriter.duplicate` and
+// `ssLinkFor` only do the work. What connects them is these callbacks, and
+// the wiring is exactly where the Task 4 Critical lived — a copied link
+// carrying `hunter2\n`.
+
+/// Drives an already-started handler that crosses the FFI several times.
+///
+/// [pressAndSettle] taps *inside* `runAsync`, so the whole chain runs in the
+/// real zone. That is not available to a gesture made through a route — a
+/// popup menu calls `onSelected`, and `showDialog` completes, only once the
+/// route has finished popping, and a route pops on frames, which `runAsync`
+/// forbids pumping. So the gesture is made in fake time, which leaves the
+/// handler running there, where a bridge future never completes on its own.
+///
+/// Hence the alternation, one round per hop. Real time lets the port message
+/// behind the pending call arrive and complete its future; the pump that
+/// follows flushes the microtask that completion queued in the fake zone,
+/// which runs the continuation and issues the *next* call. `onDuplicate` alone
+/// is six or seven of those — `newProfileId`, `checkProfile`, two `chmod`
+/// subprocesses, `exportProfile`, then `_reload`'s `parseProfile` — so a
+/// single long delay finishes exactly one of them and every assertion
+/// afterwards is about a page that never moved.
+Future<void> settleAcrossTheBridge(WidgetTester tester) async {
+  for (var hop = 0; hop < 20; hop++) {
+    await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 50)));
+    await tester.pumpAndSettle();
+  }
+}
+
+/// Chooses a menu entry whose handler crosses the FFI, and lets it finish.
+Future<void> chooseInMenuAndSettle(
+  WidgetTester tester,
+  String path,
+  String entry,
+) async {
+  await chooseInMenu(tester, path, entry);
+  await settleAcrossTheBridge(tester);
+}
+
+/// A Shadowsocks profile document naming [secret], as the CLI would write one.
+///
+/// Hand-written rather than produced by `exportProfile`: that crosses the FFI,
+/// and these tests need the file on disk before `pumpHome` runs, from a body
+/// that is a fake-async zone.
+String ssDocument({
+  required String id,
+  required String name,
+  required String secret,
+}) =>
+    '''
+{"id":"$id","name":"$name",
+ "protocol":"shadowsocks","host":"198.51.100.7","port":8388,
+ "auth":{"type":"shadowsocks","method":"aes-256-gcm",
+         "password":{"source":"file","path":"$secret"}},
+ "dns":["1.1.1.1"],
+ "split_tunnel":{"type":"all_traffic"},"kill_switch":false}
+''';
+
+/// Writes a 0600 secret file the way [ProfileWriter] would.
+///
+/// Synchronously, and that is why this exists: `writeSecret` shells out to
+/// `chmod`, and a real subprocess never completes inside a `testWidgets`
+/// fake-async zone — the test simply hangs.
+void writeManagedSecret(String path, String content) {
+  File(path).parent.createSync(recursive: true);
+  File(path).writeAsStringSync(content);
+  Process.runSync('chmod', ['600', path]);
+}
+
+void listActionTests() {
+  testWidgets('Duplicate from the list writes a second profile with its own '
+      'secret file', (tester) async {
+    const id = 'b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f';
+    final dir = Directory.systemTemp.createTempSync('lios-home-dup');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final secret = ProfileWriter(directory: dir.path).secretPathFor(id);
+    writeManagedSecret(secret, 'hunter2\n');
+    final path = '${dir.path}/ss-home.json';
+    File(path)
+        .writeAsStringSync(ssDocument(id: id, name: 'SS Home', secret: secret));
+
+    await pumpHome(tester, dir.path);
+    expect(find.text('SS Home'), findsOneWidget, reason: 'precondition');
+
+    await chooseInMenuAndSettle(tester, path, 'Duplicate');
+
+    expect(tester.takeException(), isNull);
+    expect(find.byType(SnackBar), findsNothing,
+        reason: 'nothing failed, so nothing is reported');
+    expect(find.text('SS Home'), findsOneWidget,
+        reason: 'the original is still there — duplicating is not moving');
+    expect(find.text('SS Home copy'), findsOneWidget,
+        reason: 'and the list reloaded, or the copy is invisible until the '
+            'user reloads by hand');
+
+    final secrets = Directory('${dir.path}/secrets').listSync();
+    expect(secrets.length, 2,
+        reason: "the original's credential and the copy's own");
+    final copy = Directory(dir.path)
+        .listSync()
+        .whereType<File>()
+        .firstWhere((f) => f.path.endsWith('-copy.json'));
+    final doc = jsonDecode(copy.readAsStringSync()) as Map<String, dynamic>;
+    expect(doc['auth']['password']['path'], isNot(secret));
+    expect(File(doc['auth']['password']['path'] as String).readAsStringSync(),
+        'hunter2\n',
+        reason: 'the copy carries the credential, not a stub');
+  });
+
+  testWidgets('a Duplicate that is refused says so, and adds nothing',
+      (tester) async {
+    // `sample`'s password is `env:PW`, which `duplicate` refuses: there is no
+    // file to copy alongside the profile. Unhandled, that refusal escaped an
+    // unawaited async callback — no toast, no reload, and the user got no
+    // signal at all from a menu item that had simply done nothing.
+    final dir = Directory.systemTemp.createTempSync('lios-home-dup-refused');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final path = '${dir.path}/home.json';
+    File(path).writeAsStringSync(sample);
+
+    await pumpHome(tester, dir.path);
+    await chooseInMenuAndSettle(tester, path, 'Duplicate');
+
+    expect(tester.takeException(), isNull,
+        reason: 'the failure must reach the user, not the console');
+    expect(find.byType(SnackBar), findsOneWidget);
+    expect(find.textContaining('secret is not a file'), findsOneWidget,
+        reason: 'and say what is wrong with this profile in particular');
+    expect(
+        Directory(dir.path)
+            .listSync()
+            .whereType<File>()
+            .where((f) => f.path.endsWith('.json'))
+            .length,
+        1,
+        reason: 'a refused duplicate leaves one profile, not one and a half');
+  });
+
+  testWidgets('Copy ss:// link from the list copies the password the tunnel '
+      'uses, and shows none of it', (tester) async {
+    // The Task 4 Critical, through the wiring it actually lived in. `echo
+    // hunter2 > pw` is what the README sanctions, and `FileSecretStore`
+    // resolves that to `hunter2` — so that is what the helper connects with.
+    // Reading the file as a String here produced a link carrying `hunter2\n`:
+    // another client derives a different key, the server drops the
+    // ciphertext, and Shadowsocks has no handshake in which to say why.
+    final clipboard = captureClipboard();
+    const id = 'b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f';
+    final dir = Directory.systemTemp.createTempSync('lios-home-copy');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final secret = ProfileWriter(directory: dir.path).secretPathFor(id);
+    writeManagedSecret(secret, 'hunter2\n');
+    final path = '${dir.path}/ss-home.json';
+    File(path)
+        .writeAsStringSync(ssDocument(id: id, name: 'SS Home', secret: secret));
+
+    await pumpHome(tester, dir.path);
+    await chooseInMenu(tester, path, 'Copy ss:// link');
+    expect(find.text('Copy this profile as a link?'), findsOneWidget,
+        reason: 'the list must ask, as the editor does before deleting');
+    // Confirmed in fake time — `showDialog`'s future completes when the route
+    // pops — and then given real time for the two bridge calls behind it.
+    await tester.tap(find.byKey(const Key('confirm-copy')));
+    await tester.pumpAndSettle();
+    await settleAcrossTheBridge(tester);
+
+    expect(tester.takeException(), isNull);
+    expect(clipboard.length, 1, reason: 'one copy, one link');
+    final link = clipboard.single;
+    expect(link, startsWith('ss://'));
+    // Decoded here rather than through `importSsUri`: the assertion is about
+    // what ANOTHER client reads out of this link, so it must not be made with
+    // this build's own importer.
+    final creds = link.substring('ss://'.length, link.indexOf('@'));
+    expect(utf8.decode(base64Url.decode(base64Url.normalize(creds))),
+        'aes-256-gcm:hunter2',
+        reason: "a link carrying `hunter2\\n` derives a different key and is "
+            'silently wrong everywhere it is pasted');
+
+    expect(find.textContaining('ss://'), findsNothing,
+        reason: 'a live credential on screen is one screenshot from being '
+            "someone else's");
+    expect(find.textContaining('hunter2'), findsNothing);
+    expect(find.textContaining('Link copied'), findsOneWidget,
+        reason: 'and the user has to be told it worked');
   });
 }
 

@@ -273,13 +273,28 @@ pub fn file_secret_value(bytes: Vec<u8>) -> Result<String, String> {
 /// Refusals name no field of the profile. Every one of them is
 /// caller-supplied and this error crosses back over the wire.
 ///
-/// **This is the round-trip guard.** `render_ss_uri` is total, but not every
-/// input round-trips: an empty host, port 0, an IPv6 or bracketed host, an
-/// empty cipher and an empty password each render a link that this build's own
-/// `parse_ss_uri` then refuses. `ProfileDto` enforces none of those — its
-/// fields are a `String`, a `u16` and an `Option<String>` — and nothing
-/// upstream is guaranteed to have screened them. Without these checks the user
-/// copies a link, pastes it back, and it does not import.
+/// **This is the well-formedness guard.** `render_ss_uri` is total, but not
+/// every input renders something a Shadowsocks client can read: an empty host,
+/// port 0, an IPv6 or bracketed host, an empty cipher and an empty password
+/// each produce a link that this build's own `parse_ss_uri` then refuses.
+/// `ProfileDto` enforces none of those — its fields are a `String`, a `u16` and
+/// an `Option<String>` — and nothing upstream is guaranteed to have screened
+/// them. Without these checks the user copies something no client can use.
+///
+/// It is deliberately NOT a round-trip guard, and that is the one asymmetry
+/// with [`import_ss_uri`], which calls [`check_cipher`]. A profile written by
+/// the CLI may name `2022-blake3-aes-256-gcm` — today's default server cipher —
+/// and the link this renders for it is perfectly well formed and perfectly
+/// usable in Outline or shadowsocks-rust. That it will not import back into
+/// *this* build is a limitation of this build's cipher feature set, not a
+/// defect in the link, and "copy as a link" exists precisely so a profile can
+/// be used in another client. Refusing here would withhold a working link from
+/// a profile this app cannot connect with OR edit — a dead end, in place of the
+/// one gesture that still gets the user's own credential out. The cipher name
+/// is not secret and the link says it plainly, so nothing is hidden by letting
+/// it through. `a_link_is_rendered_for_a_cipher_this_build_cannot_speak` pins
+/// this decision, including the half that makes it a decision: our own import
+/// still refuses it.
 pub fn export_ss_uri(dto: ProfileDto, password: String) -> Result<String, String> {
     if dto.auth_kind != "shadowsocks" || dto.protocol != "shadowsocks" {
         return Err("only a shadowsocks profile can be rendered as an ss:// link".into());
@@ -430,6 +445,47 @@ mod tests {
                 assert_eq!(back.name, name);
             }
         }
+    }
+
+    /// The decision the export guard makes about a cipher, stated once.
+    ///
+    /// `import_ss_uri` refuses `2022-blake3-aes-256-gcm`; this deliberately
+    /// does not. A CLI-written profile can name it — `method` is a free
+    /// `String` in the schema — and the link rendered for one is well formed
+    /// and usable in Outline or shadowsocks-rust, which is the entire point of
+    /// "copy as a link". Refusing would leave a profile this build can neither
+    /// connect with nor edit with no way at all to get the user's own
+    /// credential out.
+    ///
+    /// Both halves are asserted, because the second is what makes this a
+    /// decision rather than an oversight: the link is real, and our own import
+    /// still says no to it. If that ever becomes intolerable, the fix is
+    /// `check_cipher` here AND the doc comment above losing its second
+    /// paragraph — not one without the other.
+    #[test]
+    fn a_link_is_rendered_for_a_cipher_this_build_cannot_speak() {
+        use base64::Engine;
+        let creds = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("aes-256-gcm:pw");
+        let mut dto = import_ss_uri(format!("ss://{creds}@198.51.100.7:8388#Home")).unwrap();
+        dto.cipher = Some("2022-blake3-aes-256-gcm".into());
+
+        let link = export_ss_uri(dto, "pw".into())
+            .expect("a link for another client is not this build's to refuse");
+
+        // Parsed by the core, which deliberately does not check the method --
+        // the cipher list has one owner. This is what any other client sees.
+        let seen = liostunnel_core::protocols::ss_uri::parse_ss_uri(&link).unwrap();
+        assert_eq!(seen.method, "2022-blake3-aes-256-gcm");
+        assert_eq!(seen.password.expose(), "pw");
+        assert_eq!(seen.host, "198.51.100.7");
+        assert_eq!(seen.port, 8388);
+
+        // And the asymmetry, on purpose: this build will not take it back.
+        assert!(
+            import_ss_uri(link).is_err(),
+            "if this ever imports, the export guard is no longer the looser of \
+             the two and the doc comment above needs rewriting"
+        );
     }
 
     /// The refusal must not quote the profile. Every field of it is
