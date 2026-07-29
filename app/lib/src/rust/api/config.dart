@@ -93,6 +93,28 @@ Future<ProfileDto> importSsUri({required String uri}) =>
 Future<String> ssUriPassword({required String uri}) =>
     RustLib.instance.api.crateApiConfigSsUriPassword(uri: uri);
 
+/// What a `file:` secret's *value* is, given the file's bytes.
+///
+/// Not the raw bytes. `FileSecretStore::resolve` — the thing the helper
+/// actually connects with — strips one trailing line ending, because a
+/// password written by `echo hunter2 > pw` means `hunter2` while a PEM private
+/// key's own final newline is content. That rule has exactly one owner, in the
+/// core, and this hands it to Dart rather than letting a second copy grow
+/// there. A second copy is free to drift, on a rule whose entire purpose is
+/// that two components agree about the user's password: the app read the file
+/// itself and copied an `ss://` link carrying `hunter2\n`, which every other
+/// client then derives a different key from, and Shadowsocks has no handshake
+/// in which to report it.
+///
+/// Bytes in, because a credential is bytes: a binary pre-shared key or a
+/// DER-encoded private key is not text, and `read_to_string` — like Dart's
+/// `readAsStringSync` — answers one with a decoder's complaint about byte
+/// offsets. A refusal is the honest outcome for anything that needs a
+/// `String`, but it should be a sentence the app wrote. Nothing of the file
+/// appears in it.
+Future<String> fileSecretValue({required List<int> bytes}) =>
+    RustLib.instance.api.crateApiConfigFileSecretValue(bytes: bytes);
+
 /// Renders a Shadowsocks profile as an `ss://` link the user can copy.
 ///
 /// **The returned String carries the password.** It is what every other
@@ -106,6 +128,14 @@ Future<String> ssUriPassword({required String uri}) =>
 ///
 /// Refusals name no field of the profile. Every one of them is
 /// caller-supplied and this error crosses back over the wire.
+///
+/// **This is the round-trip guard.** `render_ss_uri` is total, but not every
+/// input round-trips: an empty host, port 0, an IPv6 or bracketed host, an
+/// empty cipher and an empty password each render a link that this build's own
+/// `parse_ss_uri` then refuses. `ProfileDto` enforces none of those — its
+/// fields are a `String`, a `u16` and an `Option<String>` — and nothing
+/// upstream is guaranteed to have screened them. Without these checks the user
+/// copies a link, pastes it back, and it does not import.
 Future<String> exportSsUri({
   required ProfileDto dto,
   required String password,

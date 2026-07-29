@@ -234,6 +234,31 @@ pub fn ss_uri_password(uri: String) -> Result<String, String> {
     Ok(parse(&uri)?.password.expose().clone())
 }
 
+/// What a `file:` secret's *value* is, given the file's bytes.
+///
+/// Not the raw bytes. `FileSecretStore::resolve` — the thing the helper
+/// actually connects with — strips one trailing line ending, because a
+/// password written by `echo hunter2 > pw` means `hunter2` while a PEM private
+/// key's own final newline is content. That rule has exactly one owner, in the
+/// core, and this hands it to Dart rather than letting a second copy grow
+/// there. A second copy is free to drift, on a rule whose entire purpose is
+/// that two components agree about the user's password: the app read the file
+/// itself and copied an `ss://` link carrying `hunter2\n`, which every other
+/// client then derives a different key from, and Shadowsocks has no handshake
+/// in which to report it.
+///
+/// Bytes in, because a credential is bytes: a binary pre-shared key or a
+/// DER-encoded private key is not text, and `read_to_string` — like Dart's
+/// `readAsStringSync` — answers one with a decoder's complaint about byte
+/// offsets. A refusal is the honest outcome for anything that needs a
+/// `String`, but it should be a sentence the app wrote. Nothing of the file
+/// appears in it.
+pub fn file_secret_value(bytes: Vec<u8>) -> Result<String, String> {
+    let body = String::from_utf8(bytes)
+        .map_err(|_| "this secret file is not text, so it cannot be read as a password")?;
+    Ok(liostunnel_core::config::secret::strip_one_trailing_line_ending(&body).to_string())
+}
+
 /// Renders a Shadowsocks profile as an `ss://` link the user can copy.
 ///
 /// **The returned String carries the password.** It is what every other
@@ -622,5 +647,69 @@ mod tests {
         let b = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("no-colon-SECRET");
         let e = import_ss_uri(format!("ss://{b}")).unwrap_err();
         assert!(!e.contains("SECRET"), "echoed: {e}");
+    }
+
+    /// A `file:` secret's value is the core's, not the file's raw bytes.
+    ///
+    /// Asserted against `FileSecretStore` itself rather than against a second
+    /// statement of the rule. That is the whole point of this function
+    /// existing: the helper resolves the secret one way, and anything in the
+    /// app that reads the same file must land on the same string or the two
+    /// components disagree about what the user's password is. `_copyLink` read
+    /// the file itself and handed the raw bytes to `export_ss_uri`, so a
+    /// password written by `echo hunter2 > pw` -- the case the core's helper
+    /// is documented for -- produced a link whose password was `hunter2\n`.
+    /// The tunnel connects with `hunter2`; the link derives a different key,
+    /// the server drops the ciphertext, and Shadowsocks has no handshake in
+    /// which to say why.
+    #[test]
+    fn a_file_secrets_value_is_whatever_the_core_resolves() {
+        use liostunnel_core::config::secret::{FileSecretStore, SecretRef, SecretStore};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("lios-ffi-secret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Every shape the core's own helper distinguishes, so this cannot pass
+        // by trimming more (or less) than the core does.
+        for raw in [
+            &b"hunter2\n"[..],
+            b"hunter2\r\n",
+            b"hunter2",
+            b"hunter2\n\n",
+            b"-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END-----\n",
+        ] {
+            let p = dir.join("pw");
+            std::fs::write(&p, raw).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+            let resolved = FileSecretStore
+                .resolve(&SecretRef::File { path: p.clone() })
+                .unwrap();
+            let ours = file_secret_value(raw.to_vec()).unwrap();
+            assert_eq!(
+                &ours,
+                resolved.expose(),
+                "the app must read {raw:?} as the helper does"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A credential is bytes, and not every credential is text.
+    ///
+    /// The refusal has to be ours. `readAsStringSync` in Dart answers a binary
+    /// pre-shared key with a UTF-8 decoder's complaint about byte offsets,
+    /// from a gesture that said "copy link", for a profile with nothing wrong
+    /// with it -- the lesson `ProfileWriter._readSecretFile` already records
+    /// one menu item over.
+    #[test]
+    fn a_secret_file_that_is_not_text_is_refused_in_our_own_words() {
+        let e = file_secret_value(vec![0x00, 0xff, 0xfe, 0x80]).unwrap_err();
+        assert!(
+            e.contains("not text"),
+            "the app's own sentence, not a decoder's: {e}"
+        );
+        // It reads a credential, so it may not quote one back.
+        assert!(!e.contains("0xff") && !e.contains("byte"), "{e}");
     }
 }
