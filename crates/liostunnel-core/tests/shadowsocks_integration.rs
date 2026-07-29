@@ -150,6 +150,12 @@ async fn a_wrong_password_fails_at_connect() {
     // does not hang up -- it holds the connection and discards the bytes, so
     // the probe runs out of time instead. That is the arm a real user hits,
     // and no loopback fixture could have shown it.
+    //
+    // Fix wave 3, finding 3: that timeout is a `Config` at `auth`, not a
+    // `Transport`. `dispatch::connect_failed` maps `Transport` to
+    // `ErrorKind::Internal` — "the helper hit an internal error, check its
+    // log" — so the arm a real user hits most often was reported as a helper
+    // fault rather than as the profile mistake it usually is.
     let mut t = ShadowsocksTunnel::new();
     let err = t
         .connect(
@@ -159,8 +165,9 @@ async fn a_wrong_password_fails_at_connect() {
         .await
         .expect_err("a wrong password must fail at connect");
     assert!(
-        matches!(err, TunnelError::Auth(_) | TunnelError::Transport(_)),
-        "got {err:?}"
+        matches!(&err, TunnelError::Auth(_))
+            || matches!(&err, TunnelError::Config { field, .. } if field == "auth"),
+        "a bad credential is the user's own profile to fix, at `auth`: got {err:?}"
     );
     // Whichever arm it takes, the message must name the credential as a
     // possible cause -- this is the most likely reason a user is here.
@@ -189,8 +196,9 @@ async fn the_wrong_cipher_against_a_real_server_also_fails_at_connect() {
         .await
         .expect_err("the wrong cipher must fail at connect");
     assert!(
-        matches!(err, TunnelError::Auth(_) | TunnelError::Transport(_)),
-        "got {err:?}"
+        matches!(&err, TunnelError::Auth(_))
+            || matches!(&err, TunnelError::Config { field, .. } if field == "auth"),
+        "a bad credential is the user's own profile to fix, at `auth`: got {err:?}"
     );
     assert!(
         format!("{err}").contains("cipher or password"),

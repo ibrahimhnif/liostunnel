@@ -95,6 +95,10 @@ impl Session {
             // now that it can dial Shadowsocks, and all five-second fixes in
             // their own file. `SshTunnel` essentially never produced `Config`,
             // which is why this never mattered before.
+            //
+            // Fix wave 3, finding 3: the probe's own timeout joins them. It is
+            // a `Config` at `auth` now, so this arm is what stops the most
+            // common Shadowsocks user error reading as a helper fault.
             StartError::Tunnel(liostunnel_core::TunnelError::Config { .. }) => {
                 ErrorKind::BadRequest
             }
@@ -557,23 +561,40 @@ mod tests {
     fn a_shadowsocks_probe_failure_is_not_reported_as_a_wrong_password() {
         // Shadowsocks has no handshake, so `connect` proves the credentials
         // with one relayed round trip — which means it can now fail for
-        // NETWORK reasons as well as credential ones. A probe that times out
-        // is `Transport`; a DoH resolver whose TLS failed through a
-        // proven-good relay is `Dns`. Neither means the password was wrong,
-        // and saying so sends the user to change a credential that works.
+        // NETWORK reasons as well as credential ones. A DoH resolver whose
+        // TLS failed through a proven-good relay is `Dns`; a server this
+        // machine cannot reach at all is `Transport`. Neither means the
+        // password was wrong, and saying so sends the user to change a
+        // credential that works.
         //
         // Fix wave 1, finding 6: the last row is the direction nothing
         // guarded. Only `Tunnel(_) => Internal` was pinned, so mutating the
         // `Auth` arm to `Internal` left the suite green and silently stopped
         // ever telling a user their password was wrong — the exact failure
         // this test's first two rows exist to prevent, in reverse.
+        //
+        // Fix wave 3, finding 3: the probe's own timeout used to be the first
+        // row, as a `Transport`, and therefore reached the user as "The
+        // helper hit an internal error. Check its log." The integration suite
+        // established that a real ss-libev server given a wrong password or
+        // cipher accepts the connection and silently discards it, so that
+        // timeout is where the most common user error in this protocol
+        // arrives. It is a `Config` at `auth` now, and belongs with the
+        // profile mistakes, not with the helper faults.
         use liostunnel_core::TunnelError;
         let mut s = sess();
         let failures = [
             (
+                StartError::Tunnel(TunnelError::config(
+                    "auth",
+                    "nothing came back through the tunnel in time",
+                )),
+                "bad_request",
+            ),
+            (
                 StartError::Tunnel(TunnelError::Transport(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "probe",
+                    std::io::ErrorKind::ConnectionRefused,
+                    "the server refused the connection",
                 ))),
                 "internal",
             ),

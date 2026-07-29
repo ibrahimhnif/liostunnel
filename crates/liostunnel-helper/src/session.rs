@@ -440,13 +440,16 @@ async fn connect_protocol(
             // wrong cipher does NOT hang up -- it accepts the connection and
             // discards the bytes silently, which is the behaviour the probe
             // exists to work around. So a bad credential arrives as the
-            // probe's TIMEOUT, a `Transport`, not as `Auth`. Since
-            // `dispatch::connect_failed` maps everything that is not `Auth` to
-            // `Internal`, the most common user error in this protocol
-            // currently reaches the UI as "the helper hit an internal error".
-            // The probe's message names the credential for that reason; the
-            // ErrorKind is a Phase 1b review decision, recorded in
-            // docs/superpowers/phase1b-verification.md.
+            // probe's TIMEOUT, not as `Auth`.
+            //
+            // That timeout is a `TunnelError::Config` at `auth` (fix wave 3,
+            // finding 3), which `dispatch::connect_failed` maps to
+            // `ErrorKind::BadRequest`. It used to be a `Transport`, and
+            // therefore `Internal`, whose wording sends the user to the
+            // helper's log -- so the most common user error in this protocol
+            // reached the UI as "the helper hit an internal error". The
+            // probe's message names both causes; the kind now says whose
+            // mistake it is.
             ss.connect(&auth.profile, &auth.secrets).await?;
             // The same guarantee the SSH arm gives, for the same reason: this
             // is the address `connect` resolved once and handed to

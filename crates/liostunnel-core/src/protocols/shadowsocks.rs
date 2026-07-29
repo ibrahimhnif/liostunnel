@@ -124,6 +124,13 @@ pub struct ShadowsocksTunnel {
     /// before the round trip in the reactor ever completes. See
     /// `connect_fails_when_the_server_does_not_answer`'s doc.
     probe_timeout: std::time::Duration,
+    /// How long one flow's connect to the server may take.
+    /// Always [`Self::FLOW_CONNECT_TIMEOUT`] in production; a field for the
+    /// same reason `probe_timeout` is one.
+    flow_connect_timeout: std::time::Duration,
+    /// How long one flow may wait for a permit before it is refused.
+    /// Always [`Self::FLOW_PERMIT_TIMEOUT`] in production.
+    flow_permit_timeout: std::time::Duration,
 }
 
 /// Hand-written, not derived, on purpose: a `#[derive(Debug)]` here would
@@ -160,6 +167,8 @@ impl ShadowsocksTunnel {
             flow_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FLOWS)),
             dns_flow_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_DNS_FLOWS)),
             probe_timeout: Self::PROBE_TIMEOUT,
+            flow_connect_timeout: Self::FLOW_CONNECT_TIMEOUT,
+            flow_permit_timeout: Self::FLOW_PERMIT_TIMEOUT,
         }
     }
 
@@ -329,6 +338,50 @@ impl ShadowsocksTunnel {
         self
     }
 
+    /// How long one flow's connect to the server may take before it is
+    /// abandoned.
+    ///
+    /// Nothing else bounds it. `ProxyClientStream::connect` reads
+    /// `ServerConfig::timeout()`, which `ServerConfig::new` leaves `None`
+    /// (shadowsocks-1.24.0, `src/config.rs`), and with no timeout the connect
+    /// waits the OS SYN retransmission limit -- about 75 seconds on macOS and
+    /// 130 on Linux -- while holding a permit out of
+    /// [`MAX_CONCURRENT_FLOWS`]. A blocked or dead server is the expected
+    /// failure mode for this product, so that is the ordinary case, not an
+    /// exotic one.
+    ///
+    /// Ten seconds is generous for a TCP handshake to a server the profile
+    /// already resolved once, and comfortably under `SshTunnel`'s own ~45s
+    /// (`keepalive_interval` 15s x `keepalive_max` 3).
+    const FLOW_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// How long one flow waits for a permit before it is refused.
+    ///
+    /// Queueing is the point of the semaphores; queueing without end is not.
+    /// `acquire_owned()` has no timeout of its own, so a burst that filled the
+    /// allowance left every later flow parked forever: `proxy_one` never
+    /// returned, the local half of the flow was never reset, and the
+    /// application saw a stall rather than an error it could report.
+    ///
+    /// Longer than [`Self::FLOW_CONNECT_TIMEOUT`] on purpose: a flow queued
+    /// behind one that is about to give up must still get its turn rather
+    /// than be refused a moment before the permit comes free.
+    const FLOW_PERMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    /// Test-only seam for the two bounds above, for the same reason
+    /// `with_probe_timeout` exists: so a test can watch them fire on the real
+    /// clock in milliseconds.
+    #[cfg(test)]
+    fn with_flow_timeouts(
+        mut self,
+        connect: std::time::Duration,
+        permit: std::time::Duration,
+    ) -> Self {
+        self.flow_connect_timeout = connect;
+        self.flow_permit_timeout = permit;
+        self
+    }
+
     /// Proves the credentials work, because the protocol will not.
     ///
     /// Shadowsocks has no handshake: a server given the wrong key accepts
@@ -355,57 +408,109 @@ impl ShadowsocksTunnel {
     /// Shadowsocks offers no server identity at all.
     ///
     /// Follows `profile.dns.mode`, and must: a DoH profile's resolver is
-    /// contacted at `servers[0]:443` (`dns/over_https.rs`) and need not
+    /// contacted on 443 (`dns/over_https.rs`) and need not
     /// serve plain DNS on 53 at all, so probing 53 unconditionally stalled a
     /// DoH profile with *correct* credentials for the whole timeout and then
     /// reported an auth failure.
     async fn probe(&self, dns: &DnsConfig) -> Result<(), TunnelError> {
         match tokio::time::timeout(self.probe_timeout, self.probe_once(dns)).await {
             Ok(r) => r,
-            // Deliberately not `Auth`, and the message names both causes,
-            // because from here they are genuinely indistinguishable.
-            //
-            // The integration suite established which one is actually
-            // common: given a wrong password OR a wrong cipher, a real
-            // ss-libev server does not close the connection -- it accepts
-            // the bytes and silently discards them, which is the behaviour
-            // the whole probe exists to work around. So a bad credential
-            // against a real server arrives HERE, as a timeout, not at the
-            // `read_exact` arm below. The loopback fixtures reach that arm
-            // only because they hang up.
-            //
-            // Calling it `Auth` would still be wrong: an exit that cannot
-            // reach the configured resolver produces exactly this too, and
-            // telling that user their password is wrong sends them to change
-            // the one thing that was never at fault. So the message carries
-            // both, in the order of likelihood a real server implies.
-            Err(_) => Err(TunnelError::Transport(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "nothing came back through the tunnel in time: the cipher or password may be \
-                 wrong (a Shadowsocks server given either accepts the connection and discards \
-                 it silently), or the exit cannot reach the resolver this profile names; \
-                 the exit may not be able to reach it",
-            ))),
+            Err(_) => Err(Self::probe_timed_out()),
         }
     }
 
+    /// What a probe that ran out of time means.
+    ///
+    /// Deliberately not `Auth`, and the message names both causes, because
+    /// from here they are genuinely indistinguishable.
+    ///
+    /// The integration suite established which one is actually common: given
+    /// a wrong password OR a wrong cipher, a real ss-libev server does not
+    /// close the connection -- it accepts the bytes and silently discards
+    /// them, which is the behaviour the whole probe exists to work around.
+    /// So a bad credential against a real server arrives HERE, as a timeout,
+    /// not at `probe_over_dns`'s `read_exact` arm. The loopback fixtures
+    /// reach that arm only because they hang up.
+    ///
+    /// Calling it `Auth` would still be wrong: an exit that cannot reach the
+    /// configured resolver produces exactly this too, and telling that user
+    /// their password is wrong sends them to change the one thing that was
+    /// never at fault. So the message carries both, in the order of
+    /// likelihood a real server implies.
+    ///
+    /// `Config`, and not `Transport`, since fix wave 3, finding 3.
+    /// `dispatch::connect_failed` maps every error that is neither `Auth` nor
+    /// `Config` to `ErrorKind::Internal`, which the app renders as "The
+    /// helper hit an internal error. Check its log." Given what the
+    /// integration suite established, that made the single most common user
+    /// error in this protocol read as a helper bug. `Config` maps to
+    /// `BadRequest` through the arm `dispatch.rs` added this phase for
+    /// exactly this reasoning -- a profile the user can fix, not a helper
+    /// fault -- and `auth` is the field to look at. Nothing about the shape
+    /// of the message changes, and no new `ErrorKind` is needed.
+    fn probe_timed_out() -> TunnelError {
+        TunnelError::config(
+            "auth",
+            "nothing came back through the tunnel in time: the cipher or password may be \
+             wrong (a Shadowsocks server given either accepts the connection and discards \
+             it silently), or the exit cannot reach the resolver this profile names",
+        )
+    }
+
+    /// Every resolver the profile names, in order, until one answers.
+    ///
+    /// Iterating rather than taking `servers.first()` since fix wave 3,
+    /// finding 4. `TcpResolver::query` (`dns/over_tcp.rs`) and
+    /// `DohResolver::query` (`dns/over_https.rs`) both try every entry, so a
+    /// probe that tried only the first refused profiles that would resolve
+    /// perfectly once connected -- and `import_ss_uri` gives every imported
+    /// link a *pair* (`api/config.rs`), precisely because an exit may not be
+    /// able to reach one of them.
+    ///
+    /// The budget is shared out rather than spent per resolver: `probe`'s
+    /// ceiling covers the whole loop, so the worst case a user waits is
+    /// unchanged. Without a per-resolver share a first entry that swallows
+    /// the query consumes everything and the loop is decorative -- exactly
+    /// the failure it exists to fix, one step in.
     async fn probe_once(&self, dns: &DnsConfig) -> Result<(), TunnelError> {
         // Guarded by `ServerProfile::validate`, so this is a belt-and-braces
         // arm rather than a reachable one -- but `connect` does not call
-        // `validate`, and the alternative here is indexing.
-        let Some(&server) = dns.servers.first() else {
+        // `validate`, and the alternative here is dividing by zero below.
+        let n = u32::try_from(dns.servers.len()).unwrap_or(u32::MAX);
+        if n == 0 {
             return Err(TunnelError::config("dns.servers", "must not be empty"));
-        };
-
-        match dns.mode {
-            DnsMode::Tcp => self.probe_over_dns(SocketAddr::new(server, DNS_PORT)).await,
-            DnsMode::Https => self.probe_over_tls(server, dns.https.as_ref()).await,
         }
+        let each = self.probe_timeout / n;
+
+        let mut last = None;
+        for &server in &dns.servers {
+            let attempt = async {
+                match dns.mode {
+                    DnsMode::Tcp => self.probe_over_dns(SocketAddr::new(server, DNS_PORT)).await,
+                    DnsMode::Https => self.probe_over_tls(server, dns.https.as_ref()).await,
+                }
+            };
+            match tokio::time::timeout(each, attempt).await {
+                Ok(Ok(())) => return Ok(()),
+                // A malformed `dns.https` block or an unparseable SNI is the
+                // same for every entry in the list, and knowable without a
+                // byte on the wire. Trying the next resolver would spend the
+                // budget re-deciding it and then report a timeout instead of
+                // the field that is actually wrong.
+                Ok(Err(e @ TunnelError::Config { .. })) => return Err(e),
+                Ok(Err(e)) => last = Some(e),
+                Err(_) => last = Some(Self::probe_timed_out()),
+            }
+        }
+        Err(last.unwrap_or_else(Self::probe_timed_out))
     }
 
-    /// `DnsMode::Tcp`: one RFC 7766-framed query to `servers[0]:53`. Two
+    /// `DnsMode::Tcp`: one RFC 7766-framed query to a resolver's port 53. Two
     /// bytes back is the whole proof -- they arrived through an AEAD tag
     /// check, so a wrong-key server cannot have produced them.
+    ///
+    /// Called once per entry in `dns.servers` (see `probe_once`), not once
+    /// for `servers[0]`.
     async fn probe_over_dns(&self, dns: SocketAddr) -> Result<(), TunnelError> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -440,7 +545,7 @@ impl ShadowsocksTunnel {
         Ok(())
     }
 
-    /// `DnsMode::Https`: relay to `servers[0]:443` and complete a TLS
+    /// `DnsMode::Https`: relay to a resolver's port 443 and complete a TLS
     /// handshake against the configured SNI, the same one `DohResolver` will
     /// perform for every real query -- same `tls_config`, same roots, same
     /// port, deliberately shared rather than re-derived here.
@@ -677,18 +782,54 @@ impl ShadowsocksTunnel {
         // descriptors: each flow below opens a socket of its own, and nothing
         // upstream of here caps them. The permit is held by the returned
         // `CountingStream` and released when the flow is dropped.
-        let permit = limit
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| TunnelError::Protocol("flow limiter closed".into()))?;
+        //
+        // Bounded in time as well as in count. `acquire_owned()` waits
+        // forever, so once the allowance was full every later flow parked
+        // here indefinitely: `engine.rs`'s `proxy_one` never returned, the
+        // local half of the flow was never reset, and the application saw a
+        // stall rather than an error. The caller has to be told.
+        let permit =
+            match tokio::time::timeout(self.flow_permit_timeout, limit.clone().acquire_owned())
+                .await
+            {
+                Ok(Ok(p)) => p,
+                Ok(Err(_)) => return Err(TunnelError::Protocol("flow limiter closed".into())),
+                Err(_) => {
+                    self.counters.failed.fetch_add(1, Ordering::Relaxed);
+                    return Err(TunnelError::Transport(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "no flow budget came free in time; the tunnel is saturated",
+                    )));
+                }
+            };
 
-        let stream = ProxyClientStream::connect(ctx, cfg, Address::SocketAddress(dest))
-            .await
-            .map_err(|e| {
+        // The connect is bounded here rather than through
+        // `ServerConfig::set_timeout` -- which `ProxyClientStream::connect`
+        // would honour -- for one reason: the crate's own timeout error is
+        // `format!("connect {} timeout", svr_cfg.addr())`, and `addr` is the
+        // address this profile's `host` resolved to. That string reaches the
+        // root-owned helper log (`tracing::warn!(error = %e, ...)`) and the
+        // wire (`dispatch::connect_failed`), and echoing caller-supplied
+        // profile content into either is the rule `cipher` and
+        // `probe_over_tls` already follow. Ours names the timeout and
+        // nothing else.
+        let connect = ProxyClientStream::connect(ctx, cfg, Address::SocketAddress(dest));
+        let stream = match tokio::time::timeout(self.flow_connect_timeout, connect).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 self.counters.failed.fetch_add(1, Ordering::Relaxed);
-                TunnelError::Protocol(format!("cannot open a relayed stream: {e}"))
-            })?;
+                return Err(TunnelError::Protocol(format!(
+                    "cannot open a relayed stream: {e}"
+                )));
+            }
+            Err(_) => {
+                self.counters.failed.fetch_add(1, Ordering::Relaxed);
+                return Err(TunnelError::Transport(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the server did not accept a connection in time",
+                )));
+            }
+        };
         Ok(Box::new(CountingStream::new(
             stream,
             self.counters.up.clone(),
@@ -777,6 +918,51 @@ mod tests {
         addr
     }
 
+    /// Everything that has to stay alive for [`a_black_hole`] to keep
+    /// swallowing SYNs: the listener itself, and the connections that filled
+    /// its accept queue. Dropping this makes the address refuse again.
+    struct BlackHole {
+        _listener: tokio::net::TcpListener,
+        _queued: Vec<tokio::task::JoinHandle<std::io::Result<tokio::net::TcpStream>>>,
+    }
+
+    /// A loopback address whose TCP connect never completes.
+    ///
+    /// A listener with a backlog of one that nothing ever accepts from: once
+    /// the kernel's accept queue is full it *drops* further SYNs instead of
+    /// refusing them, so a connect to it sits in SYN retransmission until the
+    /// caller gives up. macOS and Linux both behave this way, and none of it
+    /// leaves the loopback interface -- which is the whole point. This module
+    /// already deleted one test built on TEST-NET-1 (192.0.2.1) because that
+    /// address is black-holed by some network stacks and refused outright by
+    /// others, so the test proved a property of the machine rather than of
+    /// the code.
+    ///
+    /// This is what a blocked or dead Shadowsocks server looks like from
+    /// here, and it is the expected failure mode for this product: the
+    /// server is exactly the thing a censor drops packets to.
+    async fn a_black_hole() -> (SocketAddr, BlackHole) {
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = sock.listen(1).unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Deliberately not awaited: the ones past the queue's capacity never
+        // complete, which is the state being built. Holding the handles keeps
+        // the ones that *did* complete from being dropped and freeing a slot.
+        let queued = (0..16)
+            .map(|_| tokio::spawn(async move { tokio::net::TcpStream::connect(addr).await }))
+            .collect();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        (
+            addr,
+            BlackHole {
+                _listener: listener,
+                _queued: queued,
+            },
+        )
+    }
+
     /// A tunnel already `Connected`, pointed at a server address that refuses
     /// instantly -- built by calling `prepare` directly and assigning state
     /// by hand instead of going through `connect`. `connect`'s probe (Task
@@ -789,7 +975,11 @@ mod tests {
     /// the probe, so building the state directly is the accurate setup for
     /// them and leaves the resolved password retained, same as before.
     async fn connected_to_a_refusing_server() -> (ShadowsocksTunnel, SocketAddr) {
-        let server = a_closed_loopback_port().await;
+        connected_to(a_closed_loopback_port().await).await
+    }
+
+    /// The same, pointed at whatever server address the caller has arranged.
+    async fn connected_to(server: SocketAddr) -> (ShadowsocksTunnel, SocketAddr) {
         let (server_cfg, context, peer) = ShadowsocksTunnel::prepare(
             &profile_at(
                 "chacha20-ietf-poly1305",
@@ -1092,6 +1282,95 @@ mod tests {
         );
     }
 
+    /// Fix wave 3, finding 2. `ProxyClientStream::connect` takes its connect
+    /// timeout from `ServerConfig::timeout()`, which `ServerConfig::new`
+    /// initialises to `None` and `prepare` never set -- so a flow to a server
+    /// whose SYNs are dropped waited the OS retransmission limit (~75s on
+    /// macOS, ~130s on Linux) *while holding a flow permit*.
+    ///
+    /// That is not an exotic failure, it is the expected one: the server is
+    /// precisely what a blocking network drops packets to. Sixty-four such
+    /// flows take every permit in [`MAX_CONCURRENT_FLOWS`], and since
+    /// `acquire_owned` had no bound either, every flow after them -- and,
+    /// after eight, every DNS query -- blocked indefinitely. `proxy_one`
+    /// never returned, so the local flow was never reset and applications
+    /// hung instead of erroring, while `stats()` still said `Connected` and
+    /// `flows_failed` never moved. In `default` route mode that is the whole
+    /// machine.
+    ///
+    /// `SshTunnel` has never had this: `keepalive_interval: 15s` with
+    /// `keepalive_max: 3` tears its session down in about 45 seconds.
+    ///
+    /// The outer `timeout` here is what makes the failure a *failure* rather
+    /// than a hung test: without the fix this call does not return at all.
+    #[tokio::test]
+    async fn a_flow_to_a_black_hole_fails_instead_of_hanging_on_to_its_permit() {
+        let (server, _hole) = a_black_hole().await;
+        let (t, _) = connected_to(server).await;
+        let t = t.with_flow_timeouts(Duration::from_millis(300), Duration::from_millis(300));
+
+        let flow = tokio::time::timeout(Duration::from_secs(3), t.open_tcp_stream(dest()))
+            .await
+            .expect("a flow to a server that never answers must fail, not hang");
+        let err = flow_error(flow, "the server address swallows SYNs");
+        assert!(
+            matches!(err, TunnelError::Transport(e) if e.kind() == std::io::ErrorKind::TimedOut),
+            "a connect that ran out of time is a transport timeout"
+        );
+
+        // The half that turns one dead flow into a dead machine. A permit
+        // held by a connect nobody bounded is a permit no other flow, and
+        // after eight no DNS query, can ever have.
+        assert_eq!(
+            t.flow_limit.available_permits(),
+            MAX_CONCURRENT_FLOWS,
+            "the permit must go back when the connect is abandoned"
+        );
+        assert_eq!(
+            t.stats().flows_failed,
+            1,
+            "a flow that timed out is a failed flow; reporting zero is how this \
+             stayed invisible"
+        );
+    }
+
+    /// Fix wave 3, finding 2, the other unbounded wait. Even with a bounded
+    /// connect, `acquire_owned()` itself had no timeout: a caller queued
+    /// behind a full allowance waited forever, so the engine's per-flow task
+    /// never returned and the application's own socket was never reset. The
+    /// caller has to be told, so that it can fail the flow and let the
+    /// application see an error rather than a stall.
+    ///
+    /// Distinct from `a_dns_flow_is_never_starved_by_a_full_general_flow_allowance`,
+    /// which pins that a flow *does* queue rather than opening unbounded.
+    /// Queueing is right; queueing without end is not.
+    #[tokio::test]
+    async fn a_flow_that_never_gets_a_permit_gives_up_rather_than_waiting_forever() {
+        let (t, _server) = connected_to_a_refusing_server().await;
+        let t = t.with_flow_timeouts(Duration::from_millis(300), Duration::from_millis(300));
+
+        let _hog = t
+            .flow_limit
+            .clone()
+            .acquire_many_owned(u32::try_from(MAX_CONCURRENT_FLOWS).unwrap())
+            .await
+            .unwrap();
+
+        let flow = tokio::time::timeout(Duration::from_secs(3), t.open_tcp_stream(dest()))
+            .await
+            .expect("a flow that cannot get a permit must give up, not wait forever");
+        let err = flow_error(flow, "every permit is taken");
+        assert!(
+            format!("{err}").contains("no flow budget"),
+            "the caller must be told the tunnel is saturated: {err}"
+        );
+        assert_eq!(
+            t.stats().flows_failed,
+            1,
+            "a flow refused for want of budget is a failed flow"
+        );
+    }
+
     #[test]
     fn stats_start_at_zero_and_report_disconnected() {
         let t = ShadowsocksTunnel::new();
@@ -1297,6 +1576,142 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(3600)).await;
         });
         (addr, rx)
+    }
+
+    /// A real Shadowsocks server that relays for these credentials but
+    /// answers only when the client asked it to reach `answers_for`.
+    /// Anything else it accepts and then holds open in silence -- a resolver
+    /// the *exit* cannot reach, which is not the same thing as a wrong
+    /// credential and is the case `probe_once` has to survive by moving on to
+    /// the next entry in `dns.servers`.
+    ///
+    /// Serves connections in a loop, not one: the whole point is that the
+    /// probe comes back for the second resolver. Returns the destinations it
+    /// was asked for, in order, so a test can assert *which* resolvers were
+    /// tried rather than only that the connect succeeded.
+    async fn a_shadowsocks_server_that_answers_only_for(
+        method: &str,
+        password: &str,
+        answers_for: SocketAddr,
+    ) -> (SocketAddr, Arc<std::sync::Mutex<Vec<SocketAddr>>>) {
+        use shadowsocks::relay::tcprelay::ProxyServerStream;
+        use tokio::io::AsyncWriteExt;
+
+        let cipher = CipherKind::from_str(method).expect("the test's own cipher must build");
+        let cfg = ServerConfig::new(("127.0.0.1".to_string(), 1), password.to_string(), cipher)
+            .expect("the test's own key must derive");
+        let key = cfg.key().to_vec();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let asked: Arc<std::sync::Mutex<Vec<SocketAddr>>> = Arc::default();
+        let recorded = asked.clone();
+
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let key = key.clone();
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let ctx = Context::new_shared(ServerType::Server);
+                    let mut s = ProxyServerStream::from_stream(ctx, sock, cipher, &key);
+                    let Ok(dest) = s.handshake().await else {
+                        return;
+                    };
+                    let Address::SocketAddress(dest) = dest else {
+                        return;
+                    };
+                    recorded.lock().unwrap().push(dest);
+                    let payload = drain_briefly(&mut s).await;
+                    if dest != answers_for {
+                        // Accepted, decrypted, and then nothing -- an exit
+                        // that cannot reach this resolver. Held open rather
+                        // than dropped, because a drop is a clean EOF and
+                        // that is the *other* outcome the probe distinguishes.
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                        return;
+                    }
+                    let _ = s.write_all(&payload).await;
+                    let _ = s.flush().await;
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                });
+            }
+        });
+        (addr, asked)
+    }
+
+    /// Fix wave 3, finding 4. `probe_once` read `dns.servers.first()` and
+    /// nothing else, so one resolver the exit cannot reach failed the whole
+    /// connect -- while `TcpResolver::query` (`dns/over_tcp.rs`) and
+    /// `DohResolver::query` (`dns/over_https.rs`) both iterate every entry, so
+    /// a profile that would resolve perfectly at runtime could not be
+    /// connected at all.
+    ///
+    /// Not hypothetical. `import_ss_uri` gives every imported link
+    /// `["1.1.1.1", "1.0.0.1"]` (`api/config.rs`), and the editor's own help
+    /// text says "Many tunnel providers block outbound port 53" -- an exit
+    /// that blocks or blackholes the first of a pair is the case the second
+    /// exists for.
+    ///
+    /// Asserts *which* resolvers were asked, in order, not merely that the
+    /// connect succeeded: a probe that skipped straight to the last entry
+    /// would satisfy "it connected" while quietly ignoring the user's
+    /// preference.
+    #[tokio::test]
+    async fn the_probe_tries_every_resolver_not_just_the_first() {
+        let answering: SocketAddr = "9.9.9.9:53".parse().unwrap();
+        let (server, asked) =
+            a_shadowsocks_server_that_answers_only_for("aes-256-gcm", PW, answering).await;
+        let mut p = profile_at("aes-256-gcm", &server.ip().to_string(), server.port());
+        p.dns.servers = vec![
+            "203.0.113.1".parse().unwrap(),
+            answering.ip(),
+            "192.0.2.1".parse().unwrap(),
+        ];
+
+        let mut t = ShadowsocksTunnel::new().with_probe_timeout(Duration::from_secs(3));
+        t.connect(&p, &FixedSecret(PW))
+            .await
+            .expect("the second resolver answers, so this profile connects");
+
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec!["203.0.113.1:53".parse().unwrap(), answering],
+            "every resolver up to the one that answered must have been tried, \
+             in the order the profile lists them, and none after it"
+        );
+    }
+
+    /// Fix wave 3, finding 4, the ceiling. Iterating is only useful if each
+    /// resolver actually gets a turn: a first entry that swallows the query
+    /// must not consume the whole budget, or the loop is decorative. The
+    /// budget is shared out, so the ceiling on `connect` is unchanged.
+    #[tokio::test]
+    async fn one_silent_resolver_does_not_spend_the_whole_probe_budget() {
+        let (server, _asked) = a_shadowsocks_server_that_answers_only_for(
+            "aes-256-gcm",
+            PW,
+            "9.9.9.9:53".parse().unwrap(),
+        )
+        .await;
+        let mut p = profile_at("aes-256-gcm", &server.ip().to_string(), server.port());
+        // Two that never answer, then the one that does.
+        p.dns.servers = vec![
+            "203.0.113.1".parse().unwrap(),
+            "192.0.2.1".parse().unwrap(),
+            "9.9.9.9".parse().unwrap(),
+        ];
+
+        let mut t = ShadowsocksTunnel::new().with_probe_timeout(Duration::from_secs(3));
+        let started = std::time::Instant::now();
+        t.connect(&p, &FixedSecret(PW))
+            .await
+            .expect("the third resolver answers");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the whole loop must fit inside the one ceiling `probe` already \
+             enforces, not take it per resolver: {:?}",
+            started.elapsed()
+        );
     }
 
     async fn what_the_server_saw(rx: tokio::sync::oneshot::Receiver<Probed>) -> Probed {
@@ -1613,10 +2028,30 @@ mod tests {
         // password: an exit that cannot reach the configured resolver, or a
         // network that stalls for eight seconds, produces exactly this. The
         // user must not be told their credentials are wrong.
-        assert!(matches!(err, TunnelError::Transport(_)), "got {err:?}");
+        //
+        // Fix wave 3, finding 3. It must not be reported as a *helper* fault
+        // either, and `Transport` was. `dispatch::connect_failed` maps every
+        // non-`Auth` error except `Config` to `ErrorKind::Internal`, which the
+        // app renders as "The helper hit an internal error. Check its log." --
+        // and the integration suite established that a real ss-libev server
+        // given a wrong password or cipher does not hang up, it accepts and
+        // silently discards, so a bad credential arrives HERE. The single most
+        // common user error in this protocol read as a helper bug. `Config`
+        // maps to `BadRequest`: a profile the user can fix, in their own file,
+        // which is what this is.
+        assert!(
+            matches!(&err, TunnelError::Config { field, .. } if field == "auth"),
+            "a probe that ran out of time is the user's profile to fix, not a \
+             helper fault, and the field is the credential: got {err:?}"
+        );
         assert!(
             !format!("{err}").contains("authentication"),
             "a transport stall must not be reported as an auth failure: {err}"
+        );
+        assert!(
+            format!("{err}").contains("cipher or password"),
+            "and it must still name both causes, in the order a real server \
+             implies: {err}"
         );
         assert_eq!(
             t.stats().state,
