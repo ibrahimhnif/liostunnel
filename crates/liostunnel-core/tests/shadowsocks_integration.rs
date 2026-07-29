@@ -26,16 +26,16 @@ fn password() -> String {
         .to_string()
 }
 
-/// The nginx target's address on the compose network.
+/// A fixture container's address on the compose network.
 ///
 /// Discovered rather than hardcoded: the compose network is recreated by
-/// `make down`/`make up` and the address moves. A stale literal would fail
+/// `make down`/`make up` and the addresses move. A stale literal would fail
 /// the test for a reason that has nothing to do with the tunnel.
-fn internal_target() -> std::net::SocketAddr {
+fn container_ip(container: &str) -> std::net::IpAddr {
     let out = std::process::Command::new("docker")
         .args([
             "inspect",
-            "docker-target-1",
+            container,
             "--format",
             "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
         ])
@@ -44,9 +44,31 @@ fn internal_target() -> std::net::SocketAddr {
     let ip = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(
         !ip.is_empty(),
-        "the target container has no compose address; run: make -C testing/docker up"
+        "{container} has no compose address; run: make -C testing/docker up"
     );
-    format!("{ip}:80").parse().expect("a compose address")
+    ip.parse().expect("a compose address")
+}
+
+/// The nginx target, which the host publishes no port for.
+fn internal_target() -> std::net::SocketAddr {
+    std::net::SocketAddr::new(container_ip("docker-target-1"), 80)
+}
+
+/// The fixture's own resolver, on the compose network.
+///
+/// Every test in this file calls `connect()`, every `connect()` runs the
+/// probe, and the probe relays one DNS query to whatever `profile.dns` names.
+/// That used to be 1.1.1.1, so the entire suite depended on the compose
+/// network's outbound internet access -- which contradicts
+/// `phase1b-verification.md`'s justification for the compose target, and,
+/// worse, made both credential tests pass for the *wrong reason* wherever
+/// that access is absent: a correct password produces the same timeout,
+/// naming the same "cipher or password", as a wrong one.
+///
+/// Like `internal_target`, the host publishes no port for it. See the `dns`
+/// service in `testing/docker/docker-compose.yml`.
+fn internal_resolver() -> std::net::IpAddr {
+    container_ip("docker-dns-1")
 }
 
 fn profile(port: u16, method: &str) -> ServerProfile {
@@ -55,10 +77,46 @@ fn profile(port: u16, method: &str) -> ServerProfile {
             "protocol":"shadowsocks","host":"127.0.0.1","port":{port},
             "auth":{{"type":"shadowsocks","method":"{method}",
                     "password":{{"source":"file","path":"/tmp/k"}}}},
-            "dns":["1.1.1.1"],"split_tunnel":{{"type":"all_traffic"}},
-            "kill_switch":false}}"#
+            "dns":["{}"],"split_tunnel":{{"type":"all_traffic"}},
+            "kill_switch":false}}"#,
+        internal_resolver()
     ))
     .unwrap()
+}
+
+/// Nothing in this suite may depend on the machine's own internet access.
+///
+/// Both credential tests below assert that a bad credential fails, and the
+/// failure they observe is the probe running out of time. An unreachable
+/// resolver produces exactly that -- so if the resolver the fixture profile
+/// names were reachable only over the open internet, both of them would go
+/// green on a machine with none, against a *correct* password. The whole
+/// point of the compose target is that it does not.
+///
+/// Asserted, not assumed: this is the precondition every other test here
+/// silently rests on.
+#[tokio::test]
+#[ignore = "needs the fixture: make -C testing/docker up"]
+async fn the_probe_reaches_a_resolver_only_the_relay_can_reach() {
+    let resolver = std::net::SocketAddr::new(internal_resolver(), 53);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::TcpStream::connect(resolver),
+        )
+        .await
+        .map(|r| r.is_err())
+        .unwrap_or(true),
+        "{resolver} answers this machine directly; the probe succeeding would \
+         then say nothing about whether the relay carried it"
+    );
+
+    // And the profile that names it connects anyway, which it can only do by
+    // relaying the probe's query through the Shadowsocks server.
+    let mut t = ShadowsocksTunnel::new();
+    t.connect(&profile(8388, "aes-256-gcm"), &Pw(password()))
+        .await
+        .expect("the probe's query must travel through the relay");
 }
 
 #[tokio::test]
@@ -116,6 +174,16 @@ async fn relays_a_real_http_request_to_a_target_only_it_can_reach() {
         .await
         .unwrap();
 
+    // Snapshotted AFTER connect, and compared as a delta (finding 8).
+    // `connect` runs the probe, which goes through `open_dns_stream` ->
+    // `open_flow` -> `CountingStream` and writes 19 bytes and reads 2, so both
+    // counters are already non-zero here no matter what the HTTP exchange
+    // below does. Asserting `> 0` on the absolute values therefore said
+    // nothing at all about the relay -- unlike the identical-looking
+    // assertion in `ssh_integration.rs`, which is load-bearing precisely
+    // because SSH has no probe in front of it.
+    let before = t.stats();
+
     let mut s = t.open_tcp_stream(target).await.expect("a relayed stream");
     s.write_all(b"GET / HTTP/1.0\r\nHost: target.internal\r\n\r\n")
         .await
@@ -127,12 +195,15 @@ async fn relays_a_real_http_request_to_a_target_only_it_can_reach() {
         "unexpected response: {body}"
     );
 
-    let stats = t.stats();
+    let after = t.stats();
     assert!(
-        stats.bytes_up > 0 && stats.bytes_down > 0,
-        "counters must move: up={} down={}",
-        stats.bytes_up,
-        stats.bytes_down
+        after.bytes_up > before.bytes_up && after.bytes_down > before.bytes_down,
+        "the counters must move for THIS exchange, not merely be non-zero from \
+         the probe: up {} -> {}, down {} -> {}",
+        before.bytes_up,
+        after.bytes_up,
+        before.bytes_down,
+        after.bytes_down
     );
 }
 

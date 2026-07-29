@@ -1086,6 +1086,87 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Fix wave 3, finding 10. The counterpart of the SSH test above, and it
+    /// was missing for the same reason that one was: every other Shadowsocks
+    /// factory test binds `let Err(err) = … else { panic }`, so the `Ok`
+    /// tuple — the address the route layer pins through the original gateway —
+    /// was observed by nothing. `ShadowsocksTunnel` has the identical
+    /// `peer_addr().ok_or_else(...)`, and mutating it to return `None` left
+    /// the whole helper suite green.
+    ///
+    /// `localhost`, not `127.0.0.1`: a name is what makes the guarantee
+    /// non-trivial. What is asserted is that the factory reports the concrete
+    /// v4 address the *session* reached, not one a second, independent lookup
+    /// produced — which for a multi-A host need not be the same address.
+    ///
+    /// The resolver comes off the compose network, like `liostunnel-core`'s
+    /// own Shadowsocks integration suite: `connect` runs the probe, the probe
+    /// relays a DNS query, and naming a public resolver here would make this
+    /// depend on the machine's outbound internet rather than on the fixture.
+    ///
+    /// `#[ignore]`d because it needs the live fixture. It opens no TUN device,
+    /// installs no route and needs no privilege — `connect_protocol` is
+    /// factored out of `Tunnel::start` precisely so this is reachable without
+    /// either.
+    #[tokio::test]
+    #[ignore = "requires docker fixture: make -C testing/docker up"]
+    async fn the_shadowsocks_arm_reports_the_address_its_session_actually_reached() {
+        let password = std::fs::read_to_string("../../testing/docker/ss/conf/password")
+            .expect("run: make -C testing/docker up")
+            .trim()
+            .to_string();
+        // Same discovery the core's integration suite does, and for the same
+        // reason: `make down`/`make up` recreates the network and the address
+        // moves, so a literal would fail this for a reason that has nothing
+        // to do with the tunnel.
+        let out = std::process::Command::new("docker")
+            .args([
+                "inspect",
+                "docker-dns-1",
+                "--format",
+                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+            ])
+            .output()
+            .expect("docker must be on PATH: make -C testing/docker up");
+        let resolver = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(
+            !resolver.is_empty(),
+            "the fixture resolver has no compose address; run: make -C testing/docker up"
+        );
+
+        let secret = SecretRef::File {
+            path: "/tmp/lios-fixture-ss-password".into(),
+        };
+        let auth = Authorized {
+            profile: serde_json::from_str(&format!(
+                r#"{{"id":"00000000-0000-0000-0000-000000000000","name":"fixture",
+                    "protocol":"shadowsocks","host":"localhost","port":8388,
+                    "auth":{{"type":"shadowsocks","method":"aes-256-gcm",
+                            "password":{{"source":"file",
+                                         "path":"/tmp/lios-fixture-ss-password"}}}},
+                    "dns":["{resolver}"],"split_tunnel":{{"type":"all_traffic"}},
+                    "kill_switch":false}}"#
+            ))
+            .expect("the fixture profile must parse"),
+            user: "unused-by-shadowsocks".into(),
+            route_mode: RouteMode::Default,
+            tun_address: "10.90.0.1".parse().unwrap(),
+            // Served from memory, exactly as the gate serves them: no file is
+            // opened, so the path names nothing that has to exist.
+            secrets: ResolvedSecrets(vec![(secret, Redacted::new(password))]),
+        };
+
+        let Ok((_protocol, peer)) = connect_protocol(&auth, &paths()).await else {
+            panic!("the fixture ss-libev server must accept these credentials on 8388");
+        };
+        assert_eq!(
+            peer,
+            "127.0.0.1:8388".parse::<SocketAddr>().unwrap(),
+            "the factory must report the concrete address the session reached, \
+             which is what `default` mode pins through the original gateway"
+        );
+    }
+
     #[test]
     fn a_shadowsocks_password_the_caller_does_not_own_is_refused_by_the_same_rule() {
         // A Shadowsocks password is a `SecretRef`, so the Phase 1a ownership

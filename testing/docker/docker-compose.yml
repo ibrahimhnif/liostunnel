@@ -28,5 +28,20 @@ services:
     networks:
       lios:
         aliases: [target.internal]
+  # A resolver ON the compose network, because every `connect()` runs the
+  # probe and the probe relays a DNS query to whatever `profile.dns` names.
+  # Pointing that at 1.1.1.1 made the whole suite depend on this machine's
+  # outbound internet -- which the compose target exists to remove -- and made
+  # both credential tests pass for the wrong reason wherever it is absent: a
+  # correct password produces the same timeout, naming the same "cipher or
+  # password", as a wrong one.
+  #
+  # No published port, on purpose: a resolver the host cannot reach is what
+  # proves the probe's query travelled through the relay.
+  dns:
+    image: coredns/coredns
+    command: -conf /etc/coredns/Corefile
+    volumes: ["./dns:/etc/coredns:ro"]
+    networks: [lios]
 networks:
   lios:

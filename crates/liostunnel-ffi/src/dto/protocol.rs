@@ -6,7 +6,15 @@ use serde::{Deserialize, Serialize};
 /// independently through normal channels. A newer app talking to an older
 /// helper must fail with `ErrorKind::VersionMismatch` rather than
 /// misinterpret a field. Spec §8.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2 since Phase 1b: the profile schema gained `auth.type: "shadowsocks"`,
+/// and `ConnectParams::profile_json` crosses the socket verbatim, so a
+/// version-1 helper's `serde_json::from_str::<ServerProfile>` fails on the
+/// unknown tag and reports `BadRequest: "profile is not valid"` about a
+/// profile that is entirely valid -- with no hint that the helper is the
+/// stale half. A new value in a field the peer parses is a breaking change to
+/// the message shapes even when no field was added or removed.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Client → helper. `id` correlates a `Response` back to its request.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -84,6 +92,52 @@ pub struct StatsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fix wave 3, finding 7. `AuthMethod::Shadowsocks` is new to the profile
+    /// schema on this branch, and `profile_json` crosses the socket verbatim
+    /// -- so a Phase 1a helper hands it to `serde_json::from_str::<ServerProfile>`,
+    /// which fails on the unknown `auth.type` tag. The user updated the app,
+    /// imported an `ss://` link, pressed Connect, and was told `BadRequest:
+    /// "profile is not valid"` about a perfectly valid profile, with nothing
+    /// to suggest the helper was the stale half. The helper installs once, as
+    /// root, and updates independently of the app: that asymmetry is the whole
+    /// reason `PROTOCOL_VERSION` exists (spec §8), and it was not bumped.
+    ///
+    /// Written as an implication rather than a bare `assert_eq!` so it says
+    /// something: it is the schema accepting a tag no version-1 helper knows
+    /// that obliges the bump. Both halves can move it -- take the shadowsocks
+    /// arm out of `AuthMethod` and the premise goes away; leave the version at
+    /// 1 and the conclusion fails.
+    #[test]
+    fn a_profile_schema_that_grew_a_new_auth_type_bumped_the_protocol_version() {
+        /// The wire version in which `auth.type: "shadowsocks"` first became
+        /// something a helper could be expected to parse.
+        const SHADOWSOCKS_ARRIVED_IN: u32 = 2;
+
+        let ss = r#"{"id":"b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f","name":"SS",
+            "protocol":"shadowsocks","host":"198.51.100.7","port":8388,
+            "auth":{"type":"shadowsocks","method":"aes-256-gcm",
+                    "password":{"source":"file","path":"/tmp/k"}},
+            "dns":["1.1.1.1"],"split_tunnel":{"type":"all_traffic"},
+            "kill_switch":false}"#;
+
+        // Read through the FFI's own accessor, which is the value the app
+        // puts in its `hello` (`api::protocol::hello_line`) and the value
+        // `app/test/protocol_test.dart` compares that line against -- so this
+        // is the number both sides actually agree on, not a second copy of it.
+        let speaks = crate::api::protocol::protocol_version();
+
+        if serde_json::from_str::<liostunnel_core::config::profile::ServerProfile>(ss).is_ok() {
+            assert!(
+                speaks >= SHADOWSOCKS_ARRIVED_IN,
+                "the profile schema accepts `auth.type: shadowsocks`, which a \
+                 helper speaking protocol {} cannot parse -- a client that \
+                 sends one must be told to reinstall the helper, not told its \
+                 own profile is invalid",
+                SHADOWSOCKS_ARRIVED_IN - 1
+            );
+        }
+    }
 
     #[test]
     fn the_wire_format_is_self_describing() {

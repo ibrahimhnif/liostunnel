@@ -18,7 +18,12 @@ chmod 600 conf/password
 # blank password and silently recreates the servers with an empty key -- an
 # integration test then fails for a reason that has nothing to do with the
 # code under test.
+# `umask 077` alone is not enough: `>` truncates an existing file and keeps
+# its mode, so a `.env` that was already group- or world-readable stays that
+# way and the fixture password with it. The explicit chmod is idempotent, and
+# matches the one on conf/password above.
 umask 077
 printf 'SS_PASSWORD=%s\n' "$(cat conf/password)" > ../.env
+chmod 600 ../.env
 echo "shadowsocks fixture password ready in $(pwd)/conf/password"
 echo "and exported to $(cd .. && pwd)/.env for docker compose"
