@@ -433,10 +433,20 @@ async fn connect_protocol(
             let mut ss = ShadowsocksTunnel::new();
             // Not just "a socket opened": this proves the credentials with one
             // relayed round trip, because Shadowsocks has no handshake that
-            // would. It can therefore fail for network reasons as well as
-            // config ones — `dispatch::connect_failed` maps everything that is
-            // not `TunnelError::Auth` to `Internal`, so a probe timeout is
-            // never reported as a wrong password.
+            // would.
+            //
+            // Note what the integration suite established about the error it
+            // returns. A real ss-libev server given a wrong password or a
+            // wrong cipher does NOT hang up -- it accepts the connection and
+            // discards the bytes silently, which is the behaviour the probe
+            // exists to work around. So a bad credential arrives as the
+            // probe's TIMEOUT, a `Transport`, not as `Auth`. Since
+            // `dispatch::connect_failed` maps everything that is not `Auth` to
+            // `Internal`, the most common user error in this protocol
+            // currently reaches the UI as "the helper hit an internal error".
+            // The probe's message names the credential for that reason; the
+            // ErrorKind is a Phase 1b review decision, recorded in
+            // docs/superpowers/phase1b-verification.md.
             ss.connect(&auth.profile, &auth.secrets).await?;
             // The same guarantee the SSH arm gives, for the same reason: this
             // is the address `connect` resolved once and handed to

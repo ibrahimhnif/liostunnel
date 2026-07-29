@@ -1,0 +1,246 @@
+# Phase 1b exit criteria — verification
+
+Branch `phase1b-shadowsocks`. Fixture: `make -C testing/docker up` brings up
+`ss-libev` (C reference, `aes-256-gcm`, 8388) and `ss-rust` (Rust,
+`chacha20-ietf-poly1305`, 8389).
+
+| Criterion | Status |
+|---|---|
+| P1b-1 — connects and carries traffic | ✅ protocol layer; ⏳ end-to-end through the helper |
+| P1b-2 — interoperates with libev | ✅ |
+| P1b-3 — a wrong password fails at connect | ✅ |
+| P1b-4 — `ss://` imports; malformed refused without echo | ✅ |
+| P1b-5 — the ownership gate covers SS passwords | ✅ unit; ⏳ end-to-end |
+| P1b-6 — no SSH-shaped concession, or it is recorded | ✅ recorded below |
+
+⏳ = awaiting the root run in §7. Everything else is verbatim output.
+
+---
+
+## P1b-1 — connects and carries traffic
+
+```
+$ cargo test -p liostunnel-core --test shadowsocks_integration -- --ignored
+test connects_to_the_c_reference_implementation ... ok
+test connects_to_the_rust_server_with_a_chacha_cipher ... ok
+test relays_a_real_http_request_to_a_target_only_it_can_reach ... ok
+test a_wrong_password_fails_at_connect ... ok
+test the_wrong_cipher_against_a_real_server_also_fails_at_connect ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.00s
+```
+
+`relays_a_real_http_request_to_a_target_only_it_can_reach` is the one that
+carries traffic. It targets the fixture's nginx on the compose network, whose
+port the host does not publish, and asserts **first** that a direct connection
+to that address fails — so the fetch succeeding is proof the bytes traversed
+the relay rather than taking a direct route. It then requires the response to
+contain `tunnel-target-ok` and both byte counters to have moved.
+
+The plan named `93.184.216.34` for this. That was example.com's address and has
+since been retired, so the test would have failed for a reason having nothing
+to do with the tunnel — and would have made the result depend on the machine's
+own internet access. The compose address is discovered with `docker inspect`,
+not hardcoded: it moves on every `make down`/`make up`.
+
+**A/B.** With `probe` short-circuited to `Ok(())`, the three connect tests stay
+green and both credential tests fail. With the relay test pointed at a
+directly-reachable address, its own reachability precondition fails.
+
+## P1b-2 — interoperates with libev
+
+`connects_to_the_c_reference_implementation`, above. This is the criterion the
+two-server fixture exists for: a shadowsocks-rust client against a
+shadowsocks-rust server proves the crate agrees with itself, which is the same
+shape as a mock written to match the code it tests. libev is the C reference.
+
+`connects_to_the_rust_server_with_a_chacha_cipher` adds the second axis — a
+different implementation *and* a different cipher family, so a client hardcoded
+to one of them fails here rather than at a user's machine.
+
+## P1b-3 — a wrong password fails at connect
+
+`a_wrong_password_fails_at_connect` and
+`the_wrong_cipher_against_a_real_server_also_fails_at_connect`, above.
+
+**This criterion produced the finding of the phase, and only a real server
+could produce it.**
+
+Shadowsocks has no handshake, so without the probe `connect` returns `Ok` for a
+typo'd password: the UI reports Connected, routes get installed, and nothing
+carries. The probe sends one DNS query over a relayed stream and requires bytes
+back — a wrong-key server cannot produce readable bytes, because every chunk
+goes through an AEAD tag check.
+
+What the live servers showed is **which** failure arrives. The loopback
+fixtures hang up on a bad key, so they reach the probe's `read_exact` arm and
+return `TunnelError::Auth`. A real `ss-libev` server does not hang up. It
+accepts the connection and discards the bytes silently — which is precisely the
+behaviour the probe was written to work around — so the probe runs out of time
+instead and returns `TunnelError::Transport(TimedOut)`.
+
+So the arm a real user actually hits was the one whose message said nothing
+about credentials. The message now names both causes, in the order a real
+server implies:
+
+> nothing came back through the tunnel in time: the cipher or password may be
+> wrong (a Shadowsocks server given either accepts the connection and discards
+> it silently), or the exit cannot reach the resolver this profile names
+
+**Open question for the review — see §6.** `dispatch::connect_failed` maps
+every non-`Auth` `TunnelError` to `ErrorKind::Internal`, which the app renders
+as *"The helper hit an internal error. Check its log."* Given the above, that
+is what a user with a wrong Shadowsocks password sees.
+
+## P1b-4 — `ss://` imports; malformed refused without echo
+
+```
+$ cargo test -p liostunnel-core --lib ss_uri
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 240 filtered out
+```
+
+An `ss://` URI **contains the password**, which makes `ss_uri.rs` the most
+leak-prone file in the phase. The enforcement is structural rather than
+per-message: `bad(reason: &'static str)` is the only error constructor in the
+module, so a `format!` cannot pass through it, and a reviewer can check that by
+eye. `no_error_exit_echoes_any_part_of_the_uri` drives every exit with a marker
+password and asserts on `Display`, `Debug` **and** `source()`.
+
+Both link forms parse, including SIP002's optional trailing `/` — every Outline
+access key carries one, and the parser previously died on it reporting *"the
+port is not a number"* about a perfectly good port. The fix is scoped to the
+SIP002 branch: stripping `/` from the shared body would silently truncate a
+legacy standard-alphabet blob, whose base64 contains `/` as data.
+
+The password leaves the parser in `Redacted<String>` and reaches Dart through a
+call separate from the profile, so it never enters `ProfileDto` — the value the
+UI renders. `everyFieldOf` in the Dart suite enumerates all 17 DTO fields and
+asserts none carries it.
+
+A fourth echo sink was identified here that nobody had named: `expect` on
+secret-derived data. `FromUtf8Error`'s `Debug` prints the raw bytes, so a panic
+on a decoded credential puts it in the log.
+
+## P1b-5 — the ownership gate covers SS passwords
+
+```
+$ cargo test -p liostunnel-helper shadowsocks
+test session::tests::a_shadowsocks_password_the_caller_does_not_own_is_refused_by_the_same_rule ... ok
+test session::tests::a_shadowsocks_profile_the_caller_owns_passes_the_gate_untouched ... ok
+test session::tests::a_shadowsocks_profile_gets_a_shadowsocks_tunnel ... ok
+test session::tests::a_shadowsocks_cipher_name_is_never_echoed_back_either ... ok
+test session::tests::a_shadowsocks_dns_sni_is_never_echoed_back_either ... ok
+test dispatch::tests::a_shadowsocks_probe_failure_is_not_reported_as_a_wrong_password ... ok
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 57 filtered out
+```
+
+The point of this criterion is that **no new code was needed**. A Shadowsocks
+password is a `SecretRef`, so `AuthMethod::secret_refs()` enumerates it and
+Phase 1a's escalation gate covers it unchanged — `authorize_params` is still a
+single loop over `profile.auth.secret_refs()` with no protocol branch in it. A
+second rule for a second protocol is how the two drift.
+
+This is also the one place a missing match arm would have been a privilege
+escalation rather than a compile error, since `secret_refs()` is the list the
+root daemon iterates to decide whether it may read a file on a caller's behalf.
+The A/B for Task 1 confirmed the arm's absence is caught: `refs.len()` goes 1 →
+0.
+
+## P1b-6 — the abstraction test
+
+**Did `Protocol` need an SSH-shaped concession? Yes — one, and it was real.
+Closing it improved the abstraction rather than bending it.**
+
+**Resolved with no trait change: `HostKeyPolicy`.** Meaningless for a protocol
+with no server identity. It sat in `Tunnel::start`'s shared body; it now lives
+inside the `ProtocolKind::Ssh` arm. No residue in the neutral path. This is
+what the abstraction working looks like.
+
+**The real hole: `Protocol` exposes no peer address.** The route that pins the
+server through the original gateway needs the server's concrete IP. `SshTunnel`
+knows it — `peer_addr()` returns the address the session actually connected to,
+and that method exists because an earlier review found the alternative, a second
+independent DNS lookup, can disagree with the session for a multi-A or
+dual-stack host: the pin names one address while the traffic uses another, and
+in `default` route mode the tunnel's own packets then route into the tunnel.
+
+The trait cannot express this, so the factory first shipped as
+`Result<(Arc<dyn Protocol>, Option<SocketAddr>), StartError>` — the `Option`
+existing solely because one concrete type could answer a question the trait
+could not. The Shadowsocks arm returned `None`.
+
+**That `None` turned out to be a Critical bug, not a cosmetic gap.**
+`ServerConfig::new((host, port), …)` always yields `ServerAddr::DomainName`, so
+the shadowsocks crate re-resolves **per flow**, through the helper process's OS
+resolver — which `default` route mode has just pointed *into the tunnel*. For a
+multi-A host the pin covers only the first address and flows landing on the
+others are swallowed by the tunnel's own stack; and independently of multi-A,
+resolving the server's own name requires a relayed flow that requires resolving
+the server's name. It works only while the OS DNS cache holds the pre-route
+lookup. At TTL expiry the tunnel wedges with no default route left on the
+machine, and it reads as a server fault.
+
+Fixed at the root rather than papered over: `ShadowsocksTunnel::connect`
+resolves once through `pick_ipv4` and hands `ServerConfig` a concrete
+`SocketAddr`, so the crate never looks up again, and exposes `peer_addr()` like
+`SshTunnel`. Consequences:
+
+- the factory's return type collapsed to `(Arc<dyn Protocol>, SocketAddr)`;
+- `pick_ipv4` moved from `protocols::ssh` to `protocols::`, so the neutral path
+  no longer imports from the SSH module — it was never SSH policy, it encodes
+  the packet stack's IPv4-only constraint;
+- both protocols now give the route layer the same guarantee.
+
+**The residue, stated plainly.** `peer_addr()` is an inherent method on both
+concrete types, not a trait method. `connect_protocol` works only because each
+arm knows its concrete type and both happen to have one. A third protocol that
+does not would reintroduce the `Option`. The recommended amendment is a
+defaulted trait method:
+
+```rust
+/// The concrete address this session is actually using, where the protocol
+/// knows it. `None` means the caller must resolve, and accepts that the
+/// answer may differ from the one in use.
+fn peer_addr(&self) -> Option<SocketAddr> { None }
+```
+
+That is a spec decision, not something this phase enacted.
+
+---
+
+## §7 — end-to-end through the helper (needs root)
+
+The Phase 1a verifier, unchanged, pointed at a Shadowsocks profile. **If the
+script needs any edit to pass, that edit is a P1b-6 finding** — the script
+passing unchanged against a second protocol is the evidence the abstraction
+held.
+
+Prepared (non-root): `/tmp/lios-verify/ss-key` (mode 0600) and
+`/tmp/lios-verify/ss-profile.json`; `cargo build --release -p liostunnel-helper`.
+
+```bash
+LIOS_PROFILE=/tmp/lios-verify/ss-profile.json sudo -E ./testing/verify-phase1a.sh
+```
+
+Expected: 14 passed, 0 failed.
+
+> _Output pending._
+
+---
+
+## Decisions this phase defers to the review
+
+1. **`ErrorKind` for a probe timeout.** Established by P1b-3: a wrong
+   Shadowsocks credential arrives as `Transport(TimedOut)`, and every non-`Auth`
+   error becomes `ErrorKind::Internal`, rendered as *"The helper hit an internal
+   error."* No existing variant fits a transport failure, and adding one crosses
+   the FFI and the Dart UI.
+
+2. **`disconnect` leaves open flows relaying.** Each `ProxyClientStream` owns
+   its own config clone, so `disconnect` — and a failed reconnect — clear the
+   retained state but do not stop traffic already in flight. `SshTunnel` gets
+   this for free by sending `SSH_MSG_DISCONNECT`, which EOFs every channel.
+   Fixing it needs live-stream tracking, which no task covers.
+
+3. **The probe contacts `dns.servers[0]` only**, while both resolvers iterate
+   every entry. A profile whose first resolver is down fails `connect` outright
+   even though DNS would work at runtime.
