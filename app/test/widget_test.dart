@@ -394,17 +394,19 @@ Widget editor({LoadedProfile? existing, String? directory}) => MaterialApp(
 LoadedProfile ssProfile({
   String cipher = 'aes-256-gcm',
   List<String> dns = const ['1.1.1.1'],
+  String path = '/tmp/ss.json',
+  String source = 'file:/tmp/ss-key',
 }) =>
     LoadedProfile(
-      path: '/tmp/ss.json',
+      path: path,
       profile: ProfileDto(
-        id: 'b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f',
+        id: ssProfileId,
         name: 'SS',
         protocol: 'shadowsocks',
         host: '198.51.100.7',
         port: 8388,
         authKind: 'shadowsocks',
-        authSecretSource: 'file:/tmp/ss-key',
+        authSecretSource: source,
         cipher: cipher,
         dnsMode: 'tcp',
         dnsServers: dns,
@@ -414,12 +416,40 @@ LoadedProfile ssProfile({
       ),
     );
 
+const ssProfileId = 'b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f';
+
+/// A saved SSH profile whose credential is a private key file.
+LoadedProfile sshProfile({required String path, required String keyPath}) =>
+    LoadedProfile(
+      path: path,
+      profile: ProfileDto(
+        id: '11111111-2222-3333-4444-555555555555',
+        name: 'Home VPS',
+        protocol: 'ssh',
+        host: '198.51.100.9',
+        port: 22,
+        authKind: 'private_key',
+        authSecretSource: 'file:$keyPath',
+        dnsMode: 'tcp',
+        dnsServers: const ['1.1.1.1'],
+        splitTunnel: 'all_traffic',
+        splitTunnelApps: const [],
+        killSwitch: false,
+      ),
+    );
+
 /// A live `ss://` link. The password is only ever in this file's memory and
 /// in the 0600 file the editor writes under a temp directory.
-String ssLink({int port = 8388, String? tag}) {
-  final creds =
-      base64Url.encode(utf8.encode('aes-256-gcm:hunter2')).replaceAll('=', '');
-  return 'ss://$creds@198.51.100.7:$port${tag == null ? '' : '#$tag'}';
+String ssLink({
+  int port = 8388,
+  String? tag,
+  String host = '198.51.100.7',
+  String password = 'hunter2',
+}) {
+  final creds = base64Url
+      .encode(utf8.encode('aes-256-gcm:$password'))
+      .replaceAll('=', '');
+  return 'ss://$creds@$host:$port${tag == null ? '' : '#$tag'}';
 }
 
 /// Presses a button whose handler crosses the FFI, on the real event loop.
@@ -537,6 +567,13 @@ void editorTests() {
     // dropdown that refuses it. An Outline key — `2022-blake3-aes-256-gcm`,
     // today's default server cipher — therefore destroyed the editor with the
     // credential already on disk.
+    //
+    // `_import` writes nothing at all now (see 'an import that is never saved
+    // leaves the live credential alone'), so the secrets-directory assertion
+    // below can no longer fail on its own — it is kept as a guard against an
+    // eager write coming back. What still discriminates here is the refusal
+    // itself, and its wording: delete `check_cipher` from `import_ss_uri` and
+    // the error card does not appear.
     final dir = Directory.systemTemp.createTempSync('lios-editor-bad-cipher');
     addTearDown(() => dir.deleteSync(recursive: true));
     final creds = base64Url
@@ -596,6 +633,52 @@ void editorTests() {
         reason: 'the secret file is keyed on the id the profile will carry');
   });
 
+  testWidgets('an import that is never saved leaves the live credential alone',
+      (tester) async {
+    // `writeSecret` truncates `secrets/<slug(id)>`, and on an EDIT that id is
+    // the existing profile's -- the very file the on-disk profile points at.
+    // Running it inside `_import` destroyed that credential the instant the
+    // button was pressed: before `checkNameFree`, before `checkProfile`,
+    // before Save. Paste what you believe is the rotated link, see that the
+    // host is wrong, press Back: nothing was saved and the original password
+    // is gone, unrecoverably, because it came from a link.
+    //
+    // This is verbatim the defect the Save button already had (see 'a refused
+    // save does not destroy the credential it points at'); the fix was never
+    // applied one button over.
+    final dir = Directory.systemTemp.createTempSync('lios-editor-import-live');
+    addTearDown(() => dir.deleteSync(recursive: true));
+
+    // Written synchronously rather than through `writeSecret`: that shells out
+    // to chmod, and a real subprocess never completes inside a `testWidgets`
+    // fake-async zone.
+    final secretPath = ProfileWriter(directory: dir.path)
+        .secretPathFor(ssProfileId);
+    File(secretPath).parent.createSync(recursive: true);
+    File(secretPath).writeAsStringSync('the-live-password');
+
+    await pumpEditor(tester,
+        directory: dir.path,
+        existing: ssProfile(
+            path: '${dir.path}/ss.json', source: 'file:$secretPath'));
+
+    // A link the user believes is a rotation but which names the wrong host.
+    await tester.enterText(
+        find.byKey(const Key('f-uri')),
+        ssLink(host: '203.0.113.9', password: 'pasted-by-mistake'));
+    await pressAndSettle(tester, const Key('import-button'));
+
+    expect(find.byKey(const Key('editor-error')), findsNothing);
+    expect(fieldText(tester, const Key('f-host')), '203.0.113.9',
+        reason: 'the import did happen; without this the rest is vacuous');
+    // ...and the user presses Back rather than Save.
+    expect(find.byKey(const Key('editor-saved')), findsNothing);
+
+    expect(File(secretPath).readAsStringSync(), 'the-live-password',
+        reason: 'an import that was never saved must not have replaced the '
+            'credential the on-disk profile still points at');
+  });
+
   testWidgets('an imported link saves as shadowsocks, keyed to its own secret',
       (tester) async {
     // Two defects in one gesture. The helper's factory dispatches on
@@ -640,33 +723,63 @@ void editorTests() {
     expect(written.single.readAsStringSync(), isNot(contains('hunter2')));
   });
 
-  testWidgets('saving keeps a link the import never consumed', (tester) async {
-    // The box is cleared when an import takes the link, not on every save.
-    // Clearing unconditionally meant a user who pasted a NEW link to rotate a
-    // password and then pressed Save instead of Import saved the OLD
-    // credential, and the link vanished with nothing saying it was ignored.
+  testWidgets('a link the import never consumed refuses the save',
+      (tester) async {
+    // The user pastes link B to rotate a password and presses Save instead of
+    // Import. The old guard was `if (_importedId != null) _uri.clear()`, and
+    // `_importedId` is never reset — so after ONE import it is permanently
+    // true: B was silently cleared, the profile kept A's credential, and a
+    // green "Saved to …" said it had worked. The next connect fails eight
+    // seconds into a probe, over a password the user is certain they changed.
+    //
+    // The previous version of this test never imported at all, so the guard
+    // was trivially false and the fixture could not reach the branch it was
+    // named after. This one imports first, which is the state the guard is
+    // wrong in.
+    //
+    // Refusing rather than saving-and-keeping-the-text: a save that quietly
+    // ignores a credential in front of the user is the failure, and the box
+    // staying full is a signal nobody is obliged to notice.
     final dir = Directory.systemTemp.createTempSync('lios-editor-clear');
     addTearDown(() => dir.deleteSync(recursive: true));
 
     await pumpEditor(tester, directory: dir.path);
     await choose(tester, const Key('f-auth'), 'Shadowsocks');
-    await tester.enterText(find.byKey(const Key('f-name')), 'Manual');
-    await tester.enterText(find.byKey(const Key('f-host')), '198.51.100.7');
-    await tester.enterText(find.byKey(const Key('f-port')), '8388');
-    await tester.enterText(
-        find.byKey(const Key('f-secret-path')), '${dir.path}/key');
-    await tester.enterText(find.byKey(const Key('f-uri')), ssLink());
+    await tester.enterText(find.byKey(const Key('f-uri')), ssLink(tag: 'A'));
+    await pressAndSettle(tester, const Key('import-button'));
+    expect(find.byKey(const Key('editor-error')), findsNothing,
+        reason: 'precondition: one import really did happen');
 
+    // Link B, pasted and never imported.
+    final b = ssLink(port: 8389, tag: 'B', password: 'rotated');
+    await tester.enterText(find.byKey(const Key('f-uri')), b);
     await pressAndSettle(tester, const Key('save-button'));
-    expect(find.byKey(const Key('editor-saved')), findsOneWidget);
-    expect(fieldText(tester, const Key('f-uri')), ssLink(),
-        reason: 'the link was never imported, so it is still the user\'s');
+
+    expect(find.byKey(const Key('editor-saved')), findsNothing,
+        reason: 'a save that would ignore a pasted credential must not '
+            'report success');
+    expect(find.byKey(const Key('editor-error')), findsOneWidget);
+    expect(fieldText(tester, const Key('f-uri')), b,
+        reason: 'the link is still the user\'s; it was not consumed');
+    final message = tester
+        .widget<Text>(find.descendant(
+          of: find.byKey(const Key('editor-error')),
+          matching: find.byType(Text),
+        ))
+        .data!;
+    expect(message, contains('Import from link'),
+        reason: 'it must name the button that would use it');
+    expect(message, isNot(contains('rotated')),
+        reason: 'the link IS the password; the message may not quote it');
   });
 
-  testWidgets('an imported link is gone from the box by the time it is saved',
+  testWidgets('an imported link is consumed, and saves without complaint',
       (tester) async {
-    // The other half: once the import has taken it, the credential must not
-    // stay legible on screen through the save.
+    // The other half, and the reason the guard above cannot simply be "refuse
+    // whenever this is a Shadowsocks profile": once the import HAS taken the
+    // link, the save must go through. The box being empty is what says so —
+    // and it is `_import` that empties it, so this pins that too. The
+    // credential must not stay legible on screen through the save either.
     final dir = Directory.systemTemp.createTempSync('lios-editor-clear2');
     addTearDown(() => dir.deleteSync(recursive: true));
 
@@ -677,36 +790,134 @@ void editorTests() {
     expect(fieldText(tester, const Key('f-uri')), isEmpty,
         reason: 'the import consumed it');
     await pressAndSettle(tester, const Key('save-button'));
+    expect(find.byKey(const Key('editor-error')), findsNothing);
     expect(find.byKey(const Key('editor-saved')), findsOneWidget);
     expect(fieldText(tester, const Key('f-uri')), isEmpty);
   });
 
-  testWidgets('re-importing to fix a typo does not orphan the first secret',
+  testWidgets('the auth dropdown cannot turn an SSH profile into a '
+      'Shadowsocks one', (tester) async {
+    // Pick "Shadowsocks" in f-auth on an SSH profile and Save, and
+    // `check_profile` passed: protocol became `shadowsocks`, the password
+    // file stayed the SSH private key the profile already named, and the
+    // cipher was whatever `_cipher` had defaulted to — the exact "pick a
+    // cipher on the user's behalf" that `dto/profile.rs` refuses to do,
+    // arrived at from the other side. Shadowsocks has no handshake, so the
+    // result saves cleanly and then carries nothing.
+    //
+    // The reverse was a dead end rather than a hazard: no protocol control
+    // exists, so a Shadowsocks profile could never move off `shadowsocks`,
+    // and `check_pairing`'s refusal reads "ssh takes a password or a private
+    // key…" — advice about a control the user does not have.
+    final dir = Directory.systemTemp.createTempSync('lios-editor-convert');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final keyPath = '${dir.path}/id_ed25519';
+    File(keyPath).writeAsStringSync('-----BEGIN OPENSSH PRIVATE KEY-----');
+
+    await pumpEditor(tester,
+        directory: dir.path,
+        existing: sshProfile(path: '${dir.path}/home.json', keyPath: keyPath));
+    await choose(tester, const Key('f-auth'), 'Shadowsocks');
+    await pressAndSettle(tester, const Key('save-button'));
+
+    expect(find.byKey(const Key('editor-saved')), findsNothing);
+    expect(find.byKey(const Key('editor-error')), findsOneWidget);
+    final message = tester
+        .widget<Text>(find.descendant(
+          of: find.byKey(const Key('editor-error')),
+          matching: find.byType(Text),
+        ))
+        .data!;
+    expect(message, contains('ssh'));
+    expect(message, contains('shadowsocks'));
+    expect(message, contains('new profile'),
+        reason: 'the wording has to name a remedy the user can actually reach');
+    expect(
+        Directory(dir.path)
+            .listSync()
+            .whereType<File>()
+            .where((f) => f.path.endsWith('.json')),
+        isEmpty,
+        reason: 'nothing may reach disk');
+    expect(File(keyPath).readAsStringSync(),
+        '-----BEGIN OPENSSH PRIVATE KEY-----',
+        reason: 'and the SSH key it named is not a Shadowsocks password');
+  });
+
+  testWidgets('a Shadowsocks profile leaves no SSH username sidecar',
       (tester) async {
-    // `writeSecret` names the file after the id it is given, and deletion
-    // deliberately never touches secret files -- so an id minted fresh on
-    // each import leaves a live password on disk that no profile references
-    // and nothing collects.
+    // `_user` was passed to `writeProfile` unconditionally, so typing a
+    // username and then switching to Shadowsocks wrote a `.user` sidecar for
+    // a protocol that has no user — a connect-time parameter the helper will
+    // read and hand to nothing.
+    final dir = Directory.systemTemp.createTempSync('lios-editor-sidecar');
+    addTearDown(() => dir.deleteSync(recursive: true));
+
+    await pumpEditor(tester, directory: dir.path);
+    await tester.enterText(find.byKey(const Key('f-name')), 'Manual');
+    await tester.enterText(find.byKey(const Key('f-host')), '198.51.100.7');
+    await tester.enterText(find.byKey(const Key('f-port')), '8388');
+    await tester.enterText(find.byKey(const Key('f-user')), 'someone');
+    await choose(tester, const Key('f-auth'), 'Shadowsocks');
+    await tester.enterText(
+        find.byKey(const Key('f-secret-path')), '${dir.path}/key');
+    await pressAndSettle(tester, const Key('save-button'));
+
+    expect(find.byKey(const Key('editor-saved')), findsOneWidget);
+    expect(
+        Directory(dir.path)
+            .listSync()
+            .whereType<File>()
+            .where((f) => f.path.endsWith('.user')),
+        isEmpty,
+        reason: 'shadowsocks has no username to send');
+  });
+
+  testWidgets('re-importing to fix a typo keeps one id, and one secret file',
+      (tester) async {
+    // `writeSecret` names the file after the id it is given, so an id minted
+    // fresh on each import used to leave a live password on disk that no
+    // profile referenced -- deletion deliberately never touches secret files,
+    // and nothing collects them.
+    //
+    // The write is deferred to Save now (see 'an import that is never saved
+    // leaves the live credential alone'), so a second paste can no longer
+    // leave a file behind at all. `_importedId` still has to be stable, and
+    // for a sharper reason: `_save` mints an id of its own when it is null,
+    // and the file it then writes is not the one `f-secret-path` -- and so
+    // the saved profile -- names. The profile would point at a file that does
+    // not exist.
     final dir = Directory.systemTemp.createTempSync('lios-editor-reimport');
     addTearDown(() => dir.deleteSync(recursive: true));
 
     await pumpEditor(tester, directory: dir.path);
     await choose(tester, const Key('f-auth'), 'Shadowsocks');
 
-    await tester.enterText(find.byKey(const Key('f-uri')), ssLink(port: 8388));
+    await tester.enterText(find.byKey(const Key('f-uri')),
+        ssLink(port: 8388, password: 'first-paste'));
     await pressAndSettle(tester, const Key('import-button'));
     expect(find.byKey(const Key('editor-error')), findsNothing);
     final first = fieldText(tester, const Key('f-secret-path'));
 
     // The user notices the port is wrong and pastes the corrected link.
-    await tester.enterText(find.byKey(const Key('f-uri')), ssLink(port: 8389));
+    await tester.enterText(find.byKey(const Key('f-uri')),
+        ssLink(port: 8389, password: 'second-paste'));
     await pressAndSettle(tester, const Key('import-button'));
     expect(find.byKey(const Key('editor-error')), findsNothing);
     final second = fieldText(tester, const Key('f-secret-path'));
 
     expect(second, first, reason: 'the second import must reuse the first id');
-    expect(Directory('${dir.path}/secrets').listSync().length, 1,
+
+    await pressAndSettle(tester, const Key('save-button'));
+    expect(find.byKey(const Key('editor-saved')), findsOneWidget);
+
+    final secrets = Directory('${dir.path}/secrets').listSync();
+    expect(secrets.length, 1,
         reason: 'exactly one secret file, not one per paste');
+    expect(secrets.single.path, second,
+        reason: 'and it is the one the form -- and so the profile -- names');
+    expect(File(secrets.single.path).readAsStringSync(), 'second-paste',
+        reason: 'the credential saved is the one the last import took');
   });
 
   testWidgets('a profile whose cipher this build cannot speak will not save',
@@ -748,43 +959,28 @@ void editorTests() {
     // Written synchronously rather than through `writeSecret`: that shells
     // out to chmod, and a real subprocess never completes inside a
     // `testWidgets` fake-async zone -- the test simply hangs.
-    const id = 'b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f';
-    final secretPath = ProfileWriter(directory: dir.path).secretPathFor(id);
+    final secretPath =
+        ProfileWriter(directory: dir.path).secretPathFor(ssProfileId);
     File(secretPath).parent.createSync(recursive: true);
     File(secretPath).writeAsStringSync('hunter2');
-    final ref = 'file:$secretPath';
-    final saved = ssProfile().profile!;
 
+    // The refusal has to come from `checkProfile` and from nothing earlier,
+    // or this test cannot see the ordering it is named after. It used to use
+    // an auth-kind switch, which `_refuseAProtocolChange` now catches on the
+    // first line of `_save` -- before `writeSecret` could have run either
+    // way, so the assertion below would have held no matter where the write
+    // sat. A cipher this build cannot construct is refused by `check_profile`
+    // itself, which is exactly one step *after* the write.
     await pumpEditor(
       tester,
       directory: dir.path,
-      existing: LoadedProfile(
+      existing: ssProfile(
         path: '${dir.path}/ss.json',
-        profile: ProfileDto(
-          id: id,
-          name: saved.name,
-          protocol: saved.protocol,
-          host: saved.host,
-          port: saved.port,
-          authKind: saved.authKind,
-          authSecretSource: ref,
-          cipher: saved.cipher,
-          dnsMode: saved.dnsMode,
-          dnsServers: saved.dnsServers,
-          splitTunnel: saved.splitTunnel,
-          splitTunnelApps: saved.splitTunnelApps,
-          killSwitch: saved.killSwitch,
-        ),
+        source: 'file:$secretPath',
+        cipher: '2022-blake3-aes-256-gcm',
       ),
     );
 
-    // A save the profile checker will refuse: the protocol stays shadowsocks
-    // because the form does not own it, but the auth kind no longer matches.
-    await choose(tester, const Key('f-auth'), 'Password');
-    // Switching away from Shadowsocks reveals the SSH username field, which
-    // the form requires -- without it `_save` returns at validation and never
-    // reaches the code this test is about.
-    await tester.enterText(find.byKey(const Key('f-user')), 'someone');
     await choose(
         tester, const Key('f-secret-mode'), 'Type it — save to a 0600 file');
     await tester.enterText(find.byKey(const Key('f-secret')), 'overwritten');

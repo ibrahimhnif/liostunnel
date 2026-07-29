@@ -80,6 +80,38 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
   /// files, and re-importing to fix a typo left another.
   String? _importedId;
 
+  /// The password the last successful [_import] took out of the link, held
+  /// until [_save] has somewhere safe to put it.
+  ///
+  /// Not written at import time, and that ordering is the whole point.
+  /// [ProfileWriter.writeSecret] truncates `secrets/<slug(id)>`, and on an
+  /// edit that id is the existing profile's — the file the on-disk profile
+  /// already points at. Writing there the instant Import is pressed destroyed
+  /// a live credential before `checkNameFree`, before `checkProfile` and
+  /// before Save: paste what you believe is the rotated link, notice the host
+  /// is wrong, press Back, and the original password is gone with nothing
+  /// saved. It came from an `ss://` link, so it cannot be retyped.
+  ///
+  /// Held in widget state exactly as a typed password already is ([_secret])
+  /// and under the same rule: it never reaches the profile document, is never
+  /// rendered, and goes straight from here into a `0600` file.
+  String? _importedPassword;
+
+  /// The exact text the last [_import] consumed out of [_uri].
+  ///
+  /// [_save] used to clear [_uri] whenever `_importedId != null`, and
+  /// `_importedId` is never reset — so after one import that was permanently
+  /// true. Paste link A, Import, paste link B, Save: B was silently dropped,
+  /// the profile kept A's credential, and the UI reported success. The user
+  /// believed the password was rotated and found out eight seconds into the
+  /// next connect.
+  ///
+  /// Comparing against what was actually consumed is what tells "the box
+  /// still holds the link the import took" from "the box holds one it never
+  /// saw" — and [_import] empties the box on success, so in practice the
+  /// second case is any non-empty box at all.
+  String? _importedUri;
+
   bool get _editing => widget.existing?.profile != null;
 
   @override
@@ -143,22 +175,27 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
   /// Fills the form from an `ss://` link.
   ///
   /// Order is load-bearing. The link is parsed first, so a malformed one
-  /// leaves no secret file behind; the password is written before any form
-  /// field is touched, so a failed write leaves the form as it was rather
-  /// than half-filled with a credential that never landed.
+  /// changes nothing at all; and **nothing is written to disk here**, so an
+  /// import the user then abandons leaves every file exactly as it was. See
+  /// [_importedPassword] for what that closes.
   Future<void> _import() async {
     setState(() {
       _busy = true;
       _error = null;
     });
     try {
+      // An `ss://` link is a Shadowsocks credential and nothing else, so
+      // importing one into a profile of another protocol cannot be made
+      // coherent. Refused here as well as in `_save` so the message lands at
+      // the paste box, where the gesture was.
+      _refuseAProtocolChange('shadowsocks');
       final uri = _uri.text.trim();
       final dto = await importSsUri(uri: uri);
       final password = await ssUriPassword(uri: uri);
-      // The file `writeSecret` produces is named after the id it is given, so
-      // that id has to be the one the saved profile will carry. On an edit
-      // that is the existing profile's, which is stable across saves by
-      // design; only a new profile uses the one the import minted. Using
+      // The file `writeSecret` will produce is named after the id it is
+      // given, so that id has to be the one the saved profile will carry. On
+      // an edit that is the existing profile's, which is stable across saves
+      // by design; only a new profile uses the one the import minted. Using
       // `dto.id` unconditionally left an orphan 0600 file behind every single
       // import — nothing collects those, and deletion deliberately never
       // touches a secret file.
@@ -167,15 +204,18 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       // orphan the first import's 0600 file — the very case the paragraph
       // above claims to close, reached one gesture later.
       final id = widget.existing?.profile?.id ?? _importedId ?? dto.id;
-      // Straight to a 0600 file. The password is never held in widget state
-      // and never reaches the profile document.
-      final ref = await widget.writer.writeSecret(id, password);
 
       if (!mounted) return;
       setState(() {
         // Kept so `_save` writes the profile under the id whose secret file
-        // was just written, instead of minting a second one and orphaning it.
+        // it will write, instead of minting a second one and orphaning it.
         _importedId = id;
+        // Carried, not written. `_save` puts it in a 0600 file once the
+        // profile has actually been accepted.
+        _importedPassword = password;
+        // What the user typed and this import consumed, so `_save` can tell
+        // a link it has already taken from one pasted afterwards.
+        _importedUri = uri;
         _name.text = dto.name;
         _host.text = dto.host;
         _port.text = dto.port.toString();
@@ -185,7 +225,9 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
         // the Cipher dropdown cannot show.
         _cipher = dto.cipher ?? 'aes-256-gcm';
         _secretMode = 'file';
-        _secretPath.text = ref.substring('file:'.length);
+        // Where the password WILL live, shown before anything is written —
+        // the same thing `_save` does for a typed one.
+        _secretPath.text = widget.writer.secretPathFor(id);
         // DNS is deliberately NOT touched. An `ss://` link carries no DNS
         // information, so the DTO's value is a default the FFI had to invent,
         // and writing it back over the form discarded whatever the user had:
@@ -202,24 +244,85 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
     }
   }
 
+  /// The protocol a credential kind implies.
+  ///
+  /// The form has no protocol control, so the Authentication dropdown is the
+  /// only thing that can express one — which is exactly how an SSH profile
+  /// came to be saved as Shadowsocks.
+  static String _protocolFor(String authKind) => switch (authKind) {
+        'shadowsocks' => 'shadowsocks',
+        'preshared_key' => 'wireguard',
+        _ => 'ssh',
+      };
+
+  /// Refuses a change of protocol on an existing profile, because the editor
+  /// cannot make one coherently.
+  ///
+  /// Picking "Shadowsocks" on an SSH profile used to save: `check_profile`
+  /// saw a shadowsocks/shadowsocks pairing and passed, and what landed on
+  /// disk was a Shadowsocks profile whose password file was the SSH private
+  /// key the profile already named, under a cipher nobody chose — `_cipher`'s
+  /// default, which is precisely the "pick a cipher on the user's behalf"
+  /// that `dto/profile.rs` refuses to do. Shadowsocks has no handshake, so
+  /// the result connects and carries nothing.
+  ///
+  /// The reverse was a dead end rather than a hazard, and this fixes that
+  /// too: a Shadowsocks profile could never move off `shadowsocks`, and the
+  /// refusal the user got ("ssh takes a password or a private key…") is
+  /// advice about a control this form does not have.
+  ///
+  /// Refusing, not converting. Every field that would have to change means
+  /// something different to the two protocols — the credential, the cipher,
+  /// the username — so there is no honest automatic answer, and a protocol
+  /// dropdown would only move the same incoherence one control over. A new
+  /// profile is cheap and is the thing the user actually wants.
+  ///
+  /// Applies to edits only. A NEW profile has no protocol to change.
+  void _refuseAProtocolChange(String authKind) {
+    final old = widget.existing?.profile;
+    if (old == null) return;
+    final wanted = _protocolFor(authKind);
+    if (wanted == old.protocol) return;
+    throw StateError(
+      'This is a ${old.protocol} profile and it cannot be turned into a '
+      '$wanted one here: the credential, the cipher and the username all mean '
+      'different things to the two, so the result would save and then fail to '
+      'connect. Create a new profile instead — for a Shadowsocks server, '
+      'paste its ss:// link into one.',
+    );
+  }
+
   Future<void> _save() async {
     if (!_form.currentState!.validate()) return;
     setState(() {
       _busy = true;
       _error = null;
       _saved = null;
-      // Cleared only when an import actually consumed a link. Clearing it
-      // unconditionally meant a user who pasted a NEW link to rotate a
-      // password and then pressed Save instead of Import got a successful
-      // save of the OLD credential, with the link vanishing and nothing
-      // saying it had been ignored.
-      if (_importedId != null) _uri.clear();
     });
     try {
+      _refuseAProtocolChange(_authKind);
+      // A link in the box that no import consumed is a credential the save is
+      // about to ignore. It used to be cleared instead, on a guard that was
+      // permanently true after the first import, so the profile was written
+      // with the OLD password under a green "Saved to …".
+      //
+      // Only when the box is on screen: `_uri` keeps its text after the
+      // Authentication dropdown moves away from Shadowsocks, and refusing a
+      // save over a field the user cannot see would be its own trap.
+      if (_authKind == 'shadowsocks' &&
+          _uri.text.trim().isNotEmpty &&
+          _uri.text.trim() != _importedUri) {
+        throw StateError(
+          'There is an ss:// link in the paste box that has not been '
+          'imported. Press "Import from link" to use it, or clear the box to '
+          'save without it.',
+        );
+      }
+
       final old = widget.existing?.profile;
       // An edit keeps its id. Minting a new one would make the profile a
       // different server as far as anything keyed on id is concerned.
-      // An import keeps the id its secret file was written under, for the
+      // An import keeps the id its secret file will be written under, for the
       // same reason one step down: `writeSecret` keys on the profile id.
       final id = old?.id ?? _importedId ?? await newProfileId();
 
@@ -271,7 +374,12 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
             .map((s) => s.trim())
             .where((s) => s.isNotEmpty)
             .toList(),
-        authPassphraseSource: old?.authPassphraseSource,
+        // Carried only where it means something. A passphrase belongs to an
+        // encrypted private key; on any other credential kind `TryFrom` drops
+        // it silently, so carrying it there is a value that looks preserved
+        // and is not.
+        authPassphraseSource:
+            _authKind == 'private_key' ? old?.authPassphraseSource : null,
         peerPublicKey: old?.peerPublicKey,
         splitTunnel: old?.splitTunnel ?? 'all_traffic',
         splitTunnelApps: old?.splitTunnelApps ?? const [],
@@ -284,10 +392,20 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       await checkProfile(dto: dto);
       if (_secretMode == 'typed') {
         await widget.writer.writeSecret(id, _secret.text);
+      } else if (_importedPassword != null &&
+          _secretPath.text.trim() == widget.writer.secretPathFor(id)) {
+        // The imported password, written only now that the profile has been
+        // accepted — see `_importedPassword`. Guarded on the path still being
+        // the managed one: if the user has since pointed the form at a file
+        // of their own, that file is what the profile names and writing
+        // elsewhere would leave an orphan.
+        await widget.writer.writeSecret(id, _importedPassword!);
       }
       final file = await widget.writer.writeProfile(
         dto,
-        sshUser: _user.text,
+        // Shadowsocks has no username. Passing one wrote a `.user` sidecar
+        // beside a profile for a protocol that has nowhere to send it.
+        sshUser: _authKind == 'shadowsocks' ? null : _user.text,
         replacingPath: widget.existing?.path,
       );
       if (!mounted) return;
