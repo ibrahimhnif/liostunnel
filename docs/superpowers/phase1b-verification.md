@@ -6,14 +6,14 @@ Branch `phase1b-shadowsocks`. Fixture: `make -C testing/docker up` brings up
 
 | Criterion | Status |
 |---|---|
-| P1b-1 — connects and carries traffic | ✅ protocol layer; ⏳ end-to-end through the helper |
+| P1b-1 — connects and carries traffic | ✅ protocol layer **and** end-to-end |
 | P1b-2 — interoperates with libev | ✅ |
 | P1b-3 — a wrong password fails at connect | ✅ |
 | P1b-4 — `ss://` imports; malformed refused without echo | ✅ |
-| P1b-5 — the ownership gate covers SS passwords | ✅ unit; ⏳ end-to-end |
+| P1b-5 — the ownership gate covers SS passwords | ✅ unit **and** end-to-end |
 | P1b-6 — no SSH-shaped concession, or it is recorded | ✅ recorded below |
 
-⏳ = awaiting the root run in §7. Everything else is verbatim output.
+All verbatim output. §7 is the end-to-end run, on macOS 15.5 (Darwin 25.5.0).
 
 ---
 
@@ -247,25 +247,86 @@ set out to test, and the second protocol revealed three separate places where
 
 ---
 
-## §7 — end-to-end through the helper (needs root)
+## §7 — end-to-end through the helper (root)
 
-The Phase 1a verifier, unchanged, pointed at a Shadowsocks profile. **If the
-script needs any edit to pass, that edit is a P1b-6 finding** — the script
-passing unchanged against a second protocol is the evidence the abstraction
-held.
+The Phase 1a verifier, pointed at a Shadowsocks profile. Run on macOS
+15.5 against the Docker fixture.
 
-Prepared (non-root): `/tmp/lios-verify/ss-key` (mode 0600) and
-`/tmp/lios-verify/ss-profile.json`; `cargo build --release -p liostunnel-helper`.
+```
+$ LIOS_PROFILE=/tmp/lios-verify/ss-profile.json sudo -E ./testing/verify-phase1a.sh
+wire   : protocol_version 2, protocol shadowsocks
 
-```bash
-LIOS_PROFILE=/tmp/lios-verify/ss-profile.json sudo -E ./testing/verify-phase1a.sh
+=== P1a-6 — a secret the caller does not own is refused, with nothing created ===
+  bait: 600 owned by uid 0
+  {"type":"error","id":2,"kind":"secret_not_permitted",
+   "message":"secret file /tmp/lios-verify/rootkey is not owned by uid 501"}
+  PASS  root-owned secret refused
+  PASS  no TUN device created
+  PASS  no route installed
+
+=== P1a-6b — an env-var secret is refused (it would read ROOT's environment) ===
+  {"type":"error","id":2,"kind":"bad_request",
+   "message":"env-var secrets are not available through the helper"}
+  PASS  env-var secret refused
+
+=== P1a-2, P1a-3, P1a-4 — a real tunnel, live stats, and surviving the client ===
+  connect reply: [{"type": "ack", "id": 2}, {"type": "state", "state": "Connected"}]
+  PASS  P1a-2: connect brought up a real tunnel
+  stats before traffic: {'bytes_up': 0, 'bytes_down': 0, 'active_flows': 0, ...}
+  stats after traffic : {'bytes_up': 464, 'bytes_down': 1156, 'active_flows': 0, ...}
+  PASS  P1a-3: 4/4 fetches returned and bytes came back through the engine
+  packets on the tunnel device during those fetches:
+    listening on utun9, link-type NULL (BSD loopback)
+    IP 10.90.0.1.54772 > 192.168.158.4.80: Flags [SEW], ...
+    IP 10.90.0.1.54772 > 192.168.158.4.80: Flags [P.], ... HTTP: GET / HTTP/1.1
+    IP 192.168.158.4.80 > 10.90.0.1.54772: Flags [P.], ... HTTP: HTTP/1.1 200 OK
+
+=== P1a-4 — the tunnel outlives the client that started it ===
+  route: 192.168.158.4/32   utun9              USc                 utun9
+  PASS  a fresh client re-synced to the still-running tunnel
+
+=== teardown ===
+  PASS  default route unchanged throughout
+  PASS  no interface left behind
+  PASS  no tunnel or utun route survived teardown
+  PASS  every revert command succeeded
+
+=== 15 passed, 0 failed ===
 ```
 
-Expected: 14 passed, 0 failed.
+**P1b-1 end-to-end.** `bytes_up: 464, bytes_down: 1156` for the same four
+fetches Phase 1a measured over SSH on this machine — **the identical byte
+counts**. That is not a coincidence and it is not a tally reading its own
+output: the counters wrap the inner stream, so the same payload through a
+completely different transport moves the same bytes. The `tcpdump` capture on
+`utun9` is the independent witness — a real SYN, a real `GET / HTTP/1.1`, a
+real `HTTP/1.1 200 OK`, on the tunnel device.
 
-> _Output pending._
+**P1b-5 end-to-end.** `secret_not_permitted: secret file
+/tmp/lios-verify/rootkey is not owned by uid 501` — for a **Shadowsocks**
+profile, from the ownership branch specifically, with no TUN device created
+and no route installed. The gate needed no new code; `secret_refs()`
+enumerating the Shadowsocks password was the whole change.
 
----
+### What the script needed, and whether it is a P1b-6 finding
+
+§7's rule: *if the script needs an edit to pass, that edit is a P1b-6
+finding.* It needed two, and both are worth separating from the abstraction
+question:
+
+1. **The two escalation-gate checks built their bait profiles inline as SSH**,
+   regardless of `$LIOS_PROFILE`. Unfixed, "14 passed" on a Shadowsocks run
+   would have been evidence about SSH. This is a **test-harness** limitation,
+   not a `Protocol` concession — nothing in the product needed changing, only
+   the script's assumption that there is one protocol.
+2. **The wire version was hardcoded** in six places. Unrelated to protocols;
+   it made a stale binary look like five unrelated failures, which is exactly
+   what happened on the first attempt.
+
+Neither is a concession the abstraction had to make. The tunnel itself, the
+route pin, the state file, the reconnect path and the teardown all ran
+unchanged against a second protocol — which is the evidence the criterion was
+asking for.
 
 ## Decisions this phase defers to the review
 
