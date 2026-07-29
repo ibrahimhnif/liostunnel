@@ -2,16 +2,20 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 
 import 'package:liostunnel_app/screens/connection.dart';
+import 'package:liostunnel_app/screens/dialogs.dart';
 import 'package:liostunnel_app/screens/profile_editor.dart';
 import 'package:liostunnel_app/screens/profiles.dart';
 import 'package:liostunnel_app/services/connection_model.dart';
 import 'package:liostunnel_app/services/helper_client.dart';
+import 'package:liostunnel_app/services/link_export.dart';
 import 'package:liostunnel_app/services/profile_store.dart';
 import 'package:liostunnel_app/services/profile_writer.dart';
+import 'package:liostunnel_app/src/rust/api/config.dart';
 import 'package:liostunnel_app/src/rust/dto/profile.dart';
 import 'package:liostunnel_app/src/rust/frb_generated.dart';
 
@@ -494,6 +498,7 @@ void main() {
     dir.deleteSync(recursive: true);
   });
 
+  copyLinkTests();
   editorTests();
 
   test('a missing profiles directory is empty, not an error', () async {
@@ -506,6 +511,162 @@ void main() {
 
 void _ignore(LoadedProfile _) {}
 void _noop() {}
+
+// --- copy as a link -------------------------------------------------------
+// The one path in the app that handles a live, rendered-adjacent credential.
+// Two invariants: it asks before copying, and the link never reaches the
+// screen. Both used to be held by reading `_copyLink` — a private method of
+// `_HomePageState` that nothing could pump.
+
+/// Every `Clipboard.setData` that reaches the platform channel.
+///
+/// The real one is unavailable under `flutter test`, so without this the copy
+/// path throws into its own catch and the test cannot tell "copied" from
+/// "refused". Returned live: the list fills as the calls arrive.
+List<String> captureClipboard() {
+  final written = <String>[];
+  final messenger =
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
+  messenger.setMockMethodCallHandler(SystemChannels.platform, (call) async {
+    if (call.method == 'Clipboard.setData') {
+      written.add((call.arguments as Map)['text'] as String);
+    }
+    return null;
+  });
+  addTearDown(
+      () => messenger.setMockMethodCallHandler(SystemChannels.platform, null));
+  return written;
+}
+
+/// Puts [confirmAndCopyLink] behind a button and presses it.
+///
+/// A plain `pumpAndSettle`, deliberately: [producer] is a fake that completes
+/// inside the fake-async zone. The real one crosses the FFI, which is why the
+/// production code takes a producer at all — `pressAndSettle` wraps
+/// `tester.runAsync`, and nesting another throws "Reentrant call to
+/// runAsync() denied".
+Future<void> pumpCopyLink(
+  WidgetTester tester,
+  Future<String> Function() producer,
+) async {
+  await tester.pumpWidget(MaterialApp(
+    home: Scaffold(
+      body: Builder(
+        builder: (context) => TextButton(
+          key: const Key('copy-link'),
+          onPressed: () => confirmAndCopyLink(context, producer),
+          child: const Text('Copy as a link'),
+        ),
+      ),
+    ),
+  ));
+  await tester.tap(find.byKey(const Key('copy-link')));
+  await tester.pumpAndSettle();
+}
+
+void copyLinkTests() {
+  testWidgets('Cancel does not read the secret, let alone copy it',
+      (tester) async {
+    // Stronger than "did not copy": the producer is never invoked, so the
+    // 0600 file is not even opened. That is what makes the confirmation a
+    // decision rather than a formality — and it is what fails if the read is
+    // hoisted above the dialog for convenience.
+    final clipboard = captureClipboard();
+    var asked = false;
+    await pumpCopyLink(tester, () async {
+      asked = true;
+      return 'ss://FAKE-CREDENTIAL@h:1';
+    });
+
+    expect(find.text('Copy this profile as a link?'), findsOneWidget,
+        reason: 'it must ask at all');
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+
+    expect(asked, isFalse, reason: 'the secret file must not have been read');
+    expect(clipboard, isEmpty);
+  });
+
+  testWidgets('Copy puts the link on the clipboard and nowhere on screen',
+      (tester) async {
+    final clipboard = captureClipboard();
+    await pumpCopyLink(tester, () async => 'ss://FAKE-CREDENTIAL@h:1');
+
+    await tester.tap(find.byKey(const Key('confirm-copy')));
+    await tester.pumpAndSettle();
+
+    expect(clipboard, ['ss://FAKE-CREDENTIAL@h:1']);
+    expect(find.textContaining('ss://'), findsNothing,
+        reason: 'a live credential on screen is one screenshot from being '
+            'someone else\'s');
+    expect(find.textContaining('FAKE-CREDENTIAL'), findsNothing);
+    expect(find.textContaining('Link copied'), findsOneWidget,
+        reason: 'and the user has to be told it worked');
+  });
+
+  testWidgets('a refusal is shown, without the link in it', (tester) async {
+    final clipboard = captureClipboard();
+    await pumpCopyLink(
+        tester,
+        () async =>
+            throw StateError("this profile's password file is missing"));
+
+    await tester.tap(find.byKey(const Key('confirm-copy')));
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull,
+        reason: 'a failure here must reach the user, not the console');
+    expect(find.textContaining('password file is missing'), findsOneWidget);
+    expect(find.textContaining('ss://'), findsNothing);
+    expect(clipboard, isEmpty);
+  });
+
+  test('the link carries the password the tunnel uses, not the file\'s bytes',
+      () async {
+    // `echo hunter2 > pw` — literally the case the core's
+    // `strip_one_trailing_line_ending` is documented for, and what the README
+    // sanctions. `FileSecretStore::resolve` reads that as `hunter2`, so that
+    // is what the helper connects with. Reading the raw string here produced a
+    // link whose password was `hunter2\n`: another client derives a different
+    // key, the server drops the ciphertext, and Shadowsocks has no handshake
+    // in which to say why. The link is silently wrong, and other clients
+    // accepting it is the entire point of the feature.
+    //
+    // A plain `test`, because `ssLinkFor` crosses the FFI twice and those
+    // futures never complete in a `testWidgets` fake-async zone.
+    final dir = Directory.systemTemp.createTempSync('lios-link-newline');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final secret = '${dir.path}/pw';
+    File(secret).writeAsStringSync('hunter2\n');
+
+    final link = await ssLinkFor(ssProfile(source: 'file:$secret'));
+    expect(await ssUriPassword(uri: link), 'hunter2',
+        reason: 'the value of a file: secret is the core\'s, not the file\'s');
+  });
+
+  test('a secret file that is not text is refused in the app\'s own words',
+      () async {
+    // `ProfileWriter._readSecretFile` records this exact lesson one menu item
+    // over: a credential that is not text came back out of `readAsStringSync`
+    // as a decode failure about byte offsets, from a gesture that said
+    // "duplicate", for a profile with nothing wrong with it. `exportSsUri`
+    // takes a String, so a refusal is the honest outcome either way — but it
+    // has to be a sentence this app wrote.
+    final dir = Directory.systemTemp.createTempSync('lios-link-binary');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final secret = '${dir.path}/psk';
+    File(secret).writeAsBytesSync([0x00, 0xff, 0xfe, 0x80]);
+
+    final e = await ssLinkFor(ssProfile(source: 'file:$secret'))
+        .then<Object?>((_) => null, onError: (Object e) => e);
+    expect(e, isNotNull, reason: 'a binary credential cannot become a link');
+    expect('$e', contains('not text'));
+    expect('$e', isNot(contains('utf-8')),
+        reason: 'not a UTF-8 decoder\'s complaint about byte offsets');
+    expect('$e', isNot(contains(secret)),
+        reason: 'and the decoder\'s version named the secret file too');
+  });
+}
 
 // --- profile editor -------------------------------------------------------
 // Rendering and validation only. The save path crosses the FFI, and
