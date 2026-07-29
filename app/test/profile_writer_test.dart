@@ -752,6 +752,171 @@ void duplicateTests() {
     dir.deleteSync(recursive: true);
   });
 
+  test('two duplicates in one tick leave no orphaned credential', () async {
+    // A double-tap on a Duplicate menu item, and it is reachable exactly as
+    // written: everything before `await newProfileId()` — the guards, the read,
+    // the whole naming loop — is synchronous, so the second call enters
+    // `duplicate` before the first has yielded and both settle on
+    // "Home VPS copy". Both then write a secret under their own fresh id, and
+    // the refusal comes from `writeProfile`'s OWN `checkNameFree`, which runs
+    // after `writeSecret` — so the loser leaves a 0600 file holding a live
+    // credential that no profile names and nothing ever collects.
+    final dir = Directory.systemTemp.createTempSync('lios-dup-race');
+    final w = ProfileWriter(directory: dir.path);
+    const id = '11111111-1111-1111-1111-111111111111';
+    final ref = await w.writeSecret(id, 'original-password');
+    final original = await w.writeProfile(dto(id: id, source: ref));
+    final source = await loaded(original);
+
+    // Neither is awaited before the other starts. That is the whole scenario.
+    final settled = await Future.wait([
+      w.duplicate(source).then<Object>((f) => f, onError: (Object e) => e),
+      w.duplicate(source).then<Object>((f) => f, onError: (Object e) => e),
+    ]);
+
+    expect(settled.whereType<File>().length, 1, reason: 'one copy is made');
+    expect(settled.whereType<StateError>().length, 1,
+        reason: 'and the other is refused rather than overwriting it');
+    expect(Directory(w.secretsDirectory).listSync().length, 2,
+        reason: "the original's secret and the one copy that exists; a "
+            'refusal must collect the credential it had already written');
+    dir.deleteSync(recursive: true);
+  });
+
+  test('a secret that is not valid UTF-8 is copied byte for byte', () async {
+    // A binary pre-shared key, a DER-encoded private key. Reading the source
+    // with `readAsStringSync` decodes it as UTF-8, so duplicating one threw a
+    // FormatException about byte offsets out of a menu item that said
+    // "duplicate" — not the readable refusal the doc promises for a secret
+    // that cannot be read, and not a refusal that was owed at all: there is
+    // nothing wrong with the profile.
+    final dir = Directory.systemTemp.createTempSync('lios-dup-bin');
+    final w = ProfileWriter(directory: dir.path);
+    const id = '11111111-1111-1111-1111-111111111111';
+    final ref = await w.writeSecret(id, 'placeholder');
+    const bytes = [0x00, 0xff, 0xfe, 0x80, 0x41];
+    File(ref.substring(5)).writeAsBytesSync(bytes);
+    final original = await w.writeProfile(dto(id: id, source: ref));
+
+    final copy = await w.duplicate(await loaded(original));
+
+    final copyDto = await parseProfile(json: copy.readAsStringSync());
+    expect(File(copyDto.authSecretSource.substring(5)).readAsBytesSync(), bytes,
+        reason: 'a credential is bytes; a round trip through a String would '
+            'corrupt one even where it did not throw');
+    dir.deleteSync(recursive: true);
+  });
+
+  // An ssh `private_key` credential is TWO files, not one: `portable.rs`
+  // writes `<id>.private_key` and `<id>.passphrase`, both keyed on the profile
+  // id. Copying the first and aliasing the second is the same defect the
+  // secret copy exists to prevent, one field over — and quieter, because
+  // nothing in the app writes a passphrase today, so only a profile that came
+  // in through the CLI's portable import has one to lose.
+  ProfileDto keyProfile({
+    required String source,
+    String? passphrase,
+    String id = '11111111-1111-1111-1111-111111111111',
+  }) =>
+      ProfileDto(
+        id: id,
+        name: 'Key VPS',
+        protocol: 'ssh',
+        host: '198.51.100.9',
+        port: 22,
+        authKind: 'private_key',
+        authSecretSource: source,
+        authPassphraseSource: passphrase,
+        dnsMode: 'tcp',
+        dnsServers: const ['1.1.1.1'],
+        splitTunnel: 'all_traffic',
+        splitTunnelApps: const [],
+        killSwitch: false,
+      );
+
+  test('the copy gets its own passphrase file too', () async {
+    final dir = Directory.systemTemp.createTempSync('lios-dup-pass');
+    final w = ProfileWriter(directory: dir.path);
+    const id = '11111111-1111-1111-1111-111111111111';
+    final keyRef = await w.writeSecret(id, 'PRIVATE KEY');
+    final passRef = await w.writeSecret('$id.passphrase', 'original-phrase');
+    final original =
+        await w.writeProfile(keyProfile(source: keyRef, passphrase: passRef));
+
+    final copy = await w.duplicate(await loaded(original));
+
+    final copyDto = await parseProfile(json: copy.readAsStringSync());
+    expect(copyDto.authPassphraseSource, isNotNull,
+        reason: 'a copy that loses the passphrase cannot open its own key');
+    expect(copyDto.authPassphraseSource, isNot(passRef),
+        reason: 'sharing the file means changing the copy destroys the '
+            "original's passphrase");
+    final copyPass = copyDto.authPassphraseSource!.substring(5);
+    expect(File(copyPass).readAsStringSync(), 'original-phrase',
+        reason: 'and it must be the passphrase, not a stub');
+    final mode = (await Process.run('stat', ['-f', '%Lp', copyPass]))
+        .stdout
+        .toString()
+        .trim();
+    expect(mode, '600', reason: 'a passphrase is a credential like any other');
+
+    // The same demonstration the secret gets: writing through the reference
+    // the COPY carries must not reach the original's file.
+    File(copyPass).writeAsStringSync('changed');
+    expect(File(passRef.substring(5)).readAsStringSync(), 'original-phrase',
+        reason: 'the original passphrase must survive a change to the copy');
+    dir.deleteSync(recursive: true);
+  });
+
+  test('a passphrase that is not a file is carried, not copied', () async {
+    // `env:KEY_PASS` names no file, so both profiles reading it destroys
+    // nothing — and refusing to duplicate over it would refuse a profile with
+    // nothing wrong with it. Copying it blindly would look for a file called
+    // `KEY_PASS` and refuse for a reason that is not true.
+    final dir = Directory.systemTemp.createTempSync('lios-dup-envpass');
+    final w = ProfileWriter(directory: dir.path);
+    const id = '11111111-1111-1111-1111-111111111111';
+    final keyRef = await w.writeSecret(id, 'PRIVATE KEY');
+    final original = await w
+        .writeProfile(keyProfile(source: keyRef, passphrase: 'env:KEY_PASS'));
+
+    final copy = await w.duplicate(await loaded(original));
+
+    final copyDto = await parseProfile(json: copy.readAsStringSync());
+    expect(copyDto.authPassphraseSource, 'env:KEY_PASS');
+    dir.deleteSync(recursive: true);
+  });
+
+  test('a source whose passphrase file is gone is refused, and cleanly',
+      () async {
+    // Symmetrical with the missing secret one field over: a refusal the caller
+    // can show, rather than a copy pointing at a passphrase that is not there.
+    // And it must arrive before the secret copy is written, or a refusal about
+    // the passphrase leaves an orphaned key behind — the same ordering rule
+    // `checkNameFree` was moved ahead of `writeSecret` for.
+    final dir = Directory.systemTemp.createTempSync('lios-dup-nopass');
+    final w = ProfileWriter(directory: dir.path);
+    const id = '11111111-1111-1111-1111-111111111111';
+    final keyRef = await w.writeSecret(id, 'PRIVATE KEY');
+    final passRef = await w.writeSecret('$id.passphrase', 'original-phrase');
+    final original =
+        await w.writeProfile(keyProfile(source: keyRef, passphrase: passRef));
+    final source = await loaded(original);
+    File(passRef.substring(5)).deleteSync();
+
+    await expectLater(
+      w.duplicate(source),
+      throwsA(isA<StateError>().having(
+          (e) => '$e', 'message', contains('passphrase file is missing'))),
+    );
+    expect(dir.listSync().whereType<File>().length, 1,
+        reason: 'no half-made copy was left behind');
+    expect(Directory(w.secretsDirectory).listSync().length, 1,
+        reason: "only the original's key — a refusal about the passphrase "
+            'must not leave the copied key behind');
+    dir.deleteSync(recursive: true);
+  });
+
   test('duplicating a profile whose secret is not a file is refused', () async {
     // What the refusal SAYS, not merely that something was thrown. Asserting
     // `contains('secret')` was satisfied by the *next* guard down: `env:PW`
