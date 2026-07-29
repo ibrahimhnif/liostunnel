@@ -47,6 +47,60 @@ ProfileDto dto({
       killSwitch: false,
     );
 
+/// A profile using every field the editor does not offer.
+///
+/// At file scope rather than inside `criticalTests`, because `duplicate`
+/// rebuilds a DTO field by field exactly the way the editor used to and needs
+/// the same fixture to prove it carries everything.
+ProfileDto rich({
+  String source = 'file:/tmp/k',
+  String id = 'b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f',
+}) =>
+    ProfileDto(
+      id: id,
+      name: 'Rich',
+      protocol: 'wireguard',
+      host: 'h.example',
+      port: 51820,
+      authKind: 'preshared_key',
+      authSecretSource: source,
+      peerPublicKey: 'AAAA',
+      dnsMode: 'tcp',
+      dnsServers: const ['1.1.1.1'],
+      splitTunnel: 'exclude_apps',
+      splitTunnelApps: const ['Mail', 'Music'],
+      killSwitch: true,
+    );
+
+/// The three fields [rich] structurally cannot hold.
+///
+/// `cipher` belongs to shadowsocks credentials and the DoH endpoint to
+/// `dnsMode: https`; `ServerProfile` has nowhere to put either on a wireguard
+/// profile, so `parse_profile` hands back `null` for them however the DTO was
+/// built. A wireguard fixture therefore cannot witness them being carried —
+/// the assertion would read `null == null` no matter what `duplicate` did.
+ProfileDto richShadowsocks({
+  String source = 'file:/tmp/k',
+  String id = 'b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e3a',
+}) =>
+    ProfileDto(
+      id: id,
+      name: 'Rich SS',
+      protocol: 'shadowsocks',
+      host: 'ss.example',
+      port: 8388,
+      authKind: 'shadowsocks',
+      authSecretSource: source,
+      cipher: 'aes-256-gcm',
+      dnsMode: 'https',
+      dnsServers: const ['9.9.9.9'],
+      dohSni: 'dns.example',
+      dohPath: '/dns-query',
+      splitTunnel: 'include_only',
+      splitTunnelApps: const ['Safari'],
+      killSwitch: true,
+    );
+
 void main() {
   setUpAll(() async => await RustLib.init());
 
@@ -351,23 +405,6 @@ void dohTests() {
 // Three defects an independent review found, each of which destroyed user
 // data on a path the user believed had failed safely.
 void criticalTests() {
-  /// A profile using every field the editor does not offer.
-  ProfileDto rich() => const ProfileDto(
-        id: 'b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f',
-        name: 'Rich',
-        protocol: 'wireguard',
-        host: 'h.example',
-        port: 51820,
-        authKind: 'preshared_key',
-        authSecretSource: 'file:/tmp/k',
-        peerPublicKey: 'AAAA',
-        dnsMode: 'tcp',
-        dnsServers: ['1.1.1.1'],
-        splitTunnel: 'exclude_apps',
-        splitTunnelApps: ['Mail', 'Music'],
-        killSwitch: true,
-      );
-
   test('a field the editor does not offer survives a round trip', () async {
     // The editor rebuilt the DTO from scratch, hardcoding protocol to ssh,
     // kill_switch to false and split_tunnel to all_traffic, and dropping the
@@ -555,7 +592,8 @@ void duplicateTests() {
         profile: await parseProfile(json: f.readAsStringSync()),
       );
 
-  test('a duplicate gets its own secret file', () async {
+  test('a duplicate gets its own secret file, and the original survives',
+      () async {
     final dir = Directory.systemTemp.createTempSync('lios-dup');
     final w = ProfileWriter(directory: dir.path);
     const id = '11111111-1111-1111-1111-111111111111';
@@ -572,7 +610,79 @@ void duplicateTests() {
     expect(File(copyDto.authSecretSource.substring(5)).readAsStringSync(),
         'original-password',
         reason: 'the copy must carry the credential, not a stub');
+
+    // The whole premise of the gesture, and nothing above says it: every
+    // assertion so far reads the COPY, so a `duplicate` that ended by
+    // deleting its source — one stray `replacingPath: source.path` on the
+    // final `writeProfile`, one `await delete(source.path)` — passed all of
+    // them. A duplicate that removes the thing it duplicated is the failure
+    // this file exists to prevent, in its most literal form.
+    expect(File(original.path).existsSync(), isTrue,
+        reason: 'duplicating must not consume the original');
+    expect((await ProfileStore(directory: dir.path).load()).length, 2,
+        reason: 'the list must now hold both, not one');
+
+    // And the copy's credential is as protected as the original's. Written
+    // through `writeSecret`, not with a bare `writeAsStringSync`, which would
+    // leave a live password in a 0644 file.
+    final copyPath = copyDto.authSecretSource.substring(5);
+    final mode = (await Process.run('stat', ['-f', '%Lp', copyPath]))
+        .stdout
+        .toString()
+        .trim();
+    expect(mode, '600', reason: 'the copy is a credential like any other');
     dir.deleteSync(recursive: true);
+  });
+
+  // `duplicate` rebuilds the DTO field by field, which is exactly how this app
+  // once rewrote a wireguard profile to ssh with its app list gone (see "a
+  // field the editor does not offer survives a round trip"). Every duplicate
+  // test above builds its source from `dto()` — ssh, password, kill switch
+  // off, no apps, no peer key, no cipher, no DoH — so replacing any of those
+  // lines with a literal changed nothing anyone could see.
+  Future<void> carriesEveryField(ProfileDto Function({String source, String id})
+      fixture) async {
+    final dir = Directory.systemTemp.createTempSync('lios-dup-fields');
+    final w = ProfileWriter(directory: dir.path);
+    const id = '11111111-1111-1111-1111-111111111111';
+    final ref = await w.writeSecret(id, 'p');
+    final original = await w.writeProfile(fixture(source: ref, id: id));
+    final src = await parseProfile(json: original.readAsStringSync());
+
+    final copy = await w.duplicate(await loaded(original));
+    final got = await parseProfile(json: copy.readAsStringSync());
+
+    // Asserted against the SOURCE rather than against literals, so the fixture
+    // and the assertion cannot drift apart. Three fields are meant to differ —
+    // the id, the name and the secret reference — and every other one is here.
+    // `authPassphraseSource` is deliberately absent: the copy points at its
+    // own passphrase file, which its own test covers.
+    expect(got.protocol, src.protocol);
+    expect(got.host, src.host);
+    expect(got.port, src.port);
+    expect(got.authKind, src.authKind);
+    expect(got.peerPublicKey, src.peerPublicKey);
+    expect(got.cipher, src.cipher);
+    expect(got.dnsMode, src.dnsMode);
+    expect(got.dnsServers, src.dnsServers);
+    expect(got.dohSni, src.dohSni);
+    expect(got.dohPath, src.dohPath);
+    expect(got.splitTunnel, src.splitTunnel);
+    expect(got.splitTunnelApps, src.splitTunnelApps);
+    expect(got.killSwitch, src.killSwitch);
+    dir.deleteSync(recursive: true);
+  }
+
+  test('a wireguard profile is duplicated as a wireguard profile', () async {
+    await carriesEveryField(rich);
+  });
+
+  test('the cipher and the DoH endpoint are carried too', () async {
+    // A second fixture because the first structurally cannot hold these: a
+    // cipher lives on shadowsocks credentials and a DoH endpoint on
+    // `dnsMode: https`, and `parse_profile` returns null for both on a
+    // wireguard profile however the DTO was built.
+    await carriesEveryField(richShadowsocks);
   });
 
   test('changing the copy leaves the original credential intact', () async {
@@ -618,6 +728,14 @@ void duplicateTests() {
     final copy = await w.duplicate(await loaded(original));
 
     expect(File('${copy.path}.user').readAsStringSync(), 'hanif');
+    // Read off the COPY above, so a `duplicate` that moved the original onto
+    // the new name — deleting `home-vps.json` and `home-vps.json.user` on its
+    // way out — satisfied that line perfectly. The original's username has to
+    // still be there too, or the profile it belongs to falls back to the local
+    // account name and every connection fails as "credentials rejected".
+    expect(File('${original.path}.user').existsSync(), isTrue,
+        reason: "the original's username is not the copy's to take");
+    expect(File('${original.path}.user').readAsStringSync(), 'hanif');
     dir.deleteSync(recursive: true);
   });
 
@@ -670,6 +788,13 @@ void duplicateTests() {
     );
     expect(dir.listSync().whereType<File>().length, 1,
         reason: 'no half-made copy was left behind');
+    // Where a half-made copy actually lands. `dir.listSync().whereType<File>()`
+    // above cannot see one: secrets live in `<dir>/secrets/`, which is a
+    // Directory and gets filtered straight out, so that line only ever counted
+    // `.json` files. An orphaned 0600 file holding a live credential that no
+    // profile names and nothing collects is the leftover worth asserting on.
+    expect(Directory(w.secretsDirectory).listSync(), isEmpty,
+        reason: 'and no orphaned credential either');
     dir.deleteSync(recursive: true);
   });
 
