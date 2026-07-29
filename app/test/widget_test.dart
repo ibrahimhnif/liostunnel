@@ -488,11 +488,20 @@ String fieldText(WidgetTester tester, Key key) => tester
 void editorTests() {
   testWidgets('an empty host is refused before anything is written',
       (tester) async {
+    // Every OTHER required field is filled in, and the assertion is
+    // `findsOneWidget`. Three fields are empty on a fresh editor -- host, SSH
+    // username and the path to the secret -- so `findsWidgets` on a form
+    // where none of them had been touched was true whether the host had a
+    // validator or not: deleting it left this green.
     await pumpEditor(tester);
+    await tester.enterText(find.byKey(const Key('f-user')), 'someone');
+    await tester.enterText(
+        find.byKey(const Key('f-secret-path')), '/tmp/lios-not-read');
     await tester.enterText(find.byKey(const Key('f-host')), '');
     await tester.tap(find.byKey(const Key('save-button')));
     await tester.pump();
-    expect(find.text('required'), findsWidgets);
+    expect(find.text('required'), findsOneWidget,
+        reason: 'the host, and only the host, is what is missing');
     expect(find.byKey(const Key('editor-saved')), findsNothing);
   });
 
