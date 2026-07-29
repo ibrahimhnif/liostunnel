@@ -2,6 +2,7 @@ import 'dart:io';
 
 import '../src/rust/api/config.dart';
 import '../src/rust/dto/profile.dart';
+import 'profile_store.dart';
 
 /// Writes profiles and, when asked, the secret file one refers to.
 ///
@@ -80,6 +81,85 @@ class ProfileWriter {
       _deleteQuietly('$replacingPath.user');
     }
     return file;
+  }
+
+  /// Copies a profile, including its secret file.
+  ///
+  /// The secret copy is the point. [writeSecret] names the file after the
+  /// profile id, so a duplicate that pointed at the original's file would look
+  /// correct right up until someone changed the copy's password — and the
+  /// original's credential would be gone, from a gesture that said
+  /// "duplicate". This codebase has shipped that failure twice: once when a
+  /// name collision destroyed another profile's password, once when a refused
+  /// save destroyed the one it was refusing.
+  ///
+  /// Refused if the source's secret is not a `file:` reference or cannot be
+  /// read, rather than producing a copy that points at nothing.
+  Future<File> duplicate(LoadedProfile source) async {
+    final src = source.profile;
+    if (src == null) {
+      throw StateError('a profile that does not parse cannot be duplicated');
+    }
+    if (!src.authSecretSource.startsWith('file:')) {
+      throw StateError(
+        "this profile's secret is not a file, so there is nothing to copy "
+        'alongside it',
+      );
+    }
+    final srcSecret = File(src.authSecretSource.substring('file:'.length));
+    if (!srcSecret.existsSync()) {
+      throw StateError("this profile's secret file is missing");
+    }
+    final secret = srcSecret.readAsStringSync();
+
+    // `checkNameFree` owns what "taken" means, including the slug collapsing
+    // that makes `Home VPS` and `home-vps` the same file. Asking it in a loop
+    // is the whole rule; a single ` copy` suffix can still collide.
+    var name = '${src.name} copy';
+    for (var n = 2;; n++) {
+      try {
+        checkNameFree(name);
+        break;
+      } on StateError {
+        name = '${src.name} copy $n';
+      }
+    }
+
+    final id = await newProfileId();
+    // Where the secret WILL live, named before anything is written — the same
+    // ordering `_save` was fixed to use. Nothing below `checkProfile` runs if
+    // the copy is not a profile the core would accept, so a refusal leaves no
+    // 0600 file behind that no profile names and nothing ever collects.
+    final ref = 'file:${secretPathFor(id)}';
+    final copy = ProfileDto(
+      id: id,
+      name: name,
+      protocol: src.protocol,
+      host: src.host,
+      port: src.port,
+      authKind: src.authKind,
+      authSecretSource: ref,
+      authPassphraseSource: src.authPassphraseSource,
+      peerPublicKey: src.peerPublicKey,
+      cipher: src.cipher,
+      dnsMode: src.dnsMode,
+      dnsServers: src.dnsServers,
+      dohSni: src.dohSni,
+      dohPath: src.dohPath,
+      splitTunnel: src.splitTunnel,
+      splitTunnelApps: src.splitTunnelApps,
+      killSwitch: src.killSwitch,
+    );
+    await checkProfile(dto: copy);
+    await writeSecret(id, secret);
+
+    // The SSH username lives in a sidecar, not in the profile, so it has to be
+    // carried across explicitly or the copy silently loses it.
+    final sidecar = File('${source.path}.user');
+    return writeProfile(
+      copy,
+      sshUser: sidecar.existsSync() ? sidecar.readAsStringSync() : null,
+    );
   }
 
   /// Removes a profile and its sidecar.

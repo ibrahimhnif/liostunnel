@@ -22,12 +22,18 @@ import 'dto_fields.dart';
 
 Future<List<String>> offeredCiphersRust() => rust.offeredCiphers();
 
+// `id` is a parameter because `writeSecret` keys the secret file on the
+// profile id: a test that writes a secret under one id and then saves a
+// profile carrying a *different* one is not describing anything the app can
+// produce, and an assertion about "the copy's id" made against it would hold
+// no matter what `duplicate` did.
 ProfileDto dto({
   String name = 'Home VPS',
   String source = 'file:/tmp/key',
+  String id = 'b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f',
 }) =>
     ProfileDto(
-      id: 'b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f',
+      id: id,
       name: name,
       protocol: 'ssh',
       host: '198.51.100.7',
@@ -132,6 +138,7 @@ void main() {
   editTests();
   dohTests();
   criticalTests();
+  duplicateTests();
 
   test('a fresh id is a distinct UUID each time', () async {
     final a = await newProfileId();
@@ -534,5 +541,153 @@ void criticalTests() {
         ),
       );
     }
+  });
+}
+
+// Duplicating a profile is a convenience; the secret file is the whole of what
+// makes it a safe one. `writeSecret` names the file after the profile id, so a
+// copy that shared the original's file would look correct right up until
+// someone changed the copy's password — and the original's credential would be
+// gone, from a gesture that said "duplicate".
+void duplicateTests() {
+  Future<LoadedProfile> loaded(File f) async => LoadedProfile(
+        path: f.path,
+        profile: await parseProfile(json: f.readAsStringSync()),
+      );
+
+  test('a duplicate gets its own secret file', () async {
+    final dir = Directory.systemTemp.createTempSync('lios-dup');
+    final w = ProfileWriter(directory: dir.path);
+    const id = '11111111-1111-1111-1111-111111111111';
+    final ref = await w.writeSecret(id, 'original-password');
+    final original = await w.writeProfile(dto(id: id, source: ref));
+
+    final copy = await w.duplicate(await loaded(original));
+
+    final copyDto = await parseProfile(json: copy.readAsStringSync());
+    expect(copyDto.id, isNot(id), reason: 'a copy is a different profile');
+    expect(copyDto.authSecretSource, isNot(ref),
+        reason: 'sharing the file means editing the copy destroys the '
+            'original');
+    expect(File(copyDto.authSecretSource.substring(5)).readAsStringSync(),
+        'original-password',
+        reason: 'the copy must carry the credential, not a stub');
+    dir.deleteSync(recursive: true);
+  });
+
+  test('changing the copy leaves the original credential intact', () async {
+    // The failure this exists to prevent. "Duplicate then edit" must not
+    // overwrite the password the ORIGINAL profile still points at.
+    final dir = Directory.systemTemp.createTempSync('lios-dup2');
+    final w = ProfileWriter(directory: dir.path);
+    const id = '11111111-1111-1111-1111-111111111111';
+    final ref = await w.writeSecret(id, 'original-password');
+    final original = await w.writeProfile(dto(id: id, source: ref));
+    final copy = await w.duplicate(await loaded(original));
+
+    final copyDto = await parseProfile(json: copy.readAsStringSync());
+    // Both of the ways a credential gets changed, because they are keyed on
+    // different things and neither alone catches both defects. `writeSecret`
+    // is what the editor calls and it keys on the profile ID, so it catches a
+    // copy that kept the original's id — and nothing else: give the copy a
+    // fresh id but the original's `authSecretSource` and this call lands
+    // harmlessly on a file no profile names, while the copy still points at
+    // the original's credential. Writing through the reference the copy
+    // carries is what "this profile's password" means on disk, and it is the
+    // half that catches that.
+    await w.writeSecret(copyDto.id, 'changed');
+    File(copyDto.authSecretSource.substring(5)).writeAsStringSync('changed');
+
+    expect(File(ref.substring(5)).readAsStringSync(), 'original-password',
+        reason: 'the original credential must survive a change to the copy');
+    dir.deleteSync(recursive: true);
+  });
+
+  test('the copy carries the ssh username', () async {
+    // The username is in a sidecar, not in the profile, so a copy that only
+    // copies the document loses it — and the failure that produces is "the
+    // server rejected the credentials" against a password that is perfectly
+    // good, which sends you after the wrong fix.
+    final dir = Directory.systemTemp.createTempSync('lios-dup7');
+    final w = ProfileWriter(directory: dir.path);
+    const id = '11111111-1111-1111-1111-111111111111';
+    final ref = await w.writeSecret(id, 'p');
+    final original =
+        await w.writeProfile(dto(id: id, source: ref), sshUser: 'hanif');
+
+    final copy = await w.duplicate(await loaded(original));
+
+    expect(File('${copy.path}.user').readAsStringSync(), 'hanif');
+    dir.deleteSync(recursive: true);
+  });
+
+  test('duplicating twice does not collide', () async {
+    final dir = Directory.systemTemp.createTempSync('lios-dup3');
+    final w = ProfileWriter(directory: dir.path);
+    const id = '11111111-1111-1111-1111-111111111111';
+    final ref = await w.writeSecret(id, 'p');
+    final original = await w.writeProfile(dto(id: id, source: ref));
+    final source = await loaded(original);
+    final a = await w.duplicate(source);
+    final b = await w.duplicate(source);
+    expect(a.path, isNot(b.path), reason: 'the second copy needs its own name');
+    dir.deleteSync(recursive: true);
+  });
+
+  test('duplicating a profile whose secret is not a file is refused', () async {
+    // What the refusal SAYS, not merely that something was thrown. Asserting
+    // `contains('secret')` was satisfied by the *next* guard down: `env:PW`
+    // minus five characters is `W`, which does not exist, so "secret file is
+    // missing" answered a test about a secret that is not a file at all. It
+    // passed with this guard deleted and so had no defect to name.
+    final dir = Directory.systemTemp.createTempSync('lios-dup4');
+    final w = ProfileWriter(directory: dir.path);
+    final original = await w.writeProfile(dto(source: 'env:PW'));
+    await expectLater(
+      w.duplicate(await loaded(original)),
+      throwsA(isA<StateError>().having(
+          (e) => '$e', 'message', contains('secret is not a file'))),
+    );
+    dir.deleteSync(recursive: true);
+  });
+
+  test('duplicating a profile whose secret file is gone is refused', () async {
+    // A refusal the caller can put in front of the user, rather than a
+    // FileSystemException out of `readAsStringSync` — and it has to arrive
+    // before the copy exists, not as a profile pointing at an empty file.
+    final dir = Directory.systemTemp.createTempSync('lios-dup5');
+    final w = ProfileWriter(directory: dir.path);
+    const id = '11111111-1111-1111-1111-111111111111';
+    final ref = await w.writeSecret(id, 'p');
+    final original = await w.writeProfile(dto(id: id, source: ref));
+    final source = await loaded(original);
+    File(ref.substring(5)).deleteSync();
+
+    await expectLater(
+      w.duplicate(source),
+      throwsA(isA<StateError>()
+          .having((e) => '$e', 'message', contains('secret file is missing'))),
+    );
+    expect(dir.listSync().whereType<File>().length, 1,
+        reason: 'no half-made copy was left behind');
+    dir.deleteSync(recursive: true);
+  });
+
+  test('duplicating a profile that did not parse is refused', () async {
+    // Reachable: the list deliberately shows files it could not read, so
+    // whatever menu offers Duplicate can be pointed at one. `source.profile!`
+    // would answer with "Null check operator used on a null value", which
+    // names nothing the user can act on.
+    final dir = Directory.systemTemp.createTempSync('lios-dup6');
+    final w = ProfileWriter(directory: dir.path);
+    await expectLater(
+      w.duplicate(LoadedProfile(
+        path: '${dir.path}/broken.json',
+        error: 'not a valid profile',
+      )),
+      throwsA(isA<StateError>()
+          .having((e) => '$e', 'message', contains('does not parse'))),
+    );
+    dir.deleteSync(recursive: true);
   });
 }
