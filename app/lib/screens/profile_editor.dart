@@ -70,6 +70,16 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
   String? _error;
   String? _saved;
 
+  /// The id [_import] wrote the secret file under.
+  ///
+  /// [ProfileWriter.writeSecret] keys the file on the profile id, and that is
+  /// an invariant the profile has to honour: `_save` used to mint a *second*
+  /// id, so every import left a 0600 file no profile named. The connection
+  /// still worked — `authSecretSource` holds the literal path — but nothing
+  /// ever collected the orphan, deletion deliberately does not touch secret
+  /// files, and re-importing to fix a typo left another.
+  String? _importedId;
+
   bool get _editing => widget.existing?.profile != null;
 
   @override
@@ -145,20 +155,39 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       final uri = _uri.text.trim();
       final dto = await importSsUri(uri: uri);
       final password = await ssUriPassword(uri: uri);
+      // The file `writeSecret` produces is named after the id it is given, so
+      // that id has to be the one the saved profile will carry. On an edit
+      // that is the existing profile's, which is stable across saves by
+      // design; only a new profile uses the one the import minted. Using
+      // `dto.id` unconditionally left an orphan 0600 file behind every single
+      // import — nothing collects those, and deletion deliberately never
+      // touches a secret file.
+      final id = widget.existing?.profile?.id ?? dto.id;
       // Straight to a 0600 file. The password is never held in widget state
       // and never reaches the profile document.
-      final ref = await widget.writer.writeSecret(dto.id, password);
+      final ref = await widget.writer.writeSecret(id, password);
 
       if (!mounted) return;
       setState(() {
+        // Kept so `_save` writes the profile under the id whose secret file
+        // was just written, instead of minting a second one and orphaning it.
+        _importedId = id;
         _name.text = dto.name;
         _host.text = dto.host;
         _port.text = dto.port.toString();
         _authKind = 'shadowsocks';
+        // Guaranteed to be an offered cipher: `import_ss_uri` refuses the
+        // rest before it returns, which is what stops this assigning a value
+        // the Cipher dropdown cannot show.
         _cipher = dto.cipher ?? 'aes-256-gcm';
         _secretMode = 'file';
         _secretPath.text = ref.substring('file:'.length);
-        _dns.text = dto.dnsServers.join(', ');
+        // DNS is deliberately NOT touched. An `ss://` link carries no DNS
+        // information, so the DTO's value is a default the FFI had to invent,
+        // and writing it back over the form discarded whatever the user had:
+        // a Quad9 DoH profile kept its mode and SNI but had its resolver
+        // replaced by 1.1.1.1, so the probe dialled Cloudflare presenting
+        // Quad9's name.
         // It contains the password; do not leave it on screen.
         _uri.clear();
       });
@@ -175,12 +204,20 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       _busy = true;
       _error = null;
       _saved = null;
+      // The paste box holds a live credential and is not an input to this
+      // save — the import already took everything it carries. Clearing it
+      // here, rather than only on a successful import, is what stops a failed
+      // import or a toggle of the Authentication dropdown leaving the whole
+      // link legible on screen.
+      _uri.clear();
     });
     try {
       final old = widget.existing?.profile;
       // An edit keeps its id. Minting a new one would make the profile a
       // different server as far as anything keyed on id is concerned.
-      final id = old?.id ?? await newProfileId();
+      // An import keeps the id its secret file was written under, for the
+      // same reason one step down: `writeSecret` keys on the profile id.
+      final id = old?.id ?? _importedId ?? await newProfileId();
 
       // Refuse the name BEFORE writing a secret. Doing it afterwards meant a
       // collision destroyed another profile's credential and then reported
@@ -357,8 +394,14 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
             ),
             if (_authKind == 'shadowsocks') ...[
               const SizedBox(height: 8),
+              // Obscured: an `ss://` link IS the password, so it is a
+              // credential field like any other. It used to be cleared only by
+              // a *successful* import, which left a failed one — or a toggle
+              // of the Authentication dropdown away and back — showing the
+              // whole thing in plain text.
               _text(_uri, 'Paste an ss:// link', key: 'f-uri',
                   hint: 'ss://...',
+                  obscure: true,
                   help: 'Fills in the form from the link. The password is '
                       'written to a 0600 file and never stored in the '
                       'profile.',
@@ -376,7 +419,7 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
                 initialValue: _cipher,
                 decoration: const InputDecoration(labelText: 'Cipher'),
                 items: [
-                  for (final c in offeredCiphers)
+                  for (final c in _cipherItems())
                     DropdownMenuItem(value: c, child: Text(c)),
                 ],
                 onChanged: (v) => setState(() => _cipher = v!),
@@ -465,6 +508,29 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       ),
     );
   }
+
+  /// What the Cipher dropdown offers for the profile in front of it.
+  ///
+  /// [offeredCiphers], plus the profile's own value when this build does not
+  /// offer it. `DropdownButtonFormField` asserts that exactly one of its items
+  /// matches its value, and `method` is a free `String` in the schema: a
+  /// profile written by the CLI naming `2022-blake3-aes-256-gcm` — today's
+  /// default server cipher — made the editor unusable the moment it opened.
+  /// In debug the assertion fired and the whole form became an ErrorWidget; in
+  /// release the assert is stripped and the field rendered blank while the
+  /// rejected name was still what a Save would write.
+  ///
+  /// Shown rather than replaced by a default, deliberately. Shadowsocks has no
+  /// handshake, so a cipher silently substituted here would look exactly like
+  /// a working one and simply discard every packet; the user has to see what
+  /// their profile actually says. Saving it is still refused, by the same
+  /// `check_profile` the Save button already goes through, with a message
+  /// naming what IS offered. This is the treatment `preshared_key` already
+  /// gets in the Authentication dropdown above, for the same reason.
+  List<String> _cipherItems() => [
+        ...offeredCiphers,
+        if (!offeredCiphers.contains(_cipher)) _cipher,
+      ];
 
   Widget _text(
     TextEditingController c,

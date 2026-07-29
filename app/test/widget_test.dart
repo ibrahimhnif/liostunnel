@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
@@ -370,19 +371,89 @@ void _noop() {}
 /// 800x600 test view, so it is never constructed and `tap` finds nothing.
 /// scrollUntilVisible is not the answer here: it calls `.single` on the
 /// scrollable finder and the form has several.
-Future<void> pumpEditor(WidgetTester tester) async {
+Future<void> pumpEditor(
+  WidgetTester tester, {
+  LoadedProfile? existing,
+  String? directory,
+}) async {
   tester.view.physicalSize = const Size(1200, 2400);
   tester.view.devicePixelRatio = 1.0;
   addTearDown(tester.view.reset);
-  await tester.pumpWidget(editor());
+  await tester.pumpWidget(editor(existing: existing, directory: directory));
 }
 
-Widget editor() => MaterialApp(
+Widget editor({LoadedProfile? existing, String? directory}) => MaterialApp(
       home: ProfileEditorScreen(
-        writer: ProfileWriter(directory: '/tmp/lios-editor-test'),
+        writer: ProfileWriter(directory: directory ?? '/tmp/lios-editor-test'),
         onSaved: () {},
+        existing: existing,
       ),
     );
+
+/// A saved Shadowsocks profile, as the store would hand one back.
+LoadedProfile ssProfile({
+  String cipher = 'aes-256-gcm',
+  List<String> dns = const ['1.1.1.1'],
+}) =>
+    LoadedProfile(
+      path: '/tmp/ss.json',
+      profile: ProfileDto(
+        id: 'b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f',
+        name: 'SS',
+        protocol: 'shadowsocks',
+        host: '198.51.100.7',
+        port: 8388,
+        authKind: 'shadowsocks',
+        authSecretSource: 'file:/tmp/ss-key',
+        cipher: cipher,
+        dnsMode: 'tcp',
+        dnsServers: dns,
+        splitTunnel: 'all_traffic',
+        splitTunnelApps: const [],
+        killSwitch: false,
+      ),
+    );
+
+/// A live `ss://` link. The password is only ever in this file's memory and
+/// in the 0600 file the editor writes under a temp directory.
+String ssLink({int port = 8388, String? tag}) {
+  final creds =
+      base64Url.encode(utf8.encode('aes-256-gcm:hunter2')).replaceAll('=', '');
+  return 'ss://$creds@198.51.100.7:$port${tag == null ? '' : '#$tag'}';
+}
+
+/// Presses a button whose handler crosses the FFI, on the real event loop.
+///
+/// The header note above is the reason: `testWidgets` runs its body in a
+/// fake-async zone, and a Future from the bridge never completes there. The
+/// tap happens *inside* `runAsync`, so the handler's awaits are real awaits
+/// rather than ones parked forever in fake time; the delay lets the bridge
+/// answer; the frame that renders the resulting `setState` is pumped
+/// afterwards, outside. Without this the save path has no test at all, which
+/// is how `protocol: 'ssh'` shipped on a Shadowsocks profile.
+Future<void> pressAndSettle(WidgetTester tester, Key key) async {
+  await tester.runAsync(() async {
+    await tester.tap(find.byKey(key));
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+  });
+  await tester.pumpAndSettle();
+}
+
+/// Picks a value from one of the form's dropdowns.
+Future<void> choose(WidgetTester tester, Key dropdown, String label) async {
+  await tester.tap(find.byKey(dropdown));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text(label).last);
+  await tester.pumpAndSettle();
+}
+
+/// The text a form field currently holds.
+String fieldText(WidgetTester tester, Key key) => tester
+    .widget<EditableText>(
+      find.descendant(of: find.byKey(key), matching: find.byType(EditableText)),
+    )
+    .controller
+    .text;
 
 void editorTests() {
   testWidgets('an empty host is refused before anything is written',
@@ -424,5 +495,164 @@ void editorTests() {
     // know why from the form, so the form has to say it up front.
     await pumpEditor(tester);
     expect(find.textContaining('owned by you and mode 0600'), findsOneWidget);
+  });
+
+  testWidgets('a profile whose cipher this build does not offer still opens',
+      (tester) async {
+    // `method` is a free String in the schema, so a CLI-written profile can
+    // name anything. DropdownButtonFormField asserts exactly one item matches
+    // its value: in debug the whole editor became an ErrorWidget the moment it
+    // opened, and in release the assert is stripped and the field rendered
+    // blank while the rejected name was still what would be saved. The form
+    // already carries `preshared_key` for exactly this reason.
+    await pumpEditor(tester, existing: ssProfile(cipher: '2022-blake3-aes-256-gcm'));
+    expect(tester.takeException(), isNull,
+        reason: 'the editor must open, not turn into an ErrorWidget');
+    expect(find.text('2022-blake3-aes-256-gcm'), findsOneWidget,
+        reason: 'and must show what the profile says, not a default it '
+            'silently substituted — shadowsocks has no handshake, so the '
+            'wrong cipher looks exactly like a working one');
+  });
+
+  testWidgets('the paste box is obscured, like any other credential field',
+      (tester) async {
+    // The link IS the password. Only a *successful* import used to clear it,
+    // so a failed one — or toggling Authentication away and back — left the
+    // whole credential legible on screen.
+    await pumpEditor(tester);
+    await choose(tester, const Key('f-auth'), 'Shadowsocks');
+    final editable = tester.widget<EditableText>(
+      find.descendant(
+        of: find.byKey(const Key('f-uri')),
+        matching: find.byType(EditableText),
+      ),
+    );
+    expect(editable.obscureText, isTrue);
+  });
+
+  testWidgets('an unofferable cipher is refused at the paste box, writing '
+      'nothing', (tester) async {
+    // The import used to succeed for any cipher the link named, and the
+    // caller wrote the password to disk before the cipher ever reached the
+    // dropdown that refuses it. An Outline key — `2022-blake3-aes-256-gcm`,
+    // today's default server cipher — therefore destroyed the editor with the
+    // credential already on disk.
+    final dir = Directory.systemTemp.createTempSync('lios-editor-bad-cipher');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final creds = base64Url
+        .encode(utf8.encode('2022-blake3-aes-256-gcm:hunter2'))
+        .replaceAll('=', '');
+
+    await pumpEditor(tester, directory: dir.path);
+    await choose(tester, const Key('f-auth'), 'Shadowsocks');
+    await tester.enterText(
+        find.byKey(const Key('f-uri')), 'ss://$creds@198.51.100.7:8388');
+    await pressAndSettle(tester, const Key('import-button'));
+
+    expect(tester.takeException(), isNull);
+    expect(find.byKey(const Key('editor-error')), findsOneWidget,
+        reason: 'the refusal belongs at the paste box');
+    expect(Directory('${dir.path}/secrets').existsSync(), isFalse,
+        reason: 'nothing may be written before the link is accepted');
+    expect(find.textContaining('2022-blake3'), findsNothing,
+        reason: 'the message may not echo what the user pasted');
+    final message = tester
+        .widget<Text>(find.descendant(
+          of: find.byKey(const Key('editor-error')),
+          matching: find.byType(Text),
+        ))
+        .data!;
+    expect(message, contains('aes-128-gcm'),
+        reason: 'it must name what IS offered');
+    expect(message, isNot(contains('hunter2')));
+  });
+
+  testWidgets('an import leaves the DNS the profile already had', (tester) async {
+    // An ss:// link carries no DNS information, so the form's value wins. The
+    // import used to write its own default over it: a Quad9 profile kept its
+    // mode and SNI but had its resolver replaced by 1.1.1.1, so the DoH probe
+    // dialled Cloudflare presenting Quad9's name.
+    final dir = Directory.systemTemp.createTempSync('lios-editor-dns');
+    addTearDown(() => dir.deleteSync(recursive: true));
+
+    await pumpEditor(tester,
+        existing: ssProfile(dns: const ['9.9.9.9']), directory: dir.path);
+    await tester.enterText(find.byKey(const Key('f-uri')), ssLink());
+    await pressAndSettle(tester, const Key('import-button'));
+
+    expect(find.byKey(const Key('editor-error')), findsNothing);
+    expect(fieldText(tester, const Key('f-host')), '198.51.100.7',
+        reason: 'the import did happen');
+    expect(fieldText(tester, const Key('f-dns')), '9.9.9.9',
+        reason: 'the link says nothing about DNS');
+    // The other half of the orphaned-secret defect: an edit keeps its own id,
+    // so the secret has to be written under that one and not under the fresh
+    // id the import minted.
+    expect(fieldText(tester, const Key('f-secret-path')),
+        endsWith('b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f'),
+        reason: 'the secret file is keyed on the id the profile will carry');
+  });
+
+  testWidgets('an imported link saves as shadowsocks, keyed to its own secret',
+      (tester) async {
+    // Two defects in one gesture. The helper's factory dispatches on
+    // `protocol`, so a profile saved as `ssh` with shadowsocks auth goes to
+    // the SSH tunnel and is refused. And `_import` wrote the secret under the
+    // id the import minted while `_save` minted a second one, so every import
+    // left an orphan 0600 file that deletion never collects.
+    final dir = Directory.systemTemp.createTempSync('lios-editor-import');
+    addTearDown(() => dir.deleteSync(recursive: true));
+
+    await pumpEditor(tester, directory: dir.path);
+    await choose(tester, const Key('f-auth'), 'Shadowsocks');
+    await tester.enterText(find.byKey(const Key('f-uri')), ssLink(tag: 'Home'));
+    await pressAndSettle(tester, const Key('import-button'));
+    expect(find.byKey(const Key('editor-error')), findsNothing);
+
+    await pressAndSettle(tester, const Key('save-button'));
+    expect(find.byKey(const Key('editor-error')), findsNothing);
+    expect(find.byKey(const Key('editor-saved')), findsOneWidget);
+
+    final written = Directory(dir.path)
+        .listSync()
+        .whereType<File>()
+        .where((f) => f.path.endsWith('.json'))
+        .toList();
+    expect(written.length, 1);
+    final doc = jsonDecode(written.single.readAsStringSync())
+        as Map<String, dynamic>;
+    expect(doc['protocol'], 'shadowsocks',
+        reason: 'the factory dispatches on this');
+    expect(doc['auth']['type'], 'shadowsocks');
+    expect(doc['auth']['method'], 'aes-256-gcm');
+
+    final secrets = Directory('${dir.path}/secrets').listSync();
+    expect(secrets.length, 1, reason: 'one import, one secret file');
+    expect(doc['auth']['password']['path'], secrets.single.path,
+        reason: 'the profile must name the file that was written');
+    expect(secrets.single.path, endsWith(doc['id'] as String),
+        reason: 'writeSecret keys on the profile id, so the profile must '
+            'carry the id the import used');
+    expect(File(secrets.single.path).readAsStringSync(), 'hunter2');
+    expect(written.single.readAsStringSync(), isNot(contains('hunter2')));
+  });
+
+  testWidgets('saving clears the paste box', (tester) async {
+    // A link left in the box outlives the save that no longer needs it.
+    final dir = Directory.systemTemp.createTempSync('lios-editor-clear');
+    addTearDown(() => dir.deleteSync(recursive: true));
+
+    await pumpEditor(tester, directory: dir.path);
+    await choose(tester, const Key('f-auth'), 'Shadowsocks');
+    await tester.enterText(find.byKey(const Key('f-name')), 'Manual');
+    await tester.enterText(find.byKey(const Key('f-host')), '198.51.100.7');
+    await tester.enterText(find.byKey(const Key('f-port')), '8388');
+    await tester.enterText(
+        find.byKey(const Key('f-secret-path')), '${dir.path}/key');
+    await tester.enterText(find.byKey(const Key('f-uri')), ssLink());
+
+    await pressAndSettle(tester, const Key('save-button'));
+    expect(find.byKey(const Key('editor-saved')), findsOneWidget);
+    expect(fieldText(tester, const Key('f-uri')), isEmpty);
   });
 }

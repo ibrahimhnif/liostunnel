@@ -7,7 +7,7 @@ import '../dto/profile.dart';
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `parse`
+// These functions are ignored because they are not marked as `pub`: `check_cipher`, `check_pairing`, `parse`
 
 /// Parses a profile JSON document into a UI-shaped DTO.
 ///
@@ -75,6 +75,15 @@ Future<List<String>> offeredCiphers() =>
 /// the credential, so quoting any part of it — the blob, a fragment, "near
 /// here" — puts a live password in a message that reaches a root-owned log
 /// and comes back over the wire.
+///
+/// A cipher this build cannot construct is refused here, BEFORE the DTO
+/// exists. `parse_ss_uri` deliberately does not check the method — the cipher
+/// list has one owner — so this is the first place that can. Doing it later
+/// was worth a crash: the caller writes the password to a `0600` file the
+/// moment the import succeeds and only then puts the cipher in front of a
+/// dropdown that asserts its value is one of its items, so an Outline key
+/// (`2022-blake3-aes-256-gcm`) destroyed the editor with the credential
+/// already on disk.
 Future<ProfileDto> importSsUri({required String uri}) =>
     RustLib.instance.api.crateApiConfigImportSsUri(uri: uri);
 

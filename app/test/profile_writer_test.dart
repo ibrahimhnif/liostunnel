@@ -18,6 +18,33 @@ import 'package:liostunnel_app/src/rust/frb_generated.dart';
 
 Future<List<String>> offeredCiphersRust() => rust.offeredCiphers();
 
+/// Every string a [ProfileDto] carries, joined.
+///
+/// The DTO crosses the FFI and is rendered on screen, so the thing worth
+/// asserting is that no field of it holds secret material. `'$dto'` cannot
+/// say that: the generated class overrides `==` and `hashCode` but not
+/// `toString`, so it prints `Instance of 'ProfileDto'` and any assertion
+/// against it passes no matter what the fields contain.
+String everyFieldOf(ProfileDto d) => [
+      d.id,
+      d.name,
+      d.protocol,
+      d.host,
+      '${d.port}',
+      d.authKind,
+      d.authSecretSource,
+      d.authPassphraseSource ?? '',
+      d.peerPublicKey ?? '',
+      d.cipher ?? '',
+      d.dnsMode,
+      ...d.dnsServers,
+      d.dohSni ?? '',
+      d.dohPath ?? '',
+      d.splitTunnel,
+      ...d.splitTunnelApps,
+      '${d.killSwitch}',
+    ].join(' ');
+
 ProfileDto dto({
   String name = 'Home VPS',
   String source = 'file:/tmp/key',
@@ -442,7 +469,11 @@ void criticalTests() {
     // not be in it -- not in a field, not in its toString.
     expect(imported.authSecretSource, isEmpty,
         reason: 'no file holds this password yet; the caller writes it');
-    expect('$imported', isNot(contains('hunter2')));
+    // Field by field, because `'$imported'` — what this used to assert on —
+    // is inert: the generated ProfileDto overrides `==` and `hashCode` but
+    // not `toString`, so it renders as `Instance of 'ProfileDto'` and no
+    // implementation could have made that assertion fail.
+    expect(everyFieldOf(imported), isNot(contains('hunter2')));
 
     final dir = Directory.systemTemp.createTempSync('lios-ss');
     final w = ProfileWriter(directory: dir.path);
@@ -475,13 +506,25 @@ void criticalTests() {
 
   test('a malformed ss:// link is refused without echoing it', () async {
     // The link IS the credential, so the message may not quote any of it.
+    //
+    // The expected text is asserted, not just the absence of the secret. The
+    // predicate this replaced — `!'$e'.contains('hunter2') && ...` — was
+    // satisfied by *any* throw at all: an uninitialised bridge, a panic, a
+    // refusal for a completely different reason. It had no defect to name.
     final blob =
         base64Url.encode(utf8.encode('no-colon-hunter2')).replaceAll('=', '');
-    await expectLater(
-      importSsUri(uri: 'ss://$blob'),
-      throwsA(predicate((e) =>
-          !'$e'.contains('hunter2') && !'$e'.contains(blob))),
-    );
+    Object? thrown;
+    try {
+      await importSsUri(uri: 'ss://$blob');
+      fail('a link with no method:password in it must be refused');
+    } catch (e) {
+      thrown = e;
+    }
+    final text = '$thrown';
+    expect(text, contains('expected method:password@host:port'),
+        reason: 'the refusal must name the shape it wanted');
+    expect(text, isNot(contains('hunter2')), reason: 'echoed the password');
+    expect(text, isNot(contains(blob)), reason: 'echoed the encoded section');
   });
 
   test('the editor offers exactly the ciphers the core accepts', () async {

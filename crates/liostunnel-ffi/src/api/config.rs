@@ -67,14 +67,17 @@ pub fn check_profile(dto: ProfileDto) -> Result<(), String> {
     // process, minutes later, about a field the form did offer. The name is
     // not echoed back: it is the user's own input, and this error reaches a
     // root-owned log.
-    if let liostunnel_core::config::profile::AuthMethod::Shadowsocks { method, .. } = &core.auth
-        && !liostunnel_core::protocols::shadowsocks::offered_ciphers().contains(&method.as_str())
-    {
-        return Err(format!(
-            "that is not a cipher this build offers; one of: {}",
-            liostunnel_core::protocols::shadowsocks::offered_ciphers().join(", ")
-        ));
+    if let liostunnel_core::config::profile::AuthMethod::Shadowsocks { method, .. } = &core.auth {
+        check_cipher(method)?;
     }
+    // And the pairing itself. Exactly the same reasoning one field over: the
+    // editor's Authentication dropdown can be moved off Shadowsocks on an
+    // imported profile, which leaves `protocol: shadowsocks` beside password
+    // credentials. The cipher check above does not fire (there is no
+    // Shadowsocks auth left to check), the save succeeds, and
+    // `ShadowsocksTunnel::prepare` refuses it at connect time -- another
+    // process, minutes later, about a field the form did offer.
+    check_pairing(&core.protocol, &core.auth)?;
     // Mirrors ServerProfile::validate's DoH rules. Without these the editor
     // happily saved a profile with mode `https` and no endpoint, which the
     // helper then refused at connect time — the failure arriving minutes
@@ -93,6 +96,53 @@ pub fn check_profile(dto: ProfileDto) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Refuses a cipher this build cannot construct, naming only what IS
+/// offered.
+///
+/// Shared by [`check_profile`] and [`import_ss_uri`] so the save path and the
+/// paste box give the same answer. The name the caller supplied is never in
+/// the message: it is user input, and these errors reach a root-owned log and
+/// come back over the wire.
+fn check_cipher(method: &str) -> Result<(), String> {
+    if liostunnel_core::protocols::shadowsocks::offered_ciphers().contains(&method) {
+        return Ok(());
+    }
+    Err(format!(
+        "that is not a cipher this build offers; one of: {}",
+        liostunnel_core::protocols::shadowsocks::offered_ciphers().join(", ")
+    ))
+}
+
+/// Refuses a profile whose protocol and credentials do not go together.
+///
+/// The three pairings below are the only ones any tunnel accepts:
+/// `SshTunnel::connect` answers `Unsupported` to preshared-key and
+/// shadowsocks credentials, and `ShadowsocksTunnel::prepare` refuses both a
+/// non-shadowsocks protocol and non-shadowsocks credentials. Neither the
+/// protocol nor the credential kind is echoed -- both are caller-supplied,
+/// and the actionable half is which pairings exist.
+fn check_pairing(
+    protocol: &liostunnel_core::config::profile::ProtocolKind,
+    auth: &liostunnel_core::config::profile::AuthMethod,
+) -> Result<(), String> {
+    use liostunnel_core::config::profile::{AuthMethod as A, ProtocolKind as P};
+    let agrees = matches!(
+        (protocol, auth),
+        (P::Ssh, A::Password { .. })
+            | (P::Ssh, A::PrivateKey { .. })
+            | (P::WireGuard, A::PresharedKey { .. })
+            | (P::Shadowsocks, A::Shadowsocks { .. })
+    );
+    if agrees {
+        return Ok(());
+    }
+    Err(
+        "this protocol and this kind of credential do not go together; ssh takes a password \
+         or a private key, wireguard a pre-shared key, and shadowsocks its own"
+            .into(),
+    )
 }
 
 /// One-line summary for the profiles list.
@@ -128,11 +178,25 @@ pub fn offered_ciphers() -> Vec<String> {
 /// the credential, so quoting any part of it — the blob, a fragment, "near
 /// here" — puts a live password in a message that reaches a root-owned log
 /// and comes back over the wire.
+///
+/// A cipher this build cannot construct is refused here, BEFORE the DTO
+/// exists. `parse_ss_uri` deliberately does not check the method — the cipher
+/// list has one owner — so this is the first place that can. Doing it later
+/// was worth a crash: the caller writes the password to a `0600` file the
+/// moment the import succeeds and only then puts the cipher in front of a
+/// dropdown that asserts its value is one of its items, so an Outline key
+/// (`2022-blake3-aes-256-gcm`) destroyed the editor with the credential
+/// already on disk.
 pub fn import_ss_uri(uri: String) -> Result<ProfileDto, String> {
     let p = parse(&uri)?;
+    check_cipher(&p.method)?;
     Ok(ProfileDto {
         id: new_profile_id(),
-        name: p.tag.unwrap_or_else(|| p.host.clone()),
+        // `host:port`, not `host`. The name becomes a filename, and two links
+        // to the same host on different ports would otherwise slug to one
+        // file: the second import is refused by `checkNameFree` after the
+        // caller has already written its secret.
+        name: p.tag.unwrap_or_else(|| format!("{}:{}", p.host, p.port)),
         protocol: "shadowsocks".into(),
         host: p.host,
         port: p.port,
@@ -145,7 +209,16 @@ pub fn import_ss_uri(uri: String) -> Result<ProfileDto, String> {
         auth_passphrase_source: None,
         peer_public_key: None,
         dns_mode: "tcp".into(),
-        dns_servers: vec!["1.1.1.1".into()],
+        // A link carries no DNS information at all, and this DTO must still
+        // be valid (`check_profile` refuses an empty list), so this is a
+        // default and nothing more. It is the editor's own new-profile
+        // default, both resolvers: a caller with no form in front of it —
+        // a test, the CLI — should land where the form's user does. One
+        // resolver is not the smaller choice, it is a worse one; `probe_once`
+        // reads `dns.servers.first()` and fails the entire connect on an 8s
+        // timeout if it does not answer. The editor, which has a form,
+        // deliberately ignores this field: see `_import`.
+        dns_servers: vec!["1.1.1.1".into(), "1.0.0.1".into()],
         doh_sni: None,
         doh_path: None,
         split_tunnel: "all_traffic".into(),
@@ -202,16 +275,41 @@ mod tests {
         );
     }
 
-    /// The gap A/B 7 found: `check_profile` accepted any cipher string, so
-    /// the editor could save a profile the helper refuses at connect time --
-    /// minutes later, from another process, about a field the form offered.
+    /// Finding 1. An Outline or shadowsocks-rust key names
+    /// `2022-blake3-aes-256-gcm` -- today's default server cipher -- and the
+    /// import used to copy it straight into the DTO. The caller then wrote
+    /// the password to disk and only afterwards handed the name to a
+    /// dropdown that asserts its value is one of its items, so the editor
+    /// died with the credential already on disk. Refused here, before a DTO
+    /// exists, so nothing is written and the message lands at the paste box.
     #[test]
-    fn a_cipher_this_build_cannot_construct_is_refused_at_save_time() {
+    fn a_cipher_this_build_cannot_construct_is_refused_at_import_time() {
         use base64::Engine;
         let creds =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("2022-blake3-aes-256-gcm:pw");
+        let e = import_ss_uri(format!("ss://{creds}@198.51.100.7:8388#Home")).unwrap_err();
+        assert!(e.contains("aes-256-gcm"), "must say what IS offered: {e}");
+        assert!(
+            !e.contains("2022-blake3"),
+            "must not echo the user's own input: {e}"
+        );
+        assert!(!e.contains("Home"), "nor any other part of the link: {e}");
+    }
+
+    /// The gap A/B 7 found: `check_profile` accepted any cipher string, so
+    /// the editor could save a profile the helper refuses at connect time --
+    /// minutes later, from another process, about a field the form offered.
+    ///
+    /// Reached by hand rather than through `import_ss_uri`, which refuses
+    /// this cipher outright now: the profile can still arrive from a CLI-
+    /// written file, where `method` is a free `String`.
+    #[test]
+    fn a_cipher_this_build_cannot_construct_is_refused_at_save_time() {
+        use base64::Engine;
+        let creds = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("aes-256-gcm:pw");
         let mut dto = import_ss_uri(format!("ss://{creds}@198.51.100.7:8388")).unwrap();
         dto.auth_secret_source = "file:/tmp/k".into();
+        dto.cipher = Some("2022-blake3-aes-256-gcm".into());
         let e = check_profile(dto).unwrap_err();
         assert!(e.contains("aes-256-gcm"), "must say what IS offered: {e}");
         assert!(
@@ -228,6 +326,108 @@ mod tests {
         let mut dto = import_ss_uri(format!("ss://{creds}@198.51.100.7:8388")).unwrap();
         dto.auth_secret_source = "file:/tmp/k".into();
         check_profile(dto).expect("an offered cipher must save");
+    }
+
+    /// Finding 5. One gesture reaches this: open an imported profile and
+    /// change Authentication to Password. `_save` keeps the profile's
+    /// `protocol` and the cipher check does not fire, so the save succeeded
+    /// and `ShadowsocksTunnel::prepare` refused it at connect time -- from
+    /// another process, minutes later, about a field the form did offer.
+    /// That is verbatim the reasoning that justified the cipher check.
+    #[test]
+    fn a_protocol_that_disagrees_with_its_credentials_is_refused_at_save_time() {
+        use base64::Engine;
+        let creds = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("aes-256-gcm:pw");
+        let dto = import_ss_uri(format!("ss://{creds}@198.51.100.7:8388")).unwrap();
+
+        // Authentication switched to Password on a shadowsocks profile.
+        let mut password_on_shadowsocks = dto.clone();
+        password_on_shadowsocks.auth_kind = "password".into();
+        password_on_shadowsocks.cipher = None;
+        password_on_shadowsocks.auth_secret_source = "file:/tmp/k".into();
+        let e = check_profile(password_on_shadowsocks).unwrap_err();
+        assert!(
+            e.contains("shadowsocks"),
+            "must say what a shadowsocks profile needs: {e}"
+        );
+
+        // And the mirror image: shadowsocks credentials on an ssh profile,
+        // which `SshTunnel::connect` refuses as unsupported.
+        let mut shadowsocks_on_ssh = dto;
+        shadowsocks_on_ssh.protocol = "ssh".into();
+        shadowsocks_on_ssh.auth_secret_source = "file:/tmp/k".into();
+        assert!(check_profile(shadowsocks_on_ssh).is_err());
+    }
+
+    #[test]
+    fn every_pairing_the_helper_accepts_still_saves() {
+        // The check must refuse disagreement without refusing the three
+        // combinations that actually connect.
+        let base = ProfileDto {
+            id: new_profile_id(),
+            name: "x".into(),
+            protocol: "ssh".into(),
+            host: "h".into(),
+            port: 22,
+            auth_kind: "password".into(),
+            auth_secret_source: "file:/tmp/k".into(),
+            auth_passphrase_source: None,
+            peer_public_key: None,
+            cipher: None,
+            dns_mode: "tcp".into(),
+            dns_servers: vec!["1.1.1.1".into()],
+            doh_sni: None,
+            doh_path: None,
+            split_tunnel: "all_traffic".into(),
+            split_tunnel_apps: Vec::new(),
+            kill_switch: false,
+        };
+        for (protocol, auth_kind) in [
+            ("ssh", "password"),
+            ("ssh", "private_key"),
+            ("wireguard", "preshared_key"),
+            ("shadowsocks", "shadowsocks"),
+        ] {
+            let dto = ProfileDto {
+                protocol: protocol.into(),
+                auth_kind: auth_kind.into(),
+                peer_public_key: (auth_kind == "preshared_key").then(|| "AAAA".to_string()),
+                cipher: (auth_kind == "shadowsocks").then(|| "aes-256-gcm".to_string()),
+                ..base.clone()
+            };
+            check_profile(dto).unwrap_or_else(|e| panic!("{protocol}/{auth_kind} refused: {e}"));
+        }
+    }
+
+    /// Finding 3. An `ss://` link says nothing about DNS, so the import has
+    /// to return *something*: the same pair the editor's own new-profile
+    /// default uses. A single resolver is not a neutral choice -- `probe_once`
+    /// reads `dns.servers.first()` and fails the whole connect on an 8s
+    /// timeout if it does not answer.
+    #[test]
+    fn an_import_does_not_narrow_dns_to_one_resolver() {
+        use base64::Engine;
+        let creds = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("aes-256-gcm:pw");
+        let dto = import_ss_uri(format!("ss://{creds}@198.51.100.7:8388")).unwrap();
+        assert_eq!(
+            dto.dns_servers,
+            vec!["1.1.1.1".to_string(), "1.0.0.1".to_string()],
+            "the editor's own default for a new profile"
+        );
+    }
+
+    /// Finding 8. The name becomes a filename, and a filename is where two
+    /// profiles collide: both of these slug to `198-51-100-7` if only the
+    /// host is used, so the second import is refused by `checkNameFree` --
+    /// after the caller has already written its secret file.
+    #[test]
+    fn two_untagged_links_to_the_same_host_are_named_apart() {
+        use base64::Engine;
+        let creds = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("aes-256-gcm:pw");
+        let a = import_ss_uri(format!("ss://{creds}@198.51.100.7:8388")).unwrap();
+        let b = import_ss_uri(format!("ss://{creds}@198.51.100.7:8389")).unwrap();
+        assert_eq!(a.name, "198.51.100.7:8388");
+        assert_ne!(a.name, b.name);
     }
 
     #[test]

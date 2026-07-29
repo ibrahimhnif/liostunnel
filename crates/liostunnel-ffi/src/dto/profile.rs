@@ -273,14 +273,25 @@ mod tests {
     /// The cipher is not secret, but the DTO is the value that crosses into
     /// Dart and gets rendered, so what it carries is worth pinning: a
     /// location for the password, never the password.
+    ///
+    /// The material exists on disk here. It has to: the assertion this
+    /// replaced was `!out.contains("\"password\"")` on a *derived* `Debug`,
+    /// which prints field names bare (`password: "…"`) and never quoted, so
+    /// nothing could have made it fail. Pointing the profile at a file that
+    /// really holds a password gives it a defect to name -- a `describe` that
+    /// read the file instead of describing it.
     #[test]
     fn a_shadowsocks_dto_carries_a_location_not_a_password() {
-        let core: ServerProfile = serde_json::from_str(SS).unwrap();
+        let path = std::env::temp_dir().join("lios-dto-ss-key");
+        std::fs::write(&path, "hunter2").unwrap();
+        let at = path.to_str().unwrap();
+        let core: ServerProfile = serde_json::from_str(&SS.replace("/tmp/ss-key", at)).unwrap();
         let dto = ProfileDto::from(core);
         let out = format!("{dto:?}");
-        assert!(out.contains("file:/tmp/ss-key"), "must say where: {out}");
+        std::fs::remove_file(&path).ok();
+        assert!(out.contains(at), "must say where: {out}");
         assert!(
-            !out.contains("\"password\""),
+            !out.contains("hunter2"),
             "must not carry the material itself: {out}"
         );
     }
