@@ -67,7 +67,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.12.0';
 
   @override
-  int get rustContentHash => -1369394092;
+  int get rustContentHash => 336940439;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -89,13 +89,19 @@ abstract class RustLibApi extends BaseApi {
 
   Future<String> crateApiConfigExportProfile({required ProfileDto dto});
 
+  Future<ProfileDto> crateApiConfigImportSsUri({required String uri});
+
   Future<String> crateApiConfigNewProfileId();
+
+  Future<List<String>> crateApiConfigOfferedCiphers();
 
   Future<ProfileDto> crateApiConfigParseProfile({required String json});
 
   Future<String> crateApiConfigProfileSummary({required ProfileDto dto});
 
   Future<int> crateApiProtocolProtocolVersion();
+
+  Future<String> crateApiConfigSsUriPassword({required String uri});
 }
 
 class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
@@ -247,6 +253,34 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "export_profile", argNames: ["dto"]);
 
   @override
+  Future<ProfileDto> crateApiConfigImportSsUri({required String uri}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(uri, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 6,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_profile_dto,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiConfigImportSsUriConstMeta,
+        argValues: [uri],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiConfigImportSsUriConstMeta =>
+      const TaskConstMeta(debugName: "import_ss_uri", argNames: ["uri"]);
+
+  @override
   Future<String> crateApiConfigNewProfileId() {
     return handler.executeNormal(
       NormalTask(
@@ -255,7 +289,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 6,
+            funcId: 7,
             port: port_,
           );
         },
@@ -274,6 +308,33 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       const TaskConstMeta(debugName: "new_profile_id", argNames: []);
 
   @override
+  Future<List<String>> crateApiConfigOfferedCiphers() {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 8,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_list_String,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiConfigOfferedCiphersConstMeta,
+        argValues: [],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiConfigOfferedCiphersConstMeta =>
+      const TaskConstMeta(debugName: "offered_ciphers", argNames: []);
+
+  @override
   Future<ProfileDto> crateApiConfigParseProfile({required String json}) {
     return handler.executeNormal(
       NormalTask(
@@ -283,7 +344,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 7,
+            funcId: 9,
             port: port_,
           );
         },
@@ -311,7 +372,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 8,
+            funcId: 10,
             port: port_,
           );
         },
@@ -338,7 +399,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 9,
+            funcId: 11,
             port: port_,
           );
         },
@@ -355,6 +416,34 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   TaskConstMeta get kCrateApiProtocolProtocolVersionConstMeta =>
       const TaskConstMeta(debugName: "protocol_version", argNames: []);
+
+  @override
+  Future<String> crateApiConfigSsUriPassword({required String uri}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(uri, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 12,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_String,
+        ),
+        constMeta: kCrateApiConfigSsUriPasswordConstMeta,
+        argValues: [uri],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiConfigSsUriPasswordConstMeta =>
+      const TaskConstMeta(debugName: "ss_uri_password", argNames: ["uri"]);
 
   @protected
   String dco_decode_String(dynamic raw) {
@@ -497,8 +586,8 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ProfileDto dco_decode_profile_dto(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
-    if (arr.length != 16)
-      throw Exception('unexpected arr length: expect 16 but see ${arr.length}');
+    if (arr.length != 17)
+      throw Exception('unexpected arr length: expect 17 but see ${arr.length}');
     return ProfileDto(
       id: dco_decode_String(arr[0]),
       name: dco_decode_String(arr[1]),
@@ -509,13 +598,14 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       authSecretSource: dco_decode_String(arr[6]),
       authPassphraseSource: dco_decode_opt_String(arr[7]),
       peerPublicKey: dco_decode_opt_String(arr[8]),
-      dnsMode: dco_decode_String(arr[9]),
-      dnsServers: dco_decode_list_String(arr[10]),
-      dohSni: dco_decode_opt_String(arr[11]),
-      dohPath: dco_decode_opt_String(arr[12]),
-      splitTunnel: dco_decode_String(arr[13]),
-      splitTunnelApps: dco_decode_list_String(arr[14]),
-      killSwitch: dco_decode_bool(arr[15]),
+      cipher: dco_decode_opt_String(arr[9]),
+      dnsMode: dco_decode_String(arr[10]),
+      dnsServers: dco_decode_list_String(arr[11]),
+      dohSni: dco_decode_opt_String(arr[12]),
+      dohPath: dco_decode_opt_String(arr[13]),
+      splitTunnel: dco_decode_String(arr[14]),
+      splitTunnelApps: dco_decode_list_String(arr[15]),
+      killSwitch: dco_decode_bool(arr[16]),
     );
   }
 
@@ -754,6 +844,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     var var_authSecretSource = sse_decode_String(deserializer);
     var var_authPassphraseSource = sse_decode_opt_String(deserializer);
     var var_peerPublicKey = sse_decode_opt_String(deserializer);
+    var var_cipher = sse_decode_opt_String(deserializer);
     var var_dnsMode = sse_decode_String(deserializer);
     var var_dnsServers = sse_decode_list_String(deserializer);
     var var_dohSni = sse_decode_opt_String(deserializer);
@@ -771,6 +862,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       authSecretSource: var_authSecretSource,
       authPassphraseSource: var_authPassphraseSource,
       peerPublicKey: var_peerPublicKey,
+      cipher: var_cipher,
       dnsMode: var_dnsMode,
       dnsServers: var_dnsServers,
       dohSni: var_dohSni,
@@ -1008,6 +1100,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_String(self.authSecretSource, serializer);
     sse_encode_opt_String(self.authPassphraseSource, serializer);
     sse_encode_opt_String(self.peerPublicKey, serializer);
+    sse_encode_opt_String(self.cipher, serializer);
     sse_encode_String(self.dnsMode, serializer);
     sse_encode_list_String(self.dnsServers, serializer);
     sse_encode_opt_String(self.dohSni, serializer);

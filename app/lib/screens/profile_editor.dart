@@ -5,6 +5,23 @@ import '../services/profile_writer.dart';
 import '../src/rust/api/config.dart';
 import '../src/rust/dto/profile.dart';
 
+/// The cipher names the editor offers for Shadowsocks.
+///
+/// Must match `OFFERED` in `crates/liostunnel-core/src/protocols/
+/// shadowsocks.rs` exactly. A name this dropdown offers that the core refuses
+/// is the same bug the core's own list already had once: advice the user
+/// follows and that then fails as unknown. Public so a test can prove the
+/// agreement against the core itself rather than against a second copy of
+/// this list.
+///
+/// The `2022-blake3-*` family is deliberately absent — it cannot be built
+/// under this build's cipher feature set.
+const offeredCiphers = [
+  'aes-128-gcm',
+  'aes-256-gcm',
+  'chacha20-ietf-poly1305',
+];
+
 /// Creates a profile.
 ///
 /// **This form collects where a secret lives, not the secret.** A profile
@@ -43,8 +60,10 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
   final _secret = TextEditingController();
   final _dohSni = TextEditingController();
   final _dohPath = TextEditingController();
+  final _uri = TextEditingController();
 
   String _authKind = 'password';
+  String _cipher = 'aes-256-gcm';
   String _secretMode = 'file';
   String _dnsMode = 'tcp';
   bool _busy = false;
@@ -74,6 +93,7 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
     _authKind = p.authKind;
     _dohSni.text = p.dohSni ?? 'cloudflare-dns.com';
     _dohPath.text = p.dohPath ?? '/dns-query';
+    _cipher = p.cipher ?? 'aes-256-gcm';
 
     // The profile records where the secret lives, so the form can show that
     // much. A password typed on a previous visit is NOT recoverable — it was
@@ -103,10 +123,50 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       _secret,
       _dohSni,
       _dohPath,
+      _uri,
     ]) {
       c.dispose();
     }
     super.dispose();
+  }
+
+  /// Fills the form from an `ss://` link.
+  ///
+  /// Order is load-bearing. The link is parsed first, so a malformed one
+  /// leaves no secret file behind; the password is written before any form
+  /// field is touched, so a failed write leaves the form as it was rather
+  /// than half-filled with a credential that never landed.
+  Future<void> _import() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final uri = _uri.text.trim();
+      final dto = await importSsUri(uri: uri);
+      final password = await ssUriPassword(uri: uri);
+      // Straight to a 0600 file. The password is never held in widget state
+      // and never reaches the profile document.
+      final ref = await widget.writer.writeSecret(dto.id, password);
+
+      if (!mounted) return;
+      setState(() {
+        _name.text = dto.name;
+        _host.text = dto.host;
+        _port.text = dto.port.toString();
+        _authKind = 'shadowsocks';
+        _cipher = dto.cipher ?? 'aes-256-gcm';
+        _secretMode = 'file';
+        _secretPath.text = ref.substring('file:'.length);
+        _dns.text = dto.dnsServers.join(', ');
+        // It contains the password; do not leave it on screen.
+        _uri.clear();
+      });
+    } catch (e) {
+      if (mounted) setState(() => _error = '$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
   }
 
   Future<void> _save() async {
@@ -143,11 +203,18 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
         // profile to ssh, dropped an encrypted key's passphrase reference,
         // turned kill_switch off and reset split_tunnel — on a save where the
         // user had only corrected a typo.
-        protocol: old?.protocol ?? 'ssh',
+        // A Shadowsocks profile must say so. Before this, a link imported
+        // into a NEW profile saved with protocol `ssh` and authKind
+        // `shadowsocks`, and the helper's factory — which dispatches on
+        // protocol — handed it to the SSH tunnel, which refused it.
+        protocol: _authKind == 'shadowsocks'
+            ? 'shadowsocks'
+            : (old?.protocol ?? 'ssh'),
         host: _host.text.trim(),
         port: int.parse(_port.text),
         authKind: _authKind,
         authSecretSource: source,
+        cipher: _authKind == 'shadowsocks' ? _cipher : old?.cipher,
         dnsMode: _dnsMode,
         // Only meaningful for DoH, and required there — a profile with mode
         // `https` and no endpoint is refused by the helper at connect time.
@@ -265,7 +332,8 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
                 return null;
               },
             ),
-            _text(_user, 'SSH username', key: 'f-user'),
+            if (_authKind != 'shadowsocks')
+              _text(_user, 'SSH username', key: 'f-user'),
             const SizedBox(height: 16),
 
             DropdownButtonFormField<String>(
@@ -282,9 +350,38 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
                 // profile is editable and must survive a round trip.
                 DropdownMenuItem(
                     value: 'preshared_key', child: Text('Pre-shared key')),
+                DropdownMenuItem(
+                    value: 'shadowsocks', child: Text('Shadowsocks')),
               ],
               onChanged: (v) => setState(() => _authKind = v!),
             ),
+            if (_authKind == 'shadowsocks') ...[
+              const SizedBox(height: 8),
+              _text(_uri, 'Paste an ss:// link', key: 'f-uri',
+                  hint: 'ss://...',
+                  help: 'Fills in the form from the link. The password is '
+                      'written to a 0600 file and never stored in the '
+                      'profile.',
+                  validator: (_) => null),
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 6),
+                child: FilledButton.tonal(
+                  key: const Key('import-button'),
+                  onPressed: _busy ? null : _import,
+                  child: const Text('Import from link'),
+                ),
+              ),
+              DropdownButtonFormField<String>(
+                key: const Key('f-cipher'),
+                initialValue: _cipher,
+                decoration: const InputDecoration(labelText: 'Cipher'),
+                items: [
+                  for (final c in offeredCiphers)
+                    DropdownMenuItem(value: c, child: Text(c)),
+                ],
+                onChanged: (v) => setState(() => _cipher = v!),
+              ),
+            ],
             const SizedBox(height: 8),
             DropdownButtonFormField<String>(
               key: const Key('f-secret-mode'),

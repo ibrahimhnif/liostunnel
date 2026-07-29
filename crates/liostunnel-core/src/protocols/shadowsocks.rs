@@ -54,6 +54,14 @@ use crate::stats::{ConnectionState, ConnectionStats};
 /// no advice.
 const OFFERED: &[&str] = &["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"];
 
+/// The offered cipher names, for callers that must agree with this list
+/// rather than keep a copy of it -- the editor's dropdown, and the check the
+/// app runs before saving a profile. A second copy is how a UI comes to offer
+/// a cipher the core refuses.
+pub fn offered_ciphers() -> &'static [&'static str] {
+    OFFERED
+}
+
 /// Concurrent ordinary proxied flows. The same figure `SshTunnel` uses
 /// (`ssh::MAX_CONCURRENT_CHANNELS`), for a different reason: there the cap
 /// protects the server's channel limit, here it protects *this process's* file

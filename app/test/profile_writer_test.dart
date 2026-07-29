@@ -1,14 +1,22 @@
 // The permission rules here are the point. The helper refuses any secret file
 // the calling user does not own or that anyone else can read, so a carelessly
 // written one produces a refusal the user cannot diagnose from the UI.
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:liostunnel_app/screens/profile_editor.dart';
 import 'package:liostunnel_app/services/profile_store.dart';
 import 'package:liostunnel_app/services/profile_writer.dart';
-import 'package:liostunnel_app/src/rust/api/config.dart';
+// The editor's `offeredCiphers` and the core's are two different lists with
+// the same name, on purpose: one test's whole job is to prove they agree.
+import 'package:liostunnel_app/src/rust/api/config.dart' hide offeredCiphers;
+import 'package:liostunnel_app/src/rust/api/config.dart' as rust
+    show offeredCiphers;
 import 'package:liostunnel_app/src/rust/dto/profile.dart';
 import 'package:liostunnel_app/src/rust/frb_generated.dart';
+
+Future<List<String>> offeredCiphersRust() => rust.offeredCiphers();
 
 ProfileDto dto({
   String name = 'Home VPS',
@@ -414,5 +422,97 @@ void criticalTests() {
     final again = await w.writeSecret(id, 'new');
     expect(File(again.substring(5)).readAsStringSync(), 'new');
     dir.deleteSync(recursive: true);
+  });
+
+  test('an ss:// link imports without putting the password in the profile',
+      () async {
+    final creds =
+        base64Url.encode(utf8.encode('aes-256-gcm:hunter2')).replaceAll('=', '');
+    const link = 'ss://CREDS@198.51.100.7:8388#Home';
+    final uri = link.replaceFirst('CREDS', creds);
+
+    final imported = await importSsUri(uri: uri);
+    expect(imported.protocol, 'shadowsocks');
+    expect(imported.authKind, 'shadowsocks');
+    expect(imported.cipher, 'aes-256-gcm');
+    expect(imported.name, 'Home');
+    expect(imported.host, '198.51.100.7');
+    expect(imported.port, 8388);
+    // The DTO is rendered on screen and crosses the FFI. The credential must
+    // not be in it -- not in a field, not in its toString.
+    expect(imported.authSecretSource, isEmpty,
+        reason: 'no file holds this password yet; the caller writes it');
+    expect('$imported', isNot(contains('hunter2')));
+
+    final dir = Directory.systemTemp.createTempSync('lios-ss');
+    final w = ProfileWriter(directory: dir.path);
+    final pw = await ssUriPassword(uri: uri);
+    expect(pw, 'hunter2');
+    final ref = await w.writeSecret(imported.id, pw);
+    final file = await w.writeProfile(
+      ProfileDto(
+        id: imported.id,
+        name: imported.name,
+        protocol: imported.protocol,
+        host: imported.host,
+        port: imported.port,
+        authKind: imported.authKind,
+        authSecretSource: ref,
+        cipher: imported.cipher,
+        dnsMode: imported.dnsMode,
+        dnsServers: imported.dnsServers,
+        splitTunnel: imported.splitTunnel,
+        splitTunnelApps: imported.splitTunnelApps,
+        killSwitch: imported.killSwitch,
+      ),
+    );
+    final text = file.readAsStringSync();
+    expect(text, isNot(contains('hunter2')),
+        reason: 'the profile holds the path, never the password');
+    expect(text, contains('aes-256-gcm'));
+    dir.deleteSync(recursive: true);
+  });
+
+  test('a malformed ss:// link is refused without echoing it', () async {
+    // The link IS the credential, so the message may not quote any of it.
+    final blob =
+        base64Url.encode(utf8.encode('no-colon-hunter2')).replaceAll('=', '');
+    await expectLater(
+      importSsUri(uri: 'ss://$blob'),
+      throwsA(predicate((e) =>
+          !'$e'.contains('hunter2') && !'$e'.contains(blob))),
+    );
+  });
+
+  test('the editor offers exactly the ciphers the core accepts', () async {
+    // Compared against the core's own list, not a second copy of it. This is
+    // the assertion that failed to fail on the first attempt: checkProfile
+    // did not validate the cipher at all, so a dropdown entry the core could
+    // never construct sailed through.
+    expect(offeredCiphers, await offeredCiphersRust(),
+        reason: 'the dropdown and the core must offer the same ciphers');
+    for (final c in offeredCiphers) {
+      final creds =
+          base64Url.encode(utf8.encode('$c:pw')).replaceAll('=', '');
+      final d = await importSsUri(uri: 'ss://$creds@198.51.100.7:8388');
+      expect(d.cipher, c);
+      await checkProfile(
+        dto: ProfileDto(
+          id: d.id,
+          name: 'x',
+          protocol: d.protocol,
+          host: d.host,
+          port: d.port,
+          authKind: d.authKind,
+          authSecretSource: 'file:/tmp/k',
+          cipher: d.cipher,
+          dnsMode: d.dnsMode,
+          dnsServers: d.dnsServers,
+          splitTunnel: d.splitTunnel,
+          splitTunnelApps: d.splitTunnelApps,
+          killSwitch: d.killSwitch,
+        ),
+      );
+    }
   });
 }

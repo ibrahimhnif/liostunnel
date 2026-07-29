@@ -24,7 +24,7 @@ class ProfileDto {
   final String host;
   final int port;
 
-  /// `"password"`, `"private_key"` or `"preshared_key"`.
+  /// `"password"`, `"private_key"`, `"preshared_key"` or `"shadowsocks"`.
   final String authKind;
 
   /// Where the material lives — `"file:/path"` or `"env:NAME"` — never the
@@ -37,6 +37,14 @@ class ProfileDto {
 
   /// Public by definition for `preshared_key`; not a secret.
   final String? peerPublicKey;
+
+  /// The Shadowsocks cipher name. `None` for every other protocol.
+  ///
+  /// A cipher name is not secret -- both ends must agree on it in the
+  /// clear -- so it belongs in a value that gets rendered. The password
+  /// that goes with it does not, and never appears here:
+  /// `auth_secret_source` points at the file holding it.
+  final String? cipher;
   final String dnsMode;
   final List<String> dnsServers;
   final String? dohSni;
@@ -55,6 +63,7 @@ class ProfileDto {
     required this.authSecretSource,
     this.authPassphraseSource,
     this.peerPublicKey,
+    this.cipher,
     required this.dnsMode,
     required this.dnsServers,
     this.dohSni,
@@ -75,6 +84,7 @@ class ProfileDto {
       authSecretSource.hashCode ^
       authPassphraseSource.hashCode ^
       peerPublicKey.hashCode ^
+      cipher.hashCode ^
       dnsMode.hashCode ^
       dnsServers.hashCode ^
       dohSni.hashCode ^
@@ -97,6 +107,7 @@ class ProfileDto {
           authSecretSource == other.authSecretSource &&
           authPassphraseSource == other.authPassphraseSource &&
           peerPublicKey == other.peerPublicKey &&
+          cipher == other.cipher &&
           dnsMode == other.dnsMode &&
           dnsServers == other.dnsServers &&
           dohSni == other.dohSni &&

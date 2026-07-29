@@ -31,6 +31,13 @@ pub struct ProfileDto {
     pub auth_passphrase_source: Option<String>,
     /// Public by definition for `preshared_key`; not a secret.
     pub peer_public_key: Option<String>,
+    /// The Shadowsocks cipher name. `None` for every other protocol.
+    ///
+    /// A cipher name is not secret -- both ends must agree on it in the
+    /// clear -- so it belongs in a value that gets rendered. The password
+    /// that goes with it does not, and never appears here:
+    /// `auth_secret_source` points at the file holding it.
+    pub cipher: Option<String>,
     pub dns_mode: String,
     pub dns_servers: Vec<String>,
     pub doh_sni: Option<String>,
@@ -78,8 +85,8 @@ fn undescribe(s: &str, field: &'static str) -> Result<SecretRef, ProfileDtoError
 
 impl From<ServerProfile> for ProfileDto {
     fn from(p: ServerProfile) -> Self {
-        let (auth_kind, secret, passphrase, peer_public_key) = match &p.auth {
-            AuthMethod::Password { password } => ("password", describe(password), None, None),
+        let (auth_kind, secret, passphrase, peer_public_key, cipher) = match &p.auth {
+            AuthMethod::Password { password } => ("password", describe(password), None, None, None),
             AuthMethod::PrivateKey {
                 private_key,
                 passphrase,
@@ -87,6 +94,7 @@ impl From<ServerProfile> for ProfileDto {
                 "private_key",
                 describe(private_key),
                 passphrase.as_ref().map(describe),
+                None,
                 None,
             ),
             AuthMethod::PresharedKey {
@@ -97,14 +105,15 @@ impl From<ServerProfile> for ProfileDto {
                 describe(private_key),
                 None,
                 Some(peer_public_key.clone()),
+                None,
             ),
-            // The cipher name (`method`) has nowhere to land in this DTO yet —
-            // that lands with the Phase 1b config surface (cipher field on
-            // `ProfileDto`). Until then this loses the cipher on the way to
-            // Dart; it does not lose or expose the secret.
-            AuthMethod::Shadowsocks { password, .. } => {
-                ("shadowsocks", describe(password), None, None)
-            }
+            AuthMethod::Shadowsocks { method, password } => (
+                "shadowsocks",
+                describe(password),
+                None,
+                None,
+                Some(method.clone()),
+            ),
         };
 
         let (split_tunnel, split_tunnel_apps) = match &p.split_tunnel {
@@ -128,6 +137,7 @@ impl From<ServerProfile> for ProfileDto {
             auth_secret_source: secret,
             auth_passphrase_source: passphrase,
             peer_public_key,
+            cipher,
             dns_mode: match p.dns.mode {
                 DnsMode::Tcp => "tcp",
                 DnsMode::Https => "https",
@@ -163,6 +173,18 @@ impl TryFrom<ProfileDto> for ServerProfile {
                 peer_public_key: d
                     .peer_public_key
                     .ok_or_else(|| ProfileDtoError::at("peer_public_key"))?,
+            },
+            "shadowsocks" => AuthMethod::Shadowsocks {
+                // A Shadowsocks profile without a cipher is not a profile.
+                // Defaulting one here would pick a cipher on the user's
+                // behalf and hand it to a server that then silently discards
+                // every packet -- Shadowsocks has no handshake to disagree
+                // in, so the wrong cipher looks exactly like a working one.
+                method: d
+                    .cipher
+                    .clone()
+                    .ok_or_else(|| ProfileDtoError::at("cipher"))?,
+                password: secret,
             },
             _ => return Err(ProfileDtoError::at("auth_kind")),
         };
@@ -217,6 +239,51 @@ impl TryFrom<ProfileDto> for ServerProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SS: &str = r#"{
+        "id":"b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f","name":"SS",
+        "protocol":"shadowsocks","host":"198.51.100.7","port":8388,
+        "auth":{"type":"shadowsocks","method":"aes-256-gcm",
+                "password":{"source":"file","path":"/tmp/ss-key"}},
+        "dns":["1.1.1.1"],"split_tunnel":{"type":"all_traffic"},
+        "kill_switch":false}"#;
+
+    /// The asymmetry this closes: before it, `From<ServerProfile>` happily
+    /// emitted `auth_kind: "shadowsocks"` while `TryFrom` had no arm for it,
+    /// so `check_profile` and `export_profile` rejected a profile that
+    /// `parse_profile` had just produced.
+    #[test]
+    fn a_shadowsocks_profile_round_trips_through_the_dto() {
+        let core: ServerProfile = serde_json::from_str(SS).unwrap();
+        let dto = ProfileDto::from(core.clone());
+        assert_eq!(dto.auth_kind, "shadowsocks");
+        assert_eq!(dto.cipher.as_deref(), Some("aes-256-gcm"));
+        assert_eq!(dto.auth_secret_source, "file:/tmp/ss-key");
+        assert_eq!(ServerProfile::try_from(dto).unwrap(), core);
+    }
+
+    #[test]
+    fn a_shadowsocks_dto_without_a_cipher_is_refused() {
+        let core: ServerProfile = serde_json::from_str(SS).unwrap();
+        let mut dto = ProfileDto::from(core);
+        dto.cipher = None;
+        assert!(ServerProfile::try_from(dto).is_err());
+    }
+
+    /// The cipher is not secret, but the DTO is the value that crosses into
+    /// Dart and gets rendered, so what it carries is worth pinning: a
+    /// location for the password, never the password.
+    #[test]
+    fn a_shadowsocks_dto_carries_a_location_not_a_password() {
+        let core: ServerProfile = serde_json::from_str(SS).unwrap();
+        let dto = ProfileDto::from(core);
+        let out = format!("{dto:?}");
+        assert!(out.contains("file:/tmp/ss-key"), "must say where: {out}");
+        assert!(
+            !out.contains("\"password\""),
+            "must not carry the material itself: {out}"
+        );
+    }
 
     const SAMPLE: &str = r#"{
         "id":"b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f","name":"Home VPS",

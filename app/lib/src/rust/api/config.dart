@@ -7,6 +7,8 @@ import '../dto/profile.dart';
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
+// These functions are ignored because they are not marked as `pub`: `parse`
+
 /// Parses a profile JSON document into a UI-shaped DTO.
 ///
 /// Returns a description of the profile, never its secret material.
@@ -48,3 +50,36 @@ Future<void> checkProfile({required ProfileDto dto}) =>
 /// One-line summary for the profiles list.
 Future<String> profileSummary({required ProfileDto dto}) =>
     RustLib.instance.api.crateApiConfigProfileSummary(dto: dto);
+
+/// The cipher names a Shadowsocks profile may use.
+///
+/// Exists so the editor's dropdown can be checked against the core's own
+/// list rather than against a second copy of it. Offering a cipher the core
+/// refuses is advice the user follows and that then fails as unknown -- a bug
+/// the core's own list shipped with once already.
+Future<List<String>> offeredCiphers() =>
+    RustLib.instance.api.crateApiConfigOfferedCiphers();
+
+/// Turns an `ss://` link into a profile the editor can show.
+///
+/// Returns the profile WITHOUT its password: `auth_secret_source` is left
+/// empty and the caller writes the password to a `0600` file, then fills it
+/// in. Returning the password inside the DTO would put a credential in a
+/// value that crosses into Dart and gets rendered on screen — the one thing
+/// this type exists not to do.
+///
+/// The password comes back separately from [`ss_uri_password`], which the
+/// caller feeds straight to the secret writer without ever storing it.
+///
+/// The error deliberately says nothing about the link. An `ss://` URI *is*
+/// the credential, so quoting any part of it — the blob, a fragment, "near
+/// here" — puts a live password in a message that reaches a root-owned log
+/// and comes back over the wire.
+Future<ProfileDto> importSsUri({required String uri}) =>
+    RustLib.instance.api.crateApiConfigImportSsUri(uri: uri);
+
+/// The password from an `ss://` link, for the caller to write to a `0600`
+/// file. Separate from [`import_ss_uri`] so the credential never travels
+/// inside a struct that anything renders.
+Future<String> ssUriPassword({required String uri}) =>
+    RustLib.instance.api.crateApiConfigSsUriPassword(uri: uri);
