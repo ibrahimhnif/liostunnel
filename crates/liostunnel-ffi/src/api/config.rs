@@ -299,11 +299,17 @@ mod tests {
 
     #[test]
     fn exporting_a_non_shadowsocks_profile_is_refused() {
-        let dto = parse_profile(SAMPLE_SSH.into()).unwrap();
+        // The cipher is set deliberately. Without it this test could not tell
+        // the protocol guard from the no-cipher fallback: an SSH profile has
+        // no cipher either, so dropping the protocol guard entirely still
+        // produced a refusal whose message also contains "shadowsocks", and
+        // the A/B that named the guard passed against its absence.
+        let mut dto = parse_profile(SAMPLE_SSH.into()).unwrap();
+        dto.cipher = Some("aes-256-gcm".into());
         let e = export_ss_uri(dto, "pw".into()).unwrap_err();
         assert!(
-            e.contains("shadowsocks"),
-            "must say which protocol this is for: {e}"
+            e.contains("only a shadowsocks profile"),
+            "must be the protocol guard, not the cipher fallback: {e}"
         );
     }
 
@@ -314,8 +320,21 @@ mod tests {
         let mut dto = parse_profile(SAMPLE_SSH.into()).unwrap();
         dto.host = "MARKER-HOST".into();
         dto.name = "MARKER-NAME".into();
+        // `protocol` and `auth_kind` are the two fields the guard actually
+        // reads, so they are the two most likely to end up interpolated into
+        // its message -- and they were the two this test did not mark.
+        dto.protocol = "MARKER-PROTOCOL".into();
+        dto.auth_kind = "MARKER-AUTHKIND".into();
+        dto.cipher = Some("MARKER-CIPHER".into());
         let e = export_ss_uri(dto, "MARKER-PASSWORD".into()).unwrap_err();
-        for marker in ["MARKER-HOST", "MARKER-NAME", "MARKER-PASSWORD"] {
+        for marker in [
+            "MARKER-HOST",
+            "MARKER-NAME",
+            "MARKER-PROTOCOL",
+            "MARKER-AUTHKIND",
+            "MARKER-CIPHER",
+            "MARKER-PASSWORD",
+        ] {
             assert!(!e.contains(marker), "echoed {marker}: {e}");
         }
     }
