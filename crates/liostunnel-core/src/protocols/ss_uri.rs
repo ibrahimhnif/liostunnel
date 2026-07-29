@@ -579,7 +579,21 @@ mod tests {
     /// strips -- so the name comes back truncated or wrong.
     #[test]
     fn a_name_with_uri_syntax_in_it_survives_the_round_trip() {
-        for name in ["Home #2", "a?b", "100%", "My Server", "café", "a&b=c"] {
+        // `%41BC` is the case that makes encoding load-bearing, and it was
+        // missing from this list. The others survive an UNENCODED tag by
+        // accident: `parse_ss_uri` splits on the first `#` only and scopes
+        // the `?`-strip to the pre-fragment body, so `Home #2` and `a?b`
+        // round-trip either way. A name that already looks like an escape
+        // does not -- unencoded, `%41BC` decodes to `ABC`.
+        for name in [
+            "%41BC",
+            "Home #2",
+            "a?b",
+            "100%",
+            "My Server",
+            "café",
+            "a&b=c",
+        ] {
             let link = render_ss_uri("aes-256-gcm", "pw", "h", 1, Some(name));
             let back = parse_ss_uri(&link).expect("must parse");
             assert_eq!(back.tag.as_deref(), Some(name), "link was {link}");
