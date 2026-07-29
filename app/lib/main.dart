@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import 'screens/connection.dart';
@@ -10,6 +11,7 @@ import 'services/connection_model.dart';
 import 'services/helper_client.dart';
 import 'services/profile_store.dart';
 import 'services/profile_writer.dart';
+import 'src/rust/api/config.dart';
 import 'src/rust/api/protocol.dart';
 import 'src/rust/frb_generated.dart';
 
@@ -87,6 +89,58 @@ class _HomePageState extends State<HomePage> {
     if (mounted) setState(() => _profiles = loaded);
   }
 
+  void _toast(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  /// Copies a profile's `ss://` link, after asking.
+  ///
+  /// The link carries the password: there is no secret-free form of one. A
+  /// clipboard is readable by every process running as this user and
+  /// pasteboard managers keep history, so this asks first and names that —
+  /// the same reasoning as the CLI's warning on `export --include-secrets`.
+  ///
+  /// The link itself is never shown. Putting it in the confirmation or the
+  /// snackbar would leave a live credential on screen for a screenshot.
+  Future<void> _copyLink(LoadedProfile p) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Copy this profile as a link?'),
+        content: const Text(
+          'The link contains the password — that is what makes it usable in '
+          'another client. Anything running as you can read the clipboard, '
+          'and clipboard managers keep history.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            key: const Key('confirm-copy'),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Copy'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    try {
+      final source = p.profile!.authSecretSource;
+      if (!source.startsWith('file:')) {
+        _toast('this profile\'s password is not in a file this app can read');
+        return;
+      }
+      final password = File(source.substring('file:'.length)).readAsStringSync();
+      final link = await exportSsUri(dto: p.profile!, password: password);
+      await Clipboard.setData(ClipboardData(text: link));
+      if (mounted) _toast('Link copied. It contains the password.');
+    } catch (e) {
+      if (mounted) _toast('$e');
+    }
+  }
+
   /// Connects to the helper and mirrors everything it pushes into the model.
   ///
   /// Asking for status immediately is what makes a relaunched app re-sync to
@@ -158,6 +212,19 @@ class _HomePageState extends State<HomePage> {
         }),
         onCreate: () => _openEditor(null),
         onEdit: _openEditor,
+        onDuplicate: (p) async {
+          try {
+            await _writer.duplicate(p);
+            await _reload();
+          } catch (e) {
+            if (mounted) _toast('$e');
+          }
+        },
+        onCopyLink: (p) => _copyLink(p),
+        onDelete: (p) async {
+          await _writer.delete(p.path);
+          await _reload();
+        },
       ),
       ConnectionScreen(
         selected: _selected,

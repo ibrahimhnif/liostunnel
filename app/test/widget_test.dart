@@ -207,8 +207,11 @@ void main() {
           selectedPath: null,
           onSelect: (_) {},
           onReload: () {},
-        onCreate: () {},
-        onEdit: _ignore,
+          onCreate: () {},
+          onEdit: _ignore,
+          onDuplicate: _ignore,
+          onCopyLink: _ignore,
+          onDelete: _ignore,
         ),
       ),
     );
@@ -234,8 +237,11 @@ void main() {
           selectedPath: null,
           onSelect: (_) {},
           onReload: () {},
-        onCreate: () {},
-        onEdit: _ignore,
+          onCreate: () {},
+          onEdit: _ignore,
+          onDuplicate: _ignore,
+          onCopyLink: _ignore,
+          onDelete: _ignore,
         ),
       ),
     );
@@ -243,12 +249,15 @@ void main() {
     expect(find.text('not a valid profile'), findsOneWidget);
   });
 
-  testWidgets('every row has an edit button, including a broken one',
+  testWidgets('every row has a menu offering Edit, including a broken one',
       (tester) async {
-    // The feature shipped with this button on the BROKEN-profile branch only:
-    // a patch failed to match the healthy branch after dart format rewrapped
-    // it, and nothing asserted the affordance existed. The whole feature was
-    // unreachable for every profile that actually parsed, with a green suite.
+    // The affordance shipped once on the BROKEN-profile branch only: a patch
+    // failed to match the healthy branch after dart format rewrapped it, and
+    // nothing asserted it existed. The whole feature was unreachable for every
+    // profile that actually parsed, with a green suite. Editing moved from a
+    // per-row IconButton into this menu when Duplicate, Copy and Delete
+    // arrived; the invariant did not move with it, so it is restated here
+    // against the menu.
     const broken = LoadedProfile(path: '/tmp/b.json', error: 'not a valid profile');
     await tester.pumpWidget(MaterialApp(
       home: ProfilesScreen(
@@ -259,19 +268,28 @@ void main() {
         onReload: _noop,
         onCreate: _noop,
         onEdit: _ignore,
+        onDuplicate: _ignore,
+        onCopyLink: _ignore,
+        onDelete: _ignore,
       ),
     ));
-    expect(find.byIcon(Icons.edit_outlined), findsNWidgets(2));
-    expect(find.byKey(ValueKey('edit-${aProfile.path}')), findsOneWidget,
-        reason: 'a healthy profile must be editable');
-    expect(find.byKey(const ValueKey('edit-/tmp/b.json')), findsOneWidget,
-        reason: 'and a broken one especially so');
-    // The selected row shows both a tick and an edit button.
+    expect(find.byType(PopupMenuButton<String>), findsNWidgets(2));
+    for (final path in [aProfile.path, '/tmp/b.json']) {
+      expect(find.byKey(ValueKey('menu-$path')), findsOneWidget,
+          reason: 'every row carries one, healthy or broken');
+      await tester.tap(find.byKey(ValueKey('menu-$path')));
+      await tester.pumpAndSettle();
+      expect(find.text('Edit'), findsOneWidget,
+          reason: 'and a broken profile especially needs opening and repairing');
+      // Dismiss it: the next row's menu cannot be opened over this one.
+      await tester.tap(find.text('Edit'));
+      await tester.pumpAndSettle();
+    }
+    // The selected row shows both a tick and a menu.
     expect(find.byIcon(Icons.check), findsOneWidget);
   });
 
-  testWidgets('the edit button reports which profile it belongs to',
-      (tester) async {
+  testWidgets('the menu reports which profile it belongs to', (tester) async {
     LoadedProfile? edited;
     await tester.pumpWidget(MaterialApp(
       home: ProfilesScreen(
@@ -282,10 +300,52 @@ void main() {
         onReload: _noop,
         onCreate: _noop,
         onEdit: (p) => edited = p,
+        onDuplicate: _ignore,
+        onCopyLink: _ignore,
+        onDelete: _ignore,
       ),
     ));
-    await tester.tap(find.byKey(ValueKey('edit-${aProfile.path}')));
+    await tester.tap(find.byKey(ValueKey('menu-${aProfile.path}')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Edit'));
+    await tester.pumpAndSettle();
     expect(edited?.path, aProfile.path);
+  });
+
+  testWidgets('each entry reports the row it was chosen from', (tester) async {
+    // One `onSelected` switch serves four entries and four callbacks, and
+    // nothing else in this file would notice two of them wired to the same
+    // one. Duplicate and Delete are the pair worth pinning: both act on a
+    // profile without opening anything first, so a swap is invisible until
+    // after it has happened.
+    final called = <String, String>{};
+    await tester.pumpWidget(MaterialApp(
+      home: ProfilesScreen(
+        profiles: [ssProfile(path: '/tmp/ss.json')],
+        directory: '/tmp/whatever',
+        selectedPath: null,
+        onSelect: _ignore,
+        onReload: _noop,
+        onCreate: _noop,
+        onEdit: (p) => called['edit'] = p.path,
+        onDuplicate: (p) => called['duplicate'] = p.path,
+        onCopyLink: (p) => called['copy'] = p.path,
+        onDelete: (p) => called['delete'] = p.path,
+      ),
+    ));
+    for (final entry in {
+      'Duplicate': 'duplicate',
+      'Copy ss:// link': 'copy',
+      'Delete': 'delete',
+    }.entries) {
+      await tester.tap(find.byKey(const ValueKey('menu-/tmp/ss.json')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text(entry.key));
+      await tester.pumpAndSettle();
+      expect(called, {entry.value: '/tmp/ss.json'},
+          reason: '${entry.key} must call ${entry.value} and nothing else');
+      called.clear();
+    }
   });
 
   testWidgets('tapping a profile selects it', (tester) async {
@@ -299,8 +359,11 @@ void main() {
           selectedPath: null,
           onSelect: (p) => picked = p,
           onReload: () {},
-        onCreate: () {},
-        onEdit: _ignore,
+          onCreate: () {},
+          onEdit: _ignore,
+          onDuplicate: _ignore,
+          onCopyLink: _ignore,
+          onDelete: _ignore,
         ),
       ),
     );
@@ -321,10 +384,94 @@ void main() {
           onReload: _noop,
           onCreate: _noop,
           onEdit: _ignore,
+          onDuplicate: _ignore,
+          onCopyLink: _ignore,
+          onDelete: _ignore,
         ),
       ),
     );
     expect(find.textContaining('/somewhere/.liostunnel'), findsOneWidget);
+  });
+
+  testWidgets('search filters by name and by host', (tester) async {
+    // Host as well as name: a provider's profiles are often all called some
+    // variation of its own name, and the address is what tells them apart.
+    await tester.pumpWidget(MaterialApp(
+      home: ProfilesScreen(
+        profiles: [
+          ssProfile(name: 'Home', host: '198.51.100.7', path: '/tmp/home.json'),
+          ssProfile(name: 'Work', host: '203.0.113.9', path: '/tmp/work.json'),
+        ],
+        directory: '/tmp',
+        selectedPath: null,
+        onSelect: _ignore,
+        onReload: _noop,
+        onCreate: _noop,
+        onEdit: _ignore,
+        onDuplicate: _ignore,
+        onCopyLink: _ignore,
+        onDelete: _ignore,
+      ),
+    ));
+    expect(find.text('Home'), findsOneWidget);
+    expect(find.text('Work'), findsOneWidget);
+
+    await tester.enterText(find.byKey(const Key('profile-search')), 'wor');
+    await tester.pumpAndSettle();
+    expect(find.text('Home'), findsNothing, reason: 'filtered by name');
+    expect(find.text('Work'), findsOneWidget);
+
+    await tester.enterText(find.byKey(const Key('profile-search')), '198.51');
+    await tester.pumpAndSettle();
+    expect(find.text('Home'), findsOneWidget, reason: 'filtered by host');
+    expect(find.text('Work'), findsNothing);
+  });
+
+  testWidgets('the copy-link entry appears only on shadowsocks profiles',
+      (tester) async {
+    await tester.pumpWidget(MaterialApp(
+      home: ProfilesScreen(
+        profiles: [sshProfile(path: '/tmp/ssh.json', keyPath: '/tmp/k')],
+        directory: '/tmp',
+        selectedPath: null,
+        onSelect: _ignore,
+        onReload: _noop,
+        onCreate: _noop,
+        onEdit: _ignore,
+        onDuplicate: _ignore,
+        onCopyLink: _ignore,
+        onDelete: _ignore,
+      ),
+    ));
+    await tester.tap(find.byKey(const ValueKey('menu-/tmp/ssh.json')));
+    await tester.pumpAndSettle();
+    expect(find.text('Copy ss:// link'), findsNothing,
+        reason: 'ss:// cannot represent an SSH profile');
+    expect(find.text('Duplicate'), findsOneWidget);
+  });
+
+  testWidgets('a broken profile offers only edit and delete', (tester) async {
+    await tester.pumpWidget(MaterialApp(
+      home: ProfilesScreen(
+        profiles: const [LoadedProfile(path: '/tmp/bad.json', error: 'nope')],
+        directory: '/tmp',
+        selectedPath: null,
+        onSelect: _ignore,
+        onReload: _noop,
+        onCreate: _noop,
+        onEdit: _ignore,
+        onDuplicate: _ignore,
+        onCopyLink: _ignore,
+        onDelete: _ignore,
+      ),
+    ));
+    await tester.tap(find.byKey(const ValueKey('menu-/tmp/bad.json')));
+    await tester.pumpAndSettle();
+    expect(find.text('Edit'), findsOneWidget);
+    expect(find.text('Delete'), findsOneWidget);
+    expect(find.text('Duplicate'), findsNothing,
+        reason: 'there is nothing to duplicate');
+    expect(find.text('Copy ss:// link'), findsNothing);
   });
 
   test('the store reads and parses real files through the FFI', () async {
@@ -391,19 +538,24 @@ Widget editor({LoadedProfile? existing, String? directory}) => MaterialApp(
     );
 
 /// A saved Shadowsocks profile, as the store would hand one back.
+///
+/// [name] and [host] are parameters because the profiles list searches on
+/// both, and telling two profiles apart in that test needs two of each.
 LoadedProfile ssProfile({
   String cipher = 'aes-256-gcm',
   List<String> dns = const ['1.1.1.1'],
   String path = '/tmp/ss.json',
   String source = 'file:/tmp/ss-key',
+  String name = 'SS',
+  String host = '198.51.100.7',
 }) =>
     LoadedProfile(
       path: path,
       profile: ProfileDto(
         id: ssProfileId,
-        name: 'SS',
+        name: name,
         protocol: 'shadowsocks',
-        host: '198.51.100.7',
+        host: host,
         port: 8388,
         authKind: 'shadowsocks',
         authSecretSource: source,
