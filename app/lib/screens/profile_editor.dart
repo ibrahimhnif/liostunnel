@@ -115,6 +115,24 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
 
   bool get _editing => widget.existing?.profile != null;
 
+  /// Whether the `ss://` paste box is on screen.
+  ///
+  /// One predicate, named once. `_save`'s guard against a pasted-but-not-
+  /// imported link and the box's own render condition have to agree exactly —
+  /// a guard that fires while the box is hidden refuses a save over a field
+  /// the user cannot see, and one that does not fire while the box is visible
+  /// discards a credential under a green "Saved to …". They were two separate
+  /// literals of `!_editing`, which is the arrangement this file has already
+  /// been bitten by: a change landed on one of two branches because
+  /// `dart format` had rewrapped the other.
+  bool get _linkRowVisible => !_editing;
+
+  /// Opens and closes the Advanced section from code.
+  ///
+  /// Held here so [_save] can open it when the helper refuses something it
+  /// hides — see [_namesSomethingAdvanced].
+  final _advanced = ExpansibleController();
+
   @override
   void initState() {
     super.initState();
@@ -170,6 +188,9 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
     ]) {
       c.dispose();
     }
+    // Ours, not the tile's: ExpansionTile only disposes a controller it made
+    // itself.
+    _advanced.dispose();
     super.dispose();
   }
 
@@ -307,16 +328,19 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       // permanently true after the first import, so the profile was written
       // with the OLD password under a green "Saved to …".
       //
-      // Only when the box is on screen, and that is now `!_editing` rather
-      // than "the Authentication dropdown says Shadowsocks". The paste box no
-      // longer lives behind that dropdown — importing is what decides the
-      // protocol — so keying on `_authKind` would have let the commonest case
-      // through untouched: paste a link into a brand-new profile whose
-      // authentication still reads Password, fill the rest in by hand, press
-      // Save, and the credential in front of the user is discarded under a
-      // green "Saved to …". Refusing a save over a field the user cannot see
+      // Only when the box is on screen, and that is [_linkRowVisible] — the
+      // very getter the box is rendered under, rather than a second literal
+      // of the same condition — rather than "the Authentication dropdown says
+      // Shadowsocks". The paste box no longer lives behind that dropdown —
+      // importing is what decides the protocol — so keying on `_authKind`
+      // would have let the commonest case through untouched: paste a link
+      // into a brand-new profile whose authentication still reads Password,
+      // fill the rest in by hand, press Save, and the credential in front of
+      // the user is discarded under a green "Saved to …".
+      //
+      // Refusing a save over a field the user cannot see
       // would be its own trap, which is why this is still conditional at all.
-      if (!_editing &&
+      if (_linkRowVisible &&
           _uri.text.trim().isNotEmpty &&
           _uri.text.trim() != _importedUri) {
         throw StateError(
@@ -420,11 +444,32 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
       widget.onSaved();
     } catch (e) {
       if (!mounted) return;
+      // A refusal about a field behind the collapse has to bring the field
+      // with it. The message lands in the card at the top of the form, and
+      // "the DoH path must start with `/`" over a form with no DoH path on it
+      // is advice the user cannot act on.
+      if (_namesSomethingAdvanced('$e')) _advanced.expand();
       setState(() => _error = '$e');
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
+
+  /// Whether a refusal is about a field the Advanced section hides.
+  ///
+  /// Deliberately NOT `maintainState: true` on the section instead. Keeping
+  /// the children alive behind the collapse would put the form's own
+  /// validators back in play from somewhere invisible, so Save would do
+  /// nothing at all and say nothing either — strictly worse than an error card
+  /// naming a field you then have to go and find.
+  ///
+  /// Matched on the message rather than on which check failed, because the
+  /// messages come from Rust — `check_profile`'s DoH rules and the DTO
+  /// conversion's field names (`dns_mode`, `dns_servers`, `doh_sni/doh_path`)
+  /// — and there is no structured error to switch on. Opening the section for
+  /// a message that merely happens to contain "dns" costs the user nothing.
+  static bool _namesSomethingAdvanced(String message) =>
+      RegExp('dns|doh', caseSensitive: false).hasMatch(message);
 
   /// Deletes, after asking.
   ///
@@ -442,10 +487,52 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
 
   /// What the credential field is called, for the protocol in play.
   ///
-  /// The same two widgets serve an SSH private key and a Shadowsocks
-  /// password, which is fine — but labelling a key file "Password" is not.
-  String get _secretLabel =>
-      _authKind == 'private_key' ? 'Private key' : 'Password';
+  /// The same two widgets serve an SSH private key, a WireGuard pre-shared key
+  /// and a Shadowsocks password, which is fine — but labelling either key
+  /// "Password" is not. `preshared_key` fell to the `else` of a ternary and
+  /// was called a password, which is the same mislabelling one credential
+  /// over.
+  String get _secretLabel => switch (_authKind) {
+        'private_key' => 'Private key',
+        'preshared_key' => 'Pre-shared key',
+        _ => 'Password',
+      };
+
+  /// What the *path* field is called, and what it suggests.
+  ///
+  /// Split from [_secretLabel] because "Path to the private key file" reads
+  /// worse than the name the field has always had, and because the hint is a
+  /// third thing again: an unconditional `/Users/you/.ssh/id_ed25519` told a
+  /// Shadowsocks profile to point its password at an SSH key, which is advice
+  /// rather than a placeholder.
+  String get _secretPathLabel => switch (_authKind) {
+        'private_key' => 'Path to the key file',
+        'preshared_key' => 'Path to the pre-shared key file',
+        _ => 'Path to the password file',
+      };
+
+  String get _secretPathHint => switch (_authKind) {
+        'private_key' => '/Users/you/.ssh/id_ed25519',
+        'preshared_key' => '/Users/you/.liostunnel/secrets/wg-psk',
+        _ => '/Users/you/.liostunnel/secrets/password',
+      };
+
+  /// Whether the credential in play is a key file rather than something a
+  /// person can type.
+  ///
+  /// [_text] builds a one-line field, and it cannot be made multi-line while
+  /// it is obscured — `TextField` asserts `!obscureText || maxLines == 1`, so
+  /// the alternative to hiding the typed mode is rendering key material
+  /// legibly on screen. An OpenSSH private key is a multi-line PEM document:
+  /// offering "Type it" for one invites a paste whose newlines do not survive,
+  /// [ProfileWriter.writeSecret] writes the mangled blob, `check_profile` sees
+  /// a perfectly well-formed `(Ssh, PrivateKey)` pairing, the save reports
+  /// success, and the failure arrives at connect time from another process.
+  ///
+  /// Nothing is lost by removing it: a key you already have IS a file, which
+  /// is exactly what the other mode is for. A WireGuard pre-shared key is one
+  /// line of base64 and keeps both modes.
+  bool get _secretIsAKeyFile => _authKind == 'private_key';
 
   @override
   Widget build(BuildContext context) {
@@ -490,13 +577,23 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
             // NOT gated on picking Shadowsocks from a dropdown -- importing
             // is what decides the protocol.
             //
-            // Create only. On an edit you are not re-importing, and a link
-            // sitting here on a save is what let a rotation be silently
-            // discarded.
+            // Shown whenever the editor is not editing a profile that parsed
+            // — which is NOT the same as "there is no file". `_editing` is
+            // `existing?.profile != null`, and the profiles list offers Edit
+            // on a broken row too, deliberately and under test. So opening an
+            // unreadable profile to repair it lands here with a path, no
+            // profile, and the link row on screen. That is the right answer:
+            // re-importing is a plausible repair for a Shadowsocks profile
+            // nothing can read, and the save replaces the file it came from.
+            //
+            // On an edit proper you are not re-importing, and a link sitting
+            // here on a save is what let a rotation be silently discarded —
+            // which is why [_linkRowVisible], and not a second copy of this
+            // condition, is what `_save`'s guard keys on.
             //
             // Obscured: an `ss://` link IS the password, so it is a
             // credential field like any other.
-            if (!_editing) ...[
+            if (_linkRowVisible) ...[
               _text(_uri, 'Paste an ss:// link', key: 'f-uri',
                   hint: 'ss://...',
                   obscure: true,
@@ -546,7 +643,15 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
                 DropdownMenuItem(
                     value: 'shadowsocks', child: Text('Shadowsocks')),
               ],
-              onChanged: (v) => setState(() => _authKind = v!),
+              onChanged: (v) => setState(() {
+                _authKind = v!;
+                // The mode dropdown below drops "Type it" for a key file, and
+                // DropdownButtonFormField asserts that exactly one of its
+                // items matches its value: leaving `_secretMode` on `typed`
+                // here turned the whole form into an ErrorWidget. Same
+                // assertion the Cipher dropdown already has to dodge.
+                if (_secretIsAKeyFile) _secretMode = 'file';
+              }),
             ),
             if (_authKind == 'shadowsocks') ...[
               const SizedBox(height: 8),
@@ -566,11 +671,16 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
               key: const Key('f-secret-mode'),
               initialValue: _secretMode,
               decoration: const InputDecoration(labelText: 'Where the secret lives'),
-              items: const [
-                DropdownMenuItem(
+              items: [
+                const DropdownMenuItem(
                     value: 'file', child: Text('A file I already have')),
-                DropdownMenuItem(
-                    value: 'typed', child: Text('Type it — save to a 0600 file')),
+                // Not offered for a key file — see [_secretIsAKeyFile]. The
+                // option, not just the field: a label that invites a gesture
+                // the widget silently mangles is the defect.
+                if (!_secretIsAKeyFile)
+                  const DropdownMenuItem(
+                      value: 'typed',
+                      child: Text('Type it — save to a 0600 file')),
               ],
               onChanged: (v) => setState(() => _secretMode = v!),
             ),
@@ -587,13 +697,9 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
             else
               _text(
                 _secretPath,
-                _authKind == 'private_key'
-                    ? 'Path to the key file'
-                    : 'Path to the password file',
+                _secretPathLabel,
                 key: 'f-secret-path',
-                hint: _authKind == 'private_key'
-                    ? '/Users/you/.ssh/id_ed25519'
-                    : '/Users/you/.liostunnel/secrets/password',
+                hint: _secretPathHint,
                 help: 'Must be owned by you and mode 0600, or the helper will '
                     'refuse it.',
               ),
@@ -604,6 +710,9 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
             // with the fields you actually edit.
             ExpansionTile(
               key: const Key('advanced-section'),
+              // So a refusal naming a DNS or DoH field can open the section
+              // that holds it — see [_namesSomethingAdvanced].
+              controller: _advanced,
               title: const Text('Advanced'),
               subtitle: const Text('DNS and DNS-over-HTTPS'),
               children: [

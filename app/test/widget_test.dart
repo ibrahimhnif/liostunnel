@@ -981,6 +981,41 @@ LoadedProfile sshProfile({required String path, required String keyPath}) =>
       ),
     );
 
+/// A saved profile whose DoH endpoint is wrong in a way only the helper's own
+/// check catches.
+///
+/// [dohPath] without a leading `/` is refused by `check_profile` — and by
+/// `ServerProfile::validate` after it — but not by anything in the DTO
+/// conversion, so it survives as far as the save. [sshUser] is filled in
+/// because the SSH username field is required and an edit loads it from the
+/// sidecar: without it the form's own validator refuses the save before
+/// `checkProfile` is ever reached.
+LoadedProfile dohProfile({
+  required String path,
+  required String dohPath,
+  required String secretPath,
+}) =>
+    LoadedProfile(
+      path: path,
+      sshUser: 'someone',
+      profile: ProfileDto(
+        id: '22222222-3333-4444-5555-666666666666',
+        name: 'DoH VPS',
+        protocol: 'ssh',
+        host: '198.51.100.11',
+        port: 22,
+        authKind: 'password',
+        authSecretSource: 'file:$secretPath',
+        dnsMode: 'https',
+        dohSni: 'cloudflare-dns.com',
+        dohPath: dohPath,
+        dnsServers: const ['1.1.1.1'],
+        splitTunnel: 'all_traffic',
+        splitTunnelApps: const [],
+        killSwitch: false,
+      ),
+    );
+
 /// A live `ss://` link. The password is only ever in this file's memory and
 /// in the 0600 file the editor writes under a temp directory.
 String ssLink({
@@ -1019,6 +1054,17 @@ Future<void> choose(WidgetTester tester, Key dropdown, String label) async {
   await tester.tap(find.text(label).last);
   await tester.pumpAndSettle();
 }
+
+/// The decoration a form field was built with.
+///
+/// Read off the widget rather than looked for on screen: a hint is only
+/// painted while the field is empty, and a label like "Pre-shared key" is also
+/// the text of a dropdown entry, so `find.text` cannot say which one it found.
+InputDecoration decorationOf(WidgetTester tester, Key key) => tester
+    .widget<TextField>(
+      find.descendant(of: find.byKey(key), matching: find.byType(TextField)),
+    )
+    .decoration!;
 
 /// The text a form field currently holds.
 String fieldText(WidgetTester tester, Key key) => tester
@@ -1645,17 +1691,194 @@ void editorTests() {
   });
 
   testWidgets('the credential field names what it actually is', (tester) async {
+    // The private-key half of this test used to type a key into `f-secret`,
+    // which is the gesture 'a private key cannot be typed into one obscured
+    // line' now refuses outright; what a key is called is asserted on the path
+    // field instead, by 'the path field names the credential it points at'.
     final dir = Directory.systemTemp.createTempSync('lios-label');
     addTearDown(() => dir.deleteSync(recursive: true));
     await pumpEditor(tester, directory: dir.path);
 
-    await choose(tester, const Key('f-auth'), 'Private key');
     await choose(
         tester, const Key('f-secret-mode'), 'Type it — save to a 0600 file');
-    expect(find.widgetWithText(TextFormField, 'Private key'), findsOneWidget,
-        reason: 'calling an SSH key "Password" is wrong');
+    expect(decorationOf(tester, const Key('f-secret')).labelText, 'Password');
+
+    // WireGuard's pre-shared key is not a password. It is one line of base64,
+    // so unlike a private key it can honestly be typed here — which is why
+    // this case keeps the typed field and the private-key one does not.
+    await choose(tester, const Key('f-auth'), 'Pre-shared key');
+    expect(decorationOf(tester, const Key('f-secret')).labelText,
+        'Pre-shared key',
+        reason: 'a WireGuard pre-shared key called "Password" is the same '
+            'mislabelling one credential over');
 
     await choose(tester, const Key('f-auth'), 'Shadowsocks');
-    expect(find.widgetWithText(TextFormField, 'Password'), findsOneWidget);
+    expect(decorationOf(tester, const Key('f-secret')).labelText, 'Password');
+  });
+
+  testWidgets('a private key cannot be typed into one obscured line',
+      (tester) async {
+    // `_text` builds a one-line field, and it cannot be made multi-line while
+    // it is obscured: `TextField` asserts `!obscureText || maxLines == 1`, so
+    // the only way to accept a pasted OpenSSH key here would be to render key
+    // material legibly on screen. Offering "type it" for a key therefore
+    // invites a paste whose newlines are dropped on the way in — `writeSecret`
+    // writes the mangled blob, `check_profile` sees a well-formed
+    // (Ssh, PrivateKey) pairing, the save reports success, and the failure
+    // arrives at connect time from another process.
+    //
+    // A key you already have IS a file, which is exactly what the other mode
+    // is for, so nothing is lost by removing the option.
+    final dir = Directory.systemTemp.createTempSync('lios-keymode');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    await pumpEditor(tester, directory: dir.path);
+
+    // Switched to the typed mode FIRST, so the auth change has to pull the
+    // mode back with it: `DropdownButtonFormField` asserts that exactly one
+    // item matches its value, and a value of `typed` beside items that no
+    // longer offer it turns the whole form into an ErrorWidget — the same
+    // assertion the Cipher dropdown already has to dodge.
+    await choose(
+        tester, const Key('f-secret-mode'), 'Type it — save to a 0600 file');
+    await choose(tester, const Key('f-auth'), 'Private key');
+    expect(tester.takeException(), isNull,
+        reason: 'the form must survive the mode it was left in');
+
+    expect(find.byKey(const Key('f-secret')), findsNothing,
+        reason: 'a key that fits on one obscured line is not a key');
+    expect(find.byKey(const Key('f-secret-path')), findsOneWidget,
+        reason: 'and the file it lives in is what the form should ask for');
+
+    await tester.tap(find.byKey(const Key('f-secret-mode')));
+    await tester.pumpAndSettle();
+    expect(find.text('Type it — save to a 0600 file'), findsNothing,
+        reason: 'the option has to be gone, not merely unselected — a label '
+            'that invites a gesture the field cannot support is the defect');
+  });
+
+  testWidgets('the path field names the credential it points at',
+      (tester) async {
+    // One field, three credentials. Unconditional text sent a Shadowsocks
+    // password to `/Users/you/.ssh/id_ed25519`, which is advice, not a
+    // placeholder.
+    final dir = Directory.systemTemp.createTempSync('lios-pathlabel');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    await pumpEditor(tester, directory: dir.path);
+
+    expect(decorationOf(tester, const Key('f-secret-path')).labelText,
+        'Path to the password file');
+    expect(decorationOf(tester, const Key('f-secret-path')).hintText,
+        isNot(contains('id_ed25519')),
+        reason: 'a password does not live in an SSH key file');
+
+    await choose(tester, const Key('f-auth'), 'Private key');
+    expect(decorationOf(tester, const Key('f-secret-path')).labelText,
+        'Path to the key file');
+    expect(decorationOf(tester, const Key('f-secret-path')).hintText,
+        '/Users/you/.ssh/id_ed25519');
+
+    await choose(tester, const Key('f-auth'), 'Pre-shared key');
+    expect(decorationOf(tester, const Key('f-secret-path')).labelText,
+        'Path to the pre-shared key file');
+  });
+
+  testWidgets('a refusal about DNS opens the section that hides the field',
+      (tester) async {
+    // Not a data problem: `check_profile` validates the DoH path (twice, in
+    // fact — `ServerProfile::validate` does it again), and `_save` calls it
+    // before `writeSecret` and before `writeProfile`. Every field the collapse
+    // un-validates has a server-side twin that runs before the first byte is
+    // written.
+    //
+    // What the collapse can do is put the refusal and the field it names on
+    // opposite sides of a closed section: the user reads "the DoH path must
+    // start with `/`" over a form with no DoH path on it.
+    //
+    // Fixed by opening the section, NOT by `maintainState: true`. Keeping the
+    // children alive behind the collapse would have the form's own validator
+    // refuse from somewhere invisible, so Save would do nothing at all and say
+    // nothing either — worse than the error card.
+    final dir = Directory.systemTemp.createTempSync('lios-adv-doh');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final secretPath = '${dir.path}/pw';
+    File(secretPath).writeAsStringSync('hunter2');
+
+    await pumpEditor(
+      tester,
+      directory: dir.path,
+      existing: dohProfile(
+        path: '${dir.path}/doh.json',
+        dohPath: 'dns-query',
+        secretPath: secretPath,
+      ),
+    );
+    expect(find.byKey(const Key('f-doh-path')), findsNothing,
+        reason: 'precondition: the field is behind the collapse');
+
+    await pressAndSettle(tester, const Key('save-button'));
+
+    expect(find.byKey(const Key('editor-saved')), findsNothing);
+    expect(find.byKey(const Key('editor-error')), findsOneWidget);
+    final message = tester
+        .widget<Text>(find.descendant(
+          of: find.byKey(const Key('editor-error')),
+          matching: find.byType(Text),
+        ))
+        .data!;
+    expect(message, contains('DoH path'),
+        reason: 'precondition: the refusal is about a field Advanced hides');
+    expect(find.byKey(const Key('f-doh-path')), findsOneWidget,
+        reason: 'a refusal naming a field the form is hiding is one the user '
+            'cannot act on');
+    expect(fieldText(tester, const Key('f-doh-path')), 'dns-query',
+        reason: 'and the value it is complaining about must be in front of '
+            'them, editable');
+  });
+
+  testWidgets('a profile that does not parse is opened for repair, link row '
+      'and all', (tester) async {
+    // `_editing` is "this profile parsed", not "this file exists" — and the
+    // list offers Edit on a broken row deliberately, which is tested. So this
+    // branch reaches the editor with `error` set and no profile, and it shows
+    // the link row: re-importing IS a repair for a Shadowsocks profile nothing
+    // can read, and the save guard covers the case where the box is left full.
+    //
+    // The save still replaces the file that is there. `existing.path` is what
+    // `writeProfile` is told to replace, and it does not depend on the profile
+    // having parsed — without that, repairing a broken profile would leave the
+    // unreadable file in the list beside its replacement.
+    final dir = Directory.systemTemp.createTempSync('lios-broken');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final path = '${dir.path}/broken.json';
+    File(path).writeAsStringSync('{ this is not a profile');
+
+    await pumpEditor(
+      tester,
+      directory: dir.path,
+      existing: LoadedProfile(path: path, error: 'not a valid profile'),
+    );
+
+    expect(find.byKey(const Key('f-uri')), findsOneWidget,
+        reason: 'a Shadowsocks profile nothing can read is repaired by '
+            'pasting its link again');
+
+    await tester.enterText(
+        find.byKey(const Key('f-uri')), ssLink(tag: 'Repaired'));
+    await pressAndSettle(tester, const Key('import-button'));
+    expect(find.byKey(const Key('editor-error')), findsNothing);
+    await pressAndSettle(tester, const Key('save-button'));
+    expect(find.byKey(const Key('editor-saved')), findsOneWidget);
+
+    expect(File(path).existsSync(), isFalse,
+        reason: 'the broken file was being repaired, not kept beside its '
+            'repair');
+    expect(
+        Directory(dir.path)
+            .listSync()
+            .whereType<File>()
+            .where((f) => f.path.endsWith('.json'))
+            .length,
+        1,
+        reason: 'one profile went in and one came out');
   });
 }
