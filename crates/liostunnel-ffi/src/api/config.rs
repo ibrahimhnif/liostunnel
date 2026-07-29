@@ -247,6 +247,14 @@ pub fn ss_uri_password(uri: String) -> Result<String, String> {
 ///
 /// Refusals name no field of the profile. Every one of them is
 /// caller-supplied and this error crosses back over the wire.
+///
+/// **This is the round-trip guard.** `render_ss_uri` is total, but not every
+/// input round-trips: an empty host, port 0, an IPv6 or bracketed host, an
+/// empty cipher and an empty password each render a link that this build's own
+/// `parse_ss_uri` then refuses. `ProfileDto` enforces none of those — its
+/// fields are a `String`, a `u16` and an `Option<String>` — and nothing
+/// upstream is guaranteed to have screened them. Without these checks the user
+/// copies a link, pastes it back, and it does not import.
 pub fn export_ss_uri(dto: ProfileDto, password: String) -> Result<String, String> {
     if dto.auth_kind != "shadowsocks" || dto.protocol != "shadowsocks" {
         return Err("only a shadowsocks profile can be rendered as an ss:// link".into());
@@ -254,13 +262,32 @@ pub fn export_ss_uri(dto: ProfileDto, password: String) -> Result<String, String
     let method = dto
         .cipher
         .as_deref()
+        .filter(|c| !c.is_empty())
         .ok_or("a shadowsocks profile without a cipher cannot be rendered")?;
+    if password.is_empty() {
+        return Err("a link needs the profile's password, and this one is empty".into());
+    }
+    if dto.host.is_empty() {
+        return Err("a link needs a host, and this profile has none".into());
+    }
+    // `parse_ss_uri` splits `host:port` on the last colon and refuses IPv6
+    // outright — the packet stack is IPv4-only. A bracketed literal renders a
+    // link that only this build's own parser would have to unpick, so it is
+    // refused here rather than emitted.
+    if dto.host.contains(':') || dto.host.contains('[') {
+        return Err("an IPv6 host cannot be written as an ss:// link this build reads".into());
+    }
+    if dto.port == 0 {
+        return Err("a link needs a port, and this profile's is zero".into());
+    }
     Ok(liostunnel_core::protocols::ss_uri::render_ss_uri(
         method,
         &password,
         &dto.host,
         dto.port,
-        Some(dto.name.as_str()).filter(|n| !n.is_empty()),
+        // `render_ss_uri` maps `Some("")` to no fragment itself, so this is
+        // just the `&str`.
+        Some(dto.name.as_str()),
     ))
 }
 
@@ -311,6 +338,73 @@ mod tests {
             e.contains("only a shadowsocks profile"),
             "must be the protocol guard, not the cipher fallback: {e}"
         );
+    }
+
+    /// Every shape that passes the protocol and cipher guards but renders a
+    /// link this build's own parser refuses.
+    ///
+    /// Found by a reviewer running the real functions rather than reasoning
+    /// about them: five of these reached `render_ss_uri` and produced a link
+    /// that `parse_ss_uri` then rejected. The user copies a link, pastes it
+    /// back, and it does not import.
+    #[test]
+    fn a_profile_that_would_render_an_unreadable_link_is_refused() {
+        use base64::Engine;
+        let creds = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("aes-256-gcm:pw");
+        let good = import_ss_uri(format!("ss://{creds}@198.51.100.7:8388#Home")).unwrap();
+
+        // Concrete DTOs rather than a table of boxed closures: that shape is
+        // exactly what clippy's `type_complexity` is for, and the mutations
+        // read better inline anyway.
+        let host = |h: &str| {
+            let mut d = good.clone();
+            d.host = h.into();
+            d
+        };
+        let mut zero_port = good.clone();
+        zero_port.port = 0;
+        let mut empty_cipher = good.clone();
+        empty_cipher.cipher = Some(String::new());
+
+        for (what, dto, password) in [
+            ("empty host", host(""), "pw"),
+            ("ipv6 host", host("2001:db8::1"), "pw"),
+            ("bracketed ipv6 host", host("[2001:db8::1]"), "pw"),
+            ("port zero", zero_port, "pw"),
+            ("empty cipher", empty_cipher, "pw"),
+            ("empty password", good.clone(), ""),
+        ] {
+            assert!(
+                export_ss_uri(dto, password.into()).is_err(),
+                "{what} must be refused, not rendered into a link nothing reads"
+            );
+        }
+    }
+
+    /// The other half: everything the guard lets through must survive the
+    /// round trip. A guard that refused everything would pass the test above.
+    #[test]
+    fn every_link_this_guard_lets_through_imports_back() {
+        use base64::Engine;
+        for (cipher, host, port, name) in [
+            ("aes-256-gcm", "198.51.100.7", 8388u16, "Home"),
+            ("aes-128-gcm", "example.com", 1u16, "a?b#c"),
+            ("chacha20-ietf-poly1305", "h", 65535u16, ""),
+        ] {
+            let creds =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{cipher}:pw"));
+            let mut dto = import_ss_uri(format!("ss://{creds}@{host}:{port}")).unwrap();
+            dto.name = name.into();
+            let link = export_ss_uri(dto.clone(), "pw".into())
+                .unwrap_or_else(|e| panic!("{cipher}/{host}:{port} refused: {e}"));
+            let back = import_ss_uri(link).expect("our own link must import");
+            assert_eq!(back.host, dto.host);
+            assert_eq!(back.port, dto.port);
+            assert_eq!(back.cipher, dto.cipher);
+            if !name.is_empty() {
+                assert_eq!(back.name, name);
+            }
+        }
     }
 
     /// The refusal must not quote the profile. Every field of it is
