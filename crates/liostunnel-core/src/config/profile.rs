@@ -49,6 +49,17 @@ pub enum AuthMethod {
         /// Public by definition, so not a `SecretRef`.
         peer_public_key: String,
     },
+    /// Shadowsocks. `method` is a cipher name as Shadowsocks spells it
+    /// (`aes-256-gcm`, `chacha20-ietf-poly1305`); it is not secret. Which
+    /// names this build actually accepts is `protocols::shadowsocks`'s
+    /// `OFFERED` -- AEAD-2022 (`2022-blake3-*`) is not among them, so it is
+    /// not used as an example spelling here either. The
+    /// password IS key material, hence a `SecretRef` — which is what makes
+    /// the helper's ownership gate cover it with no new code.
+    Shadowsocks {
+        method: String,
+        password: SecretRef,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -192,6 +203,7 @@ impl AuthMethod {
                 v
             }
             AuthMethod::PresharedKey { private_key, .. } => vec![private_key],
+            AuthMethod::Shadowsocks { password, .. } => vec![password],
         }
     }
 }
@@ -451,5 +463,45 @@ mod tests {
         let (p, dir) = valid_profile("a_clean_profile_warns_about_nothing");
         assert!(p.warnings().is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    const SS_PROFILE: &str = r#"{
+        "id":"b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f","name":"SS",
+        "protocol":"shadowsocks","host":"198.51.100.7","port":8388,
+        "auth":{"type":"shadowsocks","method":"aes-256-gcm",
+                "password":{"source":"file","path":"/tmp/ss-key"}},
+        "dns":["1.1.1.1"],"split_tunnel":{"type":"all_traffic"},
+        "kill_switch":false}"#;
+
+    #[test]
+    fn a_shadowsocks_profile_parses() {
+        let p: ServerProfile = serde_json::from_str(SS_PROFILE).unwrap();
+        assert_eq!(p.protocol, ProtocolKind::Shadowsocks);
+        match &p.auth {
+            AuthMethod::Shadowsocks { method, password } => {
+                assert_eq!(method, "aes-256-gcm");
+                assert!(matches!(password, SecretRef::File { .. }));
+            }
+            other => panic!("expected Shadowsocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_shadowsocks_password_is_reported_as_a_secret() {
+        // If secret_refs misses it, the Phase 1a ownership gate never sees the
+        // password and a caller could name a file they do not own. The gate
+        // iterates exactly this list.
+        let p: ServerProfile = serde_json::from_str(SS_PROFILE).unwrap();
+        let refs = p.auth.secret_refs();
+        assert_eq!(refs.len(), 1, "the password must be enumerated");
+        assert!(matches!(refs[0], SecretRef::File { .. }));
+    }
+
+    #[test]
+    fn a_shadowsocks_profile_never_serialises_its_password() {
+        let p: ServerProfile = serde_json::from_str(SS_PROFILE).unwrap();
+        let out = serde_json::to_string(&p).unwrap();
+        assert!(out.contains("/tmp/ss-key"), "the location is kept: {out}");
+        assert!(!out.contains("BEGIN"), "no key material");
     }
 }

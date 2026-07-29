@@ -13,7 +13,7 @@ use russh::keys::ssh_key::PublicKey;
 use crate::config::profile::{AuthMethod, ProtocolKind, ServerProfile};
 use crate::config::secret::SecretStore;
 use crate::error::TunnelError;
-use crate::protocols::{Protocol, TunnelStream};
+use crate::protocols::{Protocol, TunnelStream, pick_ipv4};
 use crate::stats::{ConnectionState, ConnectionStats};
 
 /// Spec §8. `AcceptAny` is reachable only via `--insecure-accept-any-hostkey`.
@@ -452,12 +452,17 @@ impl SshTunnel {
             policy: self.policy.clone(),
         };
 
+        // Fix wave 2, finding 2: `profile.host` does not appear in this
+        // message. It is caller-supplied profile content, and this
+        // `Display` reaches the same two sinks `shadowsocks.rs`'s
+        // `prepare` already refuses to feed it to (the root-owned helper
+        // log via `tracing::warn!(error = %e, "connect failed")`, and the
+        // wire via `dispatch::connect_failed`). The io error alone is the
+        // actionable part; the host is already in the caller's own profile.
         let candidates: Vec<SocketAddr> =
             tokio::net::lookup_host((profile.host.as_str(), profile.port))
                 .await
-                .map_err(|e| {
-                    TunnelError::Protocol(format!("cannot resolve {}: {e}", profile.host))
-                })?
+                .map_err(|e| TunnelError::Protocol(format!("cannot resolve host: {e}")))?
                 .collect();
         let addr = pick_ipv4(candidates)?;
 
@@ -499,6 +504,9 @@ impl SshTunnel {
             AuthMethod::PresharedKey { .. } => {
                 return Err(TunnelError::Unsupported("preshared-key authentication"));
             }
+            AuthMethod::Shadowsocks { .. } => {
+                return Err(TunnelError::Unsupported("shadowsocks authentication"));
+            }
         };
 
         match result {
@@ -513,43 +521,6 @@ impl SshTunnel {
         }
 
         Ok((handle, addr))
-    }
-}
-
-/// Picks the first IPv4 candidate from a resolved address list, in order.
-///
-/// The `default`-mode route pin this address feeds (`connect.rs`, via
-/// `SshTunnel::peer_addr`) is built by IPv4-only commands --
-/// `route::linux`/`route::macos` hardcode a `/32` and expect a v4 gateway --
-/// so handing them a v6 address produces a malformed route command that
-/// fails `RouteGuard::apply` partway through applying (review item 2). A
-/// dual-stack host's resolved address list often has the AAAA record first,
-/// so picking blindly (`.next()`, the pre-fix behaviour) rather than
-/// filtering for v4 is itself the bug this closes.
-///
-/// Errors clearly, rather than silently building a malformed command, when
-/// the host resolves to IPv6 addresses only -- Phase 0 has no IPv6 support
-/// anywhere else in the stack either (the TUN device, `StackConfig`, and the
-/// route commands are all IPv4-only), so this is a real, honest limitation
-/// to surface at connect time, not a bug to paper over.
-pub fn pick_ipv4(addrs: impl IntoIterator<Item = SocketAddr>) -> Result<SocketAddr, TunnelError> {
-    let mut saw_any = false;
-    for addr in addrs {
-        saw_any = true;
-        if addr.is_ipv4() {
-            return Ok(addr);
-        }
-    }
-    if saw_any {
-        Err(TunnelError::Protocol(
-            "host resolved only to IPv6 addresses; Phase 0's route pinning and packet stack are \
-             IPv4-only"
-                .into(),
-        ))
-    } else {
-        Err(TunnelError::Protocol(
-            "host resolved to no addresses".into(),
-        ))
     }
 }
 
@@ -781,71 +752,10 @@ mod tests {
         assert!(h.check_server_key(&key(ED25519_KEY_B)).await.unwrap());
     }
 
-    // --- Review item 2: `pick_ipv4` --------------------------------------
-    //
-    // Pure, no network, no handle -- this is the one piece of the fix that
-    // does not need a live SSH session to verify. The property under test:
-    // whatever `connect_inner` resolves to, and whatever `SshTunnel::peer_addr`
-    // reports afterward for the route pin, must be an IPv4 address (the route
-    // commands are IPv4-only), chosen deterministically rather than by
-    // whatever order `lookup_host` happened to return.
-
-    fn v4(s: &str) -> SocketAddr {
-        s.parse().unwrap()
-    }
-
-    fn v6(s: &str) -> SocketAddr {
-        s.parse().unwrap()
-    }
-
-    #[test]
-    fn a_v4_address_is_chosen_when_the_list_is_v6_first_then_v4() {
-        // The exact dual-stack shape the review names: `lookup_host` often
-        // surfaces the AAAA record first. A `.next()`-style pick (the
-        // pre-fix behaviour) would have taken the v6 address here.
-        let picked = pick_ipv4([v6("[2001:db8::1]:22"), v4("198.51.100.7:22")]).unwrap();
-        assert_eq!(picked, v4("198.51.100.7:22"));
-    }
-
-    #[test]
-    fn a_v4_address_is_chosen_when_it_already_comes_first() {
-        let picked = pick_ipv4([v4("198.51.100.7:22"), v6("[2001:db8::1]:22")]).unwrap();
-        assert_eq!(picked, v4("198.51.100.7:22"));
-    }
-
-    #[test]
-    fn the_first_v4_wins_among_several_a_records() {
-        let picked = pick_ipv4([
-            v6("[2001:db8::1]:22"),
-            v4("198.51.100.7:22"),
-            v4("198.51.100.8:22"),
-        ])
-        .unwrap();
-        assert_eq!(
-            picked,
-            v4("198.51.100.7:22"),
-            "must be deterministic, not merely 'some' v4 address"
-        );
-    }
-
-    #[test]
-    fn an_ipv6_only_resolution_is_a_clear_error_not_a_malformed_route_later() {
-        let err = pick_ipv4([v6("[2001:db8::1]:22"), v6("[2001:db8::2]:22")]).unwrap_err();
-        match err {
-            TunnelError::Protocol(reason) => {
-                assert!(
-                    reason.contains("IPv4"),
-                    "error should explain the IPv4-only constraint: {reason}"
-                );
-            }
-            other => panic!("expected TunnelError::Protocol, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn no_addresses_at_all_is_also_a_clear_error() {
-        assert!(pick_ipv4(std::iter::empty()).is_err());
-    }
+    // `pick_ipv4`'s own tests moved with it to `protocols/mod.rs` (fix wave
+    // 1, finding 1): both protocols resolve through it now, so it is no
+    // longer SSH's to own. What stays here is SSH's side of the same
+    // property -- that a tunnel which has connected to nothing pins nothing.
 
     #[tokio::test]
     async fn a_freshly_constructed_tunnel_reports_no_peer_address_yet() {
@@ -860,5 +770,58 @@ mod tests {
             None,
             "peer_addr must be None before any successful connect"
         );
+    }
+
+    /// Fix wave 2, finding 2. `connect_inner`'s resolve failure used to echo
+    /// `profile.host` verbatim -- exactly what `shadowsocks.rs:260-262`
+    /// documents refusing to do for the identical failure mode, and for the
+    /// identical reason: this `Display` reaches the root-owned helper log
+    /// (`tracing::warn!(error = %e, "connect failed")`) and the wire
+    /// (`dispatch::connect_failed`), and `profile.host` is caller-supplied
+    /// profile content that nothing validates before `connect` runs.
+    ///
+    /// A NUL byte embedded in the host string (via the JSON escape
+    /// `\u0000`) makes `tokio::net::lookup_host` fail synchronously, in
+    /// process -- `CString::new` refuses interior NULs before any syscall,
+    /// let alone a DNS query -- so this is reachable with no network at all,
+    /// same as every other test in this module.
+    #[tokio::test]
+    async fn a_resolve_failure_never_echoes_the_host() {
+        struct NoSecret;
+        impl crate::config::secret::SecretStore for NoSecret {
+            fn resolve(
+                &self,
+                _r: &crate::config::secret::SecretRef,
+            ) -> Result<crate::config::secret::Redacted<String>, TunnelError> {
+                unreachable!("a resolve failure happens before any secret is ever read")
+            }
+        }
+
+        let profile: ServerProfile = serde_json::from_str(
+            r#"{"id":"b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f","name":"t",
+                "protocol":"ssh","host":"SECRET-VALUE-HERE\u0000","port":22,
+                "auth":{"type":"password","password":{"source":"file","path":"/tmp/k"}},
+                "dns":["1.1.1.1"],"split_tunnel":{"type":"all_traffic"},
+                "kill_switch":false}"#,
+        )
+        .unwrap();
+
+        let dir = scratch("resolve-failure");
+        let mut t = SshTunnel::new(
+            "me".into(),
+            HostKeyPolicy::Verify {
+                known_hosts: dir.join("known_hosts"),
+            },
+        );
+        let err = t
+            .connect(&profile, &NoSecret)
+            .await
+            .expect_err("a NUL byte cannot be resolved");
+        let text = format!("{err}");
+        assert!(
+            !text.contains("SECRET-VALUE-HERE"),
+            "the message must not echo caller-supplied profile content: {text}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

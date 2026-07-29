@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1369394092;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 336940439;
 
 // Section: executor
 
@@ -211,6 +211,39 @@ fn wire__crate__api__config__export_profile_impl(
         },
     )
 }
+fn wire__crate__api__config__import_ss_uri_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "import_ss_uri",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_uri = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::config::import_ss_uri(api_uri)?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
 fn wire__crate__api__config__new_profile_id_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -237,6 +270,38 @@ fn wire__crate__api__config__new_profile_id_impl(
             move |context| {
                 transform_result_sse::<_, ()>((move || {
                     let output_ok = Result::<_, ()>::Ok(crate::api::config::new_profile_id())?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__config__offered_ciphers_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "offered_ciphers",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, ()>((move || {
+                    let output_ok = Result::<_, ()>::Ok(crate::api::config::offered_ciphers())?;
                     Ok(output_ok)
                 })())
             }
@@ -336,6 +401,39 @@ fn wire__crate__api__protocol__protocol_version_impl(
             move |context| {
                 transform_result_sse::<_, ()>((move || {
                     let output_ok = Result::<_, ()>::Ok(crate::api::protocol::protocol_version())?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__config__ss_uri_password_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "ss_uri_password",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_uri = <String>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::config::ss_uri_password(api_uri)?;
                     Ok(output_ok)
                 })())
             }
@@ -533,6 +631,7 @@ impl SseDecode for crate::dto::profile::ProfileDto {
         let mut var_authSecretSource = <String>::sse_decode(deserializer);
         let mut var_authPassphraseSource = <Option<String>>::sse_decode(deserializer);
         let mut var_peerPublicKey = <Option<String>>::sse_decode(deserializer);
+        let mut var_cipher = <Option<String>>::sse_decode(deserializer);
         let mut var_dnsMode = <String>::sse_decode(deserializer);
         let mut var_dnsServers = <Vec<String>>::sse_decode(deserializer);
         let mut var_dohSni = <Option<String>>::sse_decode(deserializer);
@@ -550,6 +649,7 @@ impl SseDecode for crate::dto::profile::ProfileDto {
             auth_secret_source: var_authSecretSource,
             auth_passphrase_source: var_authPassphraseSource,
             peer_public_key: var_peerPublicKey,
+            cipher: var_cipher,
             dns_mode: var_dnsMode,
             dns_servers: var_dnsServers,
             doh_sni: var_dohSni,
@@ -641,10 +741,13 @@ fn pde_ffi_dispatcher_primary_impl(
         3 => wire__crate__api__probe__echo_probe_impl(port, ptr, rust_vec_len, data_len),
         4 => wire__crate__api__protocol__encode_request_impl(port, ptr, rust_vec_len, data_len),
         5 => wire__crate__api__config__export_profile_impl(port, ptr, rust_vec_len, data_len),
-        6 => wire__crate__api__config__new_profile_id_impl(port, ptr, rust_vec_len, data_len),
-        7 => wire__crate__api__config__parse_profile_impl(port, ptr, rust_vec_len, data_len),
-        8 => wire__crate__api__config__profile_summary_impl(port, ptr, rust_vec_len, data_len),
-        9 => wire__crate__api__protocol__protocol_version_impl(port, ptr, rust_vec_len, data_len),
+        6 => wire__crate__api__config__import_ss_uri_impl(port, ptr, rust_vec_len, data_len),
+        7 => wire__crate__api__config__new_profile_id_impl(port, ptr, rust_vec_len, data_len),
+        8 => wire__crate__api__config__offered_ciphers_impl(port, ptr, rust_vec_len, data_len),
+        9 => wire__crate__api__config__parse_profile_impl(port, ptr, rust_vec_len, data_len),
+        10 => wire__crate__api__config__profile_summary_impl(port, ptr, rust_vec_len, data_len),
+        11 => wire__crate__api__protocol__protocol_version_impl(port, ptr, rust_vec_len, data_len),
+        12 => wire__crate__api__config__ss_uri_password_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -823,6 +926,7 @@ impl flutter_rust_bridge::IntoDart for crate::dto::profile::ProfileDto {
             self.auth_secret_source.into_into_dart().into_dart(),
             self.auth_passphrase_source.into_into_dart().into_dart(),
             self.peer_public_key.into_into_dart().into_dart(),
+            self.cipher.into_into_dart().into_dart(),
             self.dns_mode.into_into_dart().into_dart(),
             self.dns_servers.into_into_dart().into_dart(),
             self.doh_sni.into_into_dart().into_dart(),
@@ -1047,6 +1151,7 @@ impl SseEncode for crate::dto::profile::ProfileDto {
         <String>::sse_encode(self.auth_secret_source, serializer);
         <Option<String>>::sse_encode(self.auth_passphrase_source, serializer);
         <Option<String>>::sse_encode(self.peer_public_key, serializer);
+        <Option<String>>::sse_encode(self.cipher, serializer);
         <String>::sse_encode(self.dns_mode, serializer);
         <Vec<String>>::sse_encode(self.dns_servers, serializer);
         <Option<String>>::sse_encode(self.doh_sni, serializer);

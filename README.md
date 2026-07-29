@@ -6,10 +6,11 @@ helper** — see
 [`docs/superpowers/specs/2026-07-28-liostunnel-phase1a-desktop-ui-design.md`](docs/superpowers/specs/2026-07-28-liostunnel-phase1a-desktop-ui-design.md)
 and its [verification](docs/superpowers/phase1a-verification.md).
 
-Routes TCP traffic from a TUN device through an SSH tunnel on macOS and
-Linux, with DNS resolved over the tunnel via one of two backends
-(DNS-over-TCP or DNS-over-HTTPS). No mobile, no WireGuard or Shadowsocks yet
-— profiles for those protocols parse, but connecting with one is rejected. See [`PRD.md`](PRD.md) for the full roadmap and
+Routes TCP traffic from a TUN device through an **SSH or Shadowsocks**
+tunnel on macOS and Linux, with DNS resolved over the tunnel via one of two
+backends (DNS-over-TCP or DNS-over-HTTPS). No mobile and no WireGuard yet —
+a WireGuard profile parses, but connecting with one is rejected. See
+[`PRD.md`](PRD.md) for the full roadmap and
 [`docs/superpowers/specs/2026-07-27-liostunnel-phase0-design.md`](docs/superpowers/specs/2026-07-27-liostunnel-phase0-design.md)
 for exactly what Phase 0 does and does not include.
 
@@ -98,6 +99,45 @@ startup rather than silently doing nothing.
 Secret files (referenced via `{"source": "file", "path": "..."}`) must be
 mode `0600` or stricter, checked before every read.
 
+### Shadowsocks
+
+```json
+{
+  "id": "b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f",
+  "name": "SS",
+  "protocol": "shadowsocks",
+  "host": "198.51.100.7",
+  "port": 8388,
+  "auth": {
+    "type": "shadowsocks",
+    "method": "aes-256-gcm",
+    "password": { "source": "file", "path": "/home/me/.liostunnel/secrets/ss" }
+  },
+  "dns": ["1.1.1.1", "1.0.0.1"],
+  "split_tunnel": { "type": "all_traffic" },
+  "kill_switch": false
+}
+```
+
+`method` is one of `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`.
+AEAD-2022 (`2022-blake3-*`) is **not** offered: those names exist in the
+crypto crate but their parsers are behind a feature this build does not
+enable, so offering them would recommend a cipher that then fails as unknown.
+The password is a `SecretRef` like any other, so the helper's ownership gate
+covers it with no special case.
+
+The app imports `ss://` links (both the legacy and SIP002 forms, including
+SIP002's optional trailing `/` that Outline keys carry). The password is
+written to a `0600` file and the profile keeps only the path — it never
+enters the profile document, and a malformed link is refused without any part
+of it appearing in the error, because the link *is* the credential.
+
+**`connect` performs one relayed round trip before reporting success.**
+Shadowsocks has no handshake, so a server given a wrong password accepts the
+connection and silently discards everything — without the probe, `connect`
+would return `Ok`, the UI would show Connected, routes would be installed,
+and nothing would carry.
+
 ## Testing
 
 ```bash
@@ -171,7 +211,7 @@ more detail in the referenced task report under `.superpowers/sdd/`.
   which case applies. The server-pin route is now family-correct too (a
   `/128`, and macOS's `-inet6`, for an IPv6 server address) as defence in
   depth, though this is not reachable from `connect` today —
-  `SshTunnel::pick_ipv4` (`protocols/ssh.rs`) already refuses to resolve to
+  `pick_ipv4` (`protocols/mod.rs`, shared by both protocols) already refuses to resolve to
   an IPv6-only server, and `detect_gateway` on both platforms only ever
   detects the IPv4 default gateway, so a real dual-stack-gateway story for
   an IPv6 SSH server remains unimplemented, not just untested.

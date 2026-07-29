@@ -3,11 +3,45 @@ services:
     build: ./sshd
     ports: ["127.0.0.1:22022:22"]
     networks: [lios]
+  # Two servers on purpose. Testing a shadowsocks-rust client against a
+  # shadowsocks-rust server lets a bug shared by both sides pass -- the same
+  # shape as a mock written to match the code it tests. libev is the C
+  # reference implementation, and is what makes this interop rather than a
+  # round trip through one codebase.
+  ss-libev:
+    image: shadowsocks/shadowsocks-libev
+    command: >
+      ss-server -s 0.0.0.0 -p 8388 -k ${SS_PASSWORD} -m aes-256-gcm -u
+    ports: ["127.0.0.1:8388:8388"]
+    networks: [lios]
+  # A different implementation AND a different cipher family, so a client
+  # hardcoded to one of them fails here rather than at a user's machine.
+  ss-rust:
+    image: teddysun/shadowsocks-rust
+    command: >
+      ssserver -s 0.0.0.0:8389 -k ${SS_PASSWORD} -m chacha20-ietf-poly1305
+    ports: ["127.0.0.1:8389:8389"]
+    networks: [lios]
   target:
     image: nginx:alpine
     volumes: ["./target-html:/usr/share/nginx/html:ro"]
     networks:
       lios:
         aliases: [target.internal]
+  # A resolver ON the compose network, because every `connect()` runs the
+  # probe and the probe relays a DNS query to whatever `profile.dns` names.
+  # Pointing that at 1.1.1.1 made the whole suite depend on this machine's
+  # outbound internet -- which the compose target exists to remove -- and made
+  # both credential tests pass for the wrong reason wherever it is absent: a
+  # correct password produces the same timeout, naming the same "cipher or
+  # password", as a wrong one.
+  #
+  # No published port, on purpose: a resolver the host cannot reach is what
+  # proves the probe's query travelled through the relay.
+  dns:
+    image: coredns/coredns
+    command: -conf /etc/coredns/Corefile
+    volumes: ["./dns:/etc/coredns:ro"]
+    networks: [lios]
 networks:
   lios:

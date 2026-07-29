@@ -12,7 +12,8 @@ pub struct CountingStream<S> {
     up: Arc<AtomicU64>,
     down: Arc<AtomicU64>,
     active: Arc<AtomicU64>,
-    /// Released when the stream drops, bounding concurrent SSH channels.
+    /// Released when the stream drops, bounding concurrent flows: SSH channels
+    /// for `SshTunnel`, sockets for `ShadowsocksTunnel`.
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 

@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use liostunnel_core::TunnelError;
-use liostunnel_core::config::profile::{DnsMode, ServerProfile};
+use liostunnel_core::config::profile::{DnsMode, ProtocolKind, ServerProfile};
 use liostunnel_core::config::secret::FileSecretStore;
 use liostunnel_core::dns::Resolver;
 use liostunnel_core::dns::over_https::DohResolver;
@@ -12,6 +12,7 @@ use liostunnel_core::net::smoltcp_stack::poll::SmoltcpStack;
 use liostunnel_core::net::tun::{TunConfig, TunDevice};
 use liostunnel_core::net::{NetStack, ShutdownHandle, StackConfig};
 use liostunnel_core::protocols::Protocol;
+use liostunnel_core::protocols::shadowsocks::ShadowsocksTunnel;
 use liostunnel_core::protocols::ssh::{HostKeyPolicy, SshTunnel};
 use liostunnel_core::route::{
     RouteGuard, RouteMode, RoutePlan, platform_manager, reject_full_default_prefixes,
@@ -108,27 +109,12 @@ pub async fn run(
     // 1. Establish the tunnel before touching the routing table, so a failed
     //    connection never leaves the machine with routes pointing at a dead
     //    interface.
-    let mut ssh = SshTunnel::new(user, policy);
-    ssh.connect(profile, &FileSecretStore).await?;
-    // The exact address the SSH session actually connected to -- not a
-    // second, independent `lookup_host` call. Review item 2: a dual-stack or
-    // multi-A-record host could previously make this resolution disagree
-    // with the one `SshTunnel::connect` performed internally, either handing
-    // the (IPv4-only) route commands below a v6 address or pinning the wrong
-    // peer entirely. `SshTunnel::peer_addr` is `Some` here in every real
-    // case -- `connect` above already returned `Ok`, and `connect`'s own Err
-    // arm is the only place that leaves it `None` -- but a clean error still
-    // beats a `panic!`/`unwrap!` if that invariant is ever violated by a
-    // future refactor.
-    let server_ip = ssh
-        .peer_addr()
-        .ok_or_else(|| {
-            TunnelError::Route(
-                "ssh session reports no resolved peer address after connecting".into(),
-            )
-        })?
-        .ip();
-    let protocol: Arc<dyn Protocol> = Arc::new(ssh);
+    //    Dispatch on the profile's protocol, as the helper's factory does.
+    //    Before this the CLI hardcoded SSH, so the two front-ends disagreed
+    //    about what the product supports: a Shadowsocks profile connected in
+    //    the app and was refused on the command line.
+    let (protocol, server_ip) = connect_protocol(profile, user, policy).await?;
+    let server_ip = server_ip.ip();
 
     // 2. Create the TUN device.
     let tun = TunDevice::open(TunConfig {
@@ -373,6 +359,45 @@ fn describe_engine_exit(res: &Result<Result<(), TunnelError>, tokio::task::JoinE
         Ok(Err(e)) => format!("the packet engine returned an error: {e}"),
         Err(e) if e.is_panic() => format!("the packet engine's task panicked: {e}"),
         Err(e) => format!("the packet engine's task ended unexpectedly: {e}"),
+    }
+}
+
+/// Builds the tunnel the profile names, and the address the route pin must use.
+///
+/// The same shape as `liostunnel-helper`'s `connect_protocol`, and for the
+/// same reason: anything only one protocol needs belongs inside its arm, not
+/// in the shared path. The address comes from the session itself rather than a
+/// second `lookup_host` -- a dual-stack or multi-A host can make an
+/// independent resolution disagree with the one the tunnel actually used,
+/// which pins the wrong peer and, in `default` mode, routes the tunnel's own
+/// packets into the tunnel.
+async fn connect_protocol(
+    profile: &ServerProfile,
+    user: String,
+    policy: HostKeyPolicy,
+) -> Result<(Arc<dyn Protocol>, std::net::SocketAddr), TunnelError> {
+    match profile.protocol {
+        ProtocolKind::Ssh => {
+            let mut ssh = SshTunnel::new(user, policy);
+            ssh.connect(profile, &FileSecretStore).await?;
+            let peer = ssh.peer_addr().ok_or_else(|| {
+                TunnelError::Route("ssh session reports no peer address after connecting".into())
+            })?;
+            Ok((Arc::new(ssh), peer))
+        }
+        ProtocolKind::Shadowsocks => {
+            let mut ss = ShadowsocksTunnel::new();
+            // Proves the credentials with one relayed round trip, because
+            // Shadowsocks has no handshake that would.
+            ss.connect(profile, &FileSecretStore).await?;
+            let peer = ss.peer_addr().ok_or_else(|| {
+                TunnelError::Route(
+                    "shadowsocks session reports no peer address after connecting".into(),
+                )
+            })?;
+            Ok((Arc::new(ss), peer))
+        }
+        ProtocolKind::WireGuard => Err(TunnelError::Unsupported("wireguard")),
     }
 }
 

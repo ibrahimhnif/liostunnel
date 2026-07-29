@@ -86,7 +86,7 @@ jobs:
       - name: cargo clippy -D warnings
         run: cargo clippy --all-targets --workspace -- -D warnings
 
-      # The 204 hermetic tests: no root, no TUN, no routing table, no
+      # The hermetic tests: no root, no TUN, no routing table, no
       # network, and no test may touch a real ~/.liostunnel — see the
       # project's test-hygiene rule in README.md.
       - name: cargo test --workspace
@@ -110,6 +110,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: make -C testing/docker up
       - run: cargo test -p liostunnel-core --test ssh_integration -- --ignored
+      # The five tests that are the only evidence for P1b-1, P1b-2 and P1b-3.
+      # Before this they ran nowhere but one developer's machine, once. Both
+      # suites are hermetic: the fixture carries its own resolver, so neither
+      # needs outbound internet from the runner.
+      - run: cargo test -p liostunnel-core --test shadowsocks_integration -- --ignored
       - if: always()
         run: make -C testing/docker down
 

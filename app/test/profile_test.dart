@@ -2,9 +2,13 @@
 // re-implementing the schema in Dart. These tests exercise the real bridge,
 // so a codegen or conversion regression shows up here rather than as a user's
 // profile mysteriously failing to load.
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:liostunnel_app/src/rust/api/config.dart';
 import 'package:liostunnel_app/src/rust/frb_generated.dart';
+
+import 'dto_fields.dart';
 
 const sample = '''
 {"id":"b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f","name":"Home VPS",
@@ -40,11 +44,35 @@ void main() {
   test(
     'what reaches Dart describes where a secret lives, not what it is',
     () async {
-      final p = await parseProfile(json: keyfile);
+      // A real key on disk, and the profile points at it. Both halves matter.
+      //
+      // This used to assert `p.toString()` did not contain 'BEGIN'. The
+      // generated `ProfileDto` overrides `==` and `hashCode` but not
+      // `toString`, so that rendered `Instance of 'ProfileDto'` and could not
+      // have failed whatever the fields held — and the profile named a path
+      // under /home/u that does not exist on any machine running this, so
+      // there was nothing for a leak to leak. `everyFieldOf` reads the fields
+      // themselves (`profile_writer_test.dart` already built it for exactly
+      // this), and the file gives it something to find: a `describe` that
+      // read the key instead of describing it now fails here.
+      final key = File(
+        '${Directory.systemTemp.createTempSync('lios-dto-key').path}/id_ed25519',
+      );
+      addTearDown(() => key.parent.deleteSync(recursive: true));
+      key.writeAsStringSync(
+        '-----BEGIN OPENSSH PRIVATE KEY-----\nc2VjcmV0\n',
+      );
+
+      final p = await parseProfile(
+        json: keyfile.replaceAll('/home/u/.ssh/id_ed25519', key.path),
+      );
       expect(p.authKind, 'private_key');
-      expect(p.authSecretSource, 'file:/home/u/.ssh/id_ed25519');
-      // Nothing on this object may be key material — it gets rendered on screen.
-      expect(p.toString(), isNot(contains('BEGIN')));
+      expect(p.authSecretSource, 'file:${key.path}');
+      // Nothing on this object may be key material — it gets rendered on
+      // screen and its `profile_json` reaches the helper over a socket.
+      expect(everyFieldOf(p), contains(key.path), reason: 'says where');
+      expect(everyFieldOf(p), isNot(contains('BEGIN')),
+          reason: 'and never what');
     },
   );
 

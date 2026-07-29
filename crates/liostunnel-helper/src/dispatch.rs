@@ -74,7 +74,7 @@ impl Session {
     pub fn connect_failed(&mut self, id: u64, e: &StartError) -> Vec<String> {
         self.connected = false;
         let kind = match e {
-            StartError::BadProfile
+            StartError::BadProfile(_)
             | StartError::BadRouteMode(_)
             | StartError::BadTunAddress
             | StartError::EnvSecretNotAllowed => ErrorKind::BadRequest,
@@ -87,11 +87,44 @@ impl Session {
             // problem. Everything else is Internal, whose wording points at
             // the helper log, which does name the cause.
             StartError::Tunnel(liostunnel_core::TunnelError::Auth(_)) => ErrorKind::AuthFailed,
+            // A profile the user can fix, not a helper fault. `Internal`'s
+            // wording points at the helper log, which is the wrong place to
+            // send someone who typed a cipher name wrong, gave a shadowsocks
+            // profile ssh credentials, or left `dns.https` out of a `https`
+            // profile — all `Config`, all newly reachable through the helper
+            // now that it can dial Shadowsocks, and all five-second fixes in
+            // their own file. `SshTunnel` essentially never produced `Config`,
+            // which is why this never mattered before.
+            //
+            // Fix wave 3, finding 3: the probe's own timeout joins them. It is
+            // a `Config` at `auth` now, so this arm is what stops the most
+            // common Shadowsocks user error reading as a helper fault.
+            StartError::Tunnel(liostunnel_core::TunnelError::Config { .. }) => {
+                ErrorKind::BadRequest
+            }
             StartError::Tunnel(_) => ErrorKind::Internal,
         };
-        // `e`'s Display is safe to send: every variant either carries no
-        // input at all or carries a path and uid. Task 6's tests pin that
-        // BadProfile does not acquire a payload later.
+        // `e`'s Display is safe to send back over the wire. Every variant
+        // except `BadRouteMode` carries no input at all, or carries only a
+        // path and uid; `BadProfile` carries a reason too, but it is
+        // `&'static str` -- a literal in `session.rs`, which no request can
+        // influence -- and Task 6's echo tests still pin that the profile
+        // itself never comes back.
+        //
+        // `BadRouteMode(String)` is the one exception, and does carry a
+        // caller string verbatim, at two sites: `session.rs:568`
+        // ("cidr is not valid: {c}") and `session.rs:596-598` ("expected
+        // `test` or `default`, got `{other}`"). Echoing there is fine, but
+        // for a narrower reason than "no input" -- a gate failure (this
+        // whole `Connect` arm, from `Tunnel::authorize_params`) never
+        // reaches `tracing::warn!(error = %e, "connect failed")`: that only
+        // fires in `main.rs` for a `StartError` from `Tunnel::start`, which
+        // runs strictly after the gate has already returned `Ok`, so it
+        // can never itself produce `BadRouteMode`. The only sink left is
+        // the wire, back to the same caller who supplied the string in the
+        // first place -- there is nothing in it they did not already have.
+        // That reasoning does not extend to a message that also reaches the
+        // helper log; do not copy this pattern for one that does.
         vec![err(id, kind, &e.to_string())]
     }
 
@@ -522,6 +555,105 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
         assert_eq!(v["kind"], "bad_request");
         assert!(!s.is_connected());
+    }
+
+    #[test]
+    fn a_shadowsocks_probe_failure_is_not_reported_as_a_wrong_password() {
+        // Shadowsocks has no handshake, so `connect` proves the credentials
+        // with one relayed round trip — which means it can now fail for
+        // NETWORK reasons as well as credential ones. A DoH resolver whose
+        // TLS failed through a proven-good relay is `Dns`; a server this
+        // machine cannot reach at all is `Transport`. Neither means the
+        // password was wrong, and saying so sends the user to change a
+        // credential that works.
+        //
+        // Fix wave 1, finding 6: the last row is the direction nothing
+        // guarded. Only `Tunnel(_) => Internal` was pinned, so mutating the
+        // `Auth` arm to `Internal` left the suite green and silently stopped
+        // ever telling a user their password was wrong — the exact failure
+        // this test's first two rows exist to prevent, in reverse.
+        //
+        // Fix wave 3, finding 3: the probe's own timeout used to be the first
+        // row, as a `Transport`, and therefore reached the user as "The
+        // helper hit an internal error. Check its log." The integration suite
+        // established that a real ss-libev server given a wrong password or
+        // cipher accepts the connection and silently discards it, so that
+        // timeout is where the most common user error in this protocol
+        // arrives. It is a `Config` at `auth` now, and belongs with the
+        // profile mistakes, not with the helper faults.
+        use liostunnel_core::TunnelError;
+        let mut s = sess();
+        let failures = [
+            (
+                StartError::Tunnel(TunnelError::config(
+                    "auth",
+                    "nothing came back through the tunnel in time",
+                )),
+                "bad_request",
+            ),
+            (
+                StartError::Tunnel(TunnelError::Transport(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "the server refused the connection",
+                ))),
+                "internal",
+            ),
+            (
+                StartError::Tunnel(TunnelError::Dns("resolver refused the handshake".into())),
+                "internal",
+            ),
+            (
+                StartError::Tunnel(TunnelError::Auth("server rejected credentials".into())),
+                "auth_failed",
+            ),
+        ];
+        for (e, expected) in &failures {
+            let out = s.connect_failed(3, e);
+            let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+            assert_eq!(v["kind"], *expected, "{e} was reported as {v}");
+        }
+    }
+
+    /// Fix wave 1, finding 3. `dispatch` mapped every non-`Auth` `TunnelError`
+    /// to `Internal`, whose wording sends the user to the helper's log.
+    /// `SshTunnel` essentially never produced `Config`, so that never
+    /// mattered — but the Shadowsocks arm reaches the helper now, and it
+    /// returns `Config` for an unoffered cipher name, wrong-kind credentials
+    /// and a missing `dns.https`: all things the user fixes in their own
+    /// profile in five seconds, none of them a helper fault.
+    ///
+    /// The error is produced by the real code path rather than hand-built, so
+    /// this cannot pass against a `Config` shape the tunnel never actually
+    /// returns. No network: the cipher allow-list refuses before anything is
+    /// resolved, opened or read.
+    #[tokio::test]
+    async fn a_cipher_this_build_does_not_offer_is_the_users_mistake_not_an_internal_error() {
+        use liostunnel_core::protocols::Protocol;
+        use liostunnel_core::protocols::shadowsocks::ShadowsocksTunnel;
+
+        let profile = serde_json::from_str(
+            r#"{"id":"00000000-0000-0000-0000-000000000000","name":"t",
+                "protocol":"shadowsocks","host":"127.0.0.1","port":8388,
+                "auth":{"type":"shadowsocks","method":"rot13",
+                        "password":{"source":"file","path":"/tmp/lios-absent"}},
+                "dns":["1.1.1.1"],"split_tunnel":{"type":"all_traffic"},
+                "kill_switch":false}"#,
+        )
+        .unwrap();
+        let mut t = ShadowsocksTunnel::new();
+        let e = StartError::Tunnel(
+            t.connect(&profile, &crate::session::ResolvedSecrets::default())
+                .await
+                .expect_err("`rot13` is not a cipher this build offers"),
+        );
+
+        let mut s = sess();
+        let out = s.connect_failed(9, &e);
+        let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        assert_eq!(
+            v["kind"], "bad_request",
+            "a cipher name the user typed is theirs to fix, not a helper fault: {v}"
+        );
     }
 
     #[test]

@@ -1,0 +1,31 @@
+# The fixture's own resolver, reachable only from the compose network.
+#
+# The integration suite's every test calls `connect()`, and every `connect()`
+# runs the probe, which relays one DNS query through the Shadowsocks server to
+# whatever `profile.dns` names. That used to be 1.1.1.1, which made the whole
+# suite depend on the compose network's outbound internet access -- and worse,
+# made both credential tests pass for the wrong reason where it is absent: a
+# *correct* password produces the same timeout, with "cipher or password" in
+# it, as a wrong one. This closes that, and makes the compose target mean what
+# testing/../phase1b-verification.md already claims it means.
+#
+# Deliberately publishes no host port. A resolver the host cannot reach is
+# what proves the probe's query travelled through the relay.
+. {
+    # The fixture's own names, so this is a resolver and not just something
+    # that emits bytes. `target.internal` is the nginx the relay test fetches.
+    hosts {
+        127.0.0.1 localhost
+        fallthrough
+    }
+
+    # Everything else: a real, well-formed DNS answer that involves no
+    # upstream at all. NXDOMAIN is an answer -- what the probe reads for is
+    # bytes that came back *through the cipher*, which a wrong-key server
+    # cannot produce.
+    template ANY ANY {
+        rcode NXDOMAIN
+    }
+
+    errors
+}
