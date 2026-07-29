@@ -58,3 +58,42 @@ Future<void> confirmAndCopyLink(
     messenger.showSnackBar(SnackBar(content: Text('$e')));
   }
 }
+
+/// Asks before a profile is deleted, and says what deletion leaves behind.
+///
+/// One dialog for both call sites — the editor's Delete button and the list
+/// row's overflow menu — so they cannot drift. They already had: the editor
+/// asked, and the menu entry deleted on one tap, from a menu whose other three
+/// entries are harmless. The asymmetry is the argument, because the *more*
+/// accidental affordance is the one that had the weaker guard. The profile
+/// document is the only copy and there is no undo.
+///
+/// The body says the thing the user cannot otherwise know: the credential file
+/// survives. That is deliberate — [ProfileWriter.delete] touches only the
+/// `.json` and the `.user` sidecar, because the secret may be an SSH key
+/// relied on elsewhere and deleting a profile is not consent to destroy a
+/// credential.
+Future<bool> confirmDeleteProfile(BuildContext context, String name) async {
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      title: Text('Delete "$name"?'),
+      content: const Text(
+        'The profile is removed. Any key or password file it points at is '
+        'left where it is.',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx, false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          key: const Key('confirm-delete'),
+          onPressed: () => Navigator.pop(ctx, true),
+          child: const Text('Delete'),
+        ),
+      ],
+    ),
+  );
+  return ok == true;
+}

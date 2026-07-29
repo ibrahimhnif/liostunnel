@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../services/profile_store.dart';
 import '../services/profile_writer.dart';
 import '../src/rust/api/config.dart';
+import 'dialogs.dart';
 import '../src/rust/dto/profile.dart';
 
 /// The cipher names the editor offers for Shadowsocks.
@@ -419,32 +420,15 @@ class _ProfileEditorScreenState extends State<ProfileEditorScreen> {
     }
   }
 
+  /// Deletes, after asking.
+  ///
+  /// The question itself lives in [confirmDeleteProfile], shared with the
+  /// profiles list's menu entry. Two copies of a confirmation drift, and the
+  /// one that drifts is the one nothing asserts — which is how the list's
+  /// entry came to have no confirmation at all while this one did.
   Future<void> _confirmDelete() async {
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text('Delete "${_name.text}"?'),
-        // The secret file is deliberately left alone: it may be an SSH key
-        // the user relies on elsewhere, and deleting a profile is not consent
-        // to destroy a credential.
-        content: const Text(
-          'The profile is removed. Any key or password file it points at is '
-          'left where it is.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            key: const Key('confirm-delete'),
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-    if (ok != true || !mounted) return;
+    final ok = await confirmDeleteProfile(context, _name.text);
+    if (!ok || !mounted) return;
     await widget.writer.delete(widget.existing!.path);
     widget.onSaved();
     if (mounted) Navigator.of(context).pop();

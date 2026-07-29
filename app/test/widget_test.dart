@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 
+import 'package:liostunnel_app/main.dart';
 import 'package:liostunnel_app/screens/connection.dart';
 import 'package:liostunnel_app/screens/dialogs.dart';
 import 'package:liostunnel_app/screens/profile_editor.dart';
@@ -498,7 +499,66 @@ void main() {
     dir.deleteSync(recursive: true);
   });
 
+  testWidgets('a search that matches nothing says so', (tester) async {
+    // Without this the list falls through to an empty ListView, which reads
+    // exactly like "your profiles are gone" — the same failure the
+    // empty-directory message exists to prevent, reached from the other side.
+    // And it must not be the empty-directory message either: that one names a
+    // path and tells the user to put a file there, which would send them
+    // looking for profiles that are on disk and merely filtered out.
+    await tester.pumpWidget(MaterialApp(
+      home: ProfilesScreen(
+        profiles: [ssProfile(name: 'Home', path: '/tmp/home.json')],
+        directory: '/somewhere/.liostunnel',
+        selectedPath: null,
+        onSelect: _ignore,
+        onReload: _noop,
+        onCreate: _noop,
+        onEdit: _ignore,
+        onDuplicate: _ignore,
+        onCopyLink: _ignore,
+        onDelete: _ignore,
+      ),
+    ));
+    await tester.enterText(find.byKey(const Key('profile-search')), 'zzz');
+    await tester.pumpAndSettle();
+
+    expect(find.text('Home'), findsNothing, reason: 'precondition: filtered');
+    expect(find.text('Nothing matches that search.'), findsOneWidget);
+    expect(find.textContaining('/somewhere/.liostunnel'), findsNothing,
+        reason: 'the directory is not empty; only the filter is');
+  });
+
+  testWidgets('whitespace around a search term is ignored', (tester) async {
+    // A term arrives with a space more often than not — from a paste, or from
+    // a keyboard that adds one after a word. Matching on the raw text turns
+    // that into "Nothing matches that search." over a list that does.
+    await tester.pumpWidget(MaterialApp(
+      home: ProfilesScreen(
+        profiles: [
+          ssProfile(name: 'Home', host: '198.51.100.7', path: '/tmp/home.json'),
+          ssProfile(name: 'Work', host: '203.0.113.9', path: '/tmp/work.json'),
+        ],
+        directory: '/tmp',
+        selectedPath: null,
+        onSelect: _ignore,
+        onReload: _noop,
+        onCreate: _noop,
+        onEdit: _ignore,
+        onDuplicate: _ignore,
+        onCopyLink: _ignore,
+        onDelete: _ignore,
+      ),
+    ));
+    await tester.enterText(find.byKey(const Key('profile-search')), '  wor  ');
+    await tester.pumpAndSettle();
+
+    expect(find.text('Work'), findsOneWidget);
+    expect(find.text('Home'), findsNothing);
+  });
+
   copyLinkTests();
+  deleteTests();
   editorTests();
 
   test('a missing profiles directory is empty, not an error', () async {
@@ -665,6 +725,176 @@ void copyLinkTests() {
         reason: 'not a UTF-8 decoder\'s complaint about byte offsets');
     expect('$e', isNot(contains(secret)),
         reason: 'and the decoder\'s version named the secret file too');
+  });
+}
+
+// --- deleting from the list -----------------------------------------------
+// These pump the real `HomePage`, because the three defects below live in the
+// wiring rather than in either screen: what the menu entry does, and what the
+// page still holds afterwards.
+
+/// Pumps the real [HomePage] against a throwaway profiles directory.
+///
+/// `runAsync` around the first pump because `_reload` awaits `parseProfile`
+/// across the FFI, and a `testWidgets` fake-async zone never completes that —
+/// the list would stay empty for the whole test and every assertion below
+/// would be vacuous.
+///
+/// The socket path is inside the temp directory, so nothing is listening on
+/// it: `_attach` fails into the error banner rather than reaching a helper
+/// that may genuinely be running on the machine running the suite.
+Future<void> pumpHome(WidgetTester tester, String directory) async {
+  tester.view.physicalSize = const Size(1200, 2400);
+  tester.view.devicePixelRatio = 1.0;
+  addTearDown(tester.view.reset);
+  await tester.runAsync(() async {
+    await tester.pumpWidget(wrap(
+      ConnectionModel(),
+      HomePage(
+        profilesDirectory: directory,
+        socketPath: '$directory/nobody-is-listening.sock',
+      ),
+    ));
+    await Future<void>.delayed(const Duration(milliseconds: 500));
+  });
+  await tester.pumpAndSettle();
+}
+
+/// Opens a row's overflow menu and chooses [entry].
+Future<void> chooseInMenu(
+  WidgetTester tester,
+  String path,
+  String entry,
+) async {
+  await tester.tap(find.byKey(ValueKey('menu-$path')));
+  await tester.pumpAndSettle();
+  await tester.tap(find.text(entry));
+  await tester.pumpAndSettle();
+}
+
+void deleteTests() {
+  testWidgets('the menu asks before deleting, and Cancel deletes nothing',
+      (tester) async {
+    // The same action behind the editor's Delete button was already guarded by
+    // a dialog; this one — one tap, in a menu whose other three entries are
+    // harmless, and the *more* accidental affordance of the two — was not. The
+    // profile document is the only copy and there is no undo.
+    final dir = Directory.systemTemp.createTempSync('lios-home-cancel');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final path = '${dir.path}/home.json';
+    File(path).writeAsStringSync(sample);
+
+    await pumpHome(tester, dir.path);
+    expect(find.text('Home VPS'), findsOneWidget, reason: 'precondition');
+
+    await chooseInMenu(tester, path, 'Delete');
+    expect(find.text('Delete "Home VPS"?'), findsOneWidget,
+        reason: 'it must name the profile, as the editor\'s dialog does');
+    expect(find.textContaining('left where it is'), findsOneWidget,
+        reason: 'and say the thing the user cannot otherwise know: the key '
+            'or password file it points at survives');
+
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+
+    expect(File(path).existsSync(), isTrue);
+    expect(find.text('Home VPS'), findsOneWidget);
+  });
+
+  testWidgets('deleting the selected profile lets go of it', (tester) async {
+    // `_selected` held the in-memory DTO, and the Connection screen's guard is
+    // `selected?.profile == null`. So after a delete the profile was still
+    // named there and Connect was still enabled; pressing it read a file that
+    // is gone, and `applyError` fell through to `Fault.internal` — the generic
+    // internal-error wording, for a profile the user deleted themselves.
+    // `_openEditor`'s `onSaved` does exactly this, twelve lines above, with
+    // the reason written out.
+    final dir = Directory.systemTemp.createTempSync('lios-home-selected');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final path = '${dir.path}/home.json';
+    File(path).writeAsStringSync(sample);
+
+    await pumpHome(tester, dir.path);
+    // Tapping a row selects it and jumps to the Connection tab.
+    await tester.tap(find.text('Home VPS'));
+    await tester.pumpAndSettle();
+    expect(find.text('Connect'), findsOneWidget, reason: 'precondition');
+    final before = tester.widget<FilledButton>(
+      find.byKey(const Key('connect-button')),
+    );
+    expect(before.onPressed, isNotNull,
+        reason: 'precondition: the connection screen is holding it');
+
+    await tester.tap(find.text('Profiles'));
+    await tester.pumpAndSettle();
+    await chooseInMenu(tester, path, 'Delete');
+    // Through `pressAndSettle`: the reload behind the delete crosses the FFI.
+    await pressAndSettle(tester, const Key('confirm-delete'));
+
+    expect(File(path).existsSync(), isFalse, reason: 'it really was deleted');
+    expect(find.text('Home VPS'), findsNothing, reason: 'and the list reloaded');
+
+    await tester.tap(find.text('Connection'));
+    await tester.pumpAndSettle();
+    expect(find.text('No profile selected'), findsOneWidget);
+    final after = tester.widget<FilledButton>(
+      find.byKey(const Key('connect-button')),
+    );
+    expect(after.onPressed, isNull,
+        reason: 'Connect on a deleted profile can only produce the generic '
+            'internal-error wording');
+  });
+
+  testWidgets('a delete that fails says so, and leaves the row', (tester) async {
+    // `_deleteQuietly` guards `existsSync` and then calls `deleteSync`, which
+    // still throws on a permission failure or a file removed between the two.
+    // With no `try/catch` the exception escaped an unawaited async callback:
+    // no toast, no reload, the row stayed, and the user got no signal at all.
+    // `onDuplicate`, immediately above, already had the right shape.
+    final dir = Directory.systemTemp.createTempSync('lios-home-refused');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final path = '${dir.path}/home.json';
+    File(path).writeAsStringSync(sample);
+
+    await pumpHome(tester, dir.path);
+    expect(find.text('Home VPS'), findsOneWidget, reason: 'precondition');
+
+    // Readable and listable, so the profile still loads; not writable, so the
+    // unlink is refused. Registered after the directory's own teardown so it
+    // runs BEFORE it — tearDowns run in reverse.
+    Process.runSync('chmod', ['500', dir.path]);
+    addTearDown(() => Process.runSync('chmod', ['700', dir.path]));
+
+    await chooseInMenu(tester, path, 'Delete');
+    await pressAndSettle(tester, const Key('confirm-delete'));
+
+    expect(tester.takeException(), isNull,
+        reason: 'the failure must reach the user, not the console');
+    expect(find.byType(SnackBar), findsOneWidget);
+    expect(File(path).existsSync(), isTrue);
+    expect(find.text('Home VPS'), findsOneWidget,
+        reason: 'the profile is still on disk, so the row must still be there');
+  });
+
+  testWidgets('the editor asks the same question, and Cancel keeps the file',
+      (tester) async {
+    // The other call site of the shared dialog. Two copies of a confirmation
+    // drift, and the one that drifts is the one nothing asserts.
+    final dir = Directory.systemTemp.createTempSync('lios-editor-delete');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final path = '${dir.path}/ss.json';
+    File(path).writeAsStringSync('{}');
+
+    await pumpEditor(tester,
+        directory: dir.path, existing: ssProfile(path: path, name: 'SS'));
+    await tester.tap(find.byKey(const Key('delete-button')));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Delete "SS"?'), findsOneWidget);
+    expect(find.textContaining('left where it is'), findsOneWidget);
+    await tester.tap(find.text('Cancel'));
+    await tester.pumpAndSettle();
+    expect(File(path).existsSync(), isTrue);
   });
 }
 
