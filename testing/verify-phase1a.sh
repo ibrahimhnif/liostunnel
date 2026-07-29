@@ -101,6 +101,29 @@ trap 'kill $HPID 2>/dev/null; wait $HPID 2>/dev/null; rm -f "$SOCK" "$SOCK.lock"
 for _ in $(seq 1 40); do [ -S "$SOCK" ] && break; sleep 0.25; done
 [ -S "$SOCK" ] || { echo "helper never bound; log:"; cat /tmp/lios-verify/helper.log; exit 1; }
 
+# A stale helper binary answers every hello with version_mismatch, and every
+# check below then fails with a message about the wrong thing entirely. That
+# cost a full run once: the source said 2, the built binary said 1, and the
+# report was five unrelated-looking failures. Fail here, and say why.
+hdr "preflight — the built helper speaks the version this tree defines"
+PRE=$(subst <<'PYPRE' | sudo -u "#$CLIENT_UID" python3 - "$SOCK"
+import socket,sys,time
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(sys.argv[1])
+s.sendall(b'{"type":"hello","id":1,"protocol_version":__VER__}\n'); time.sleep(0.4)
+print(s.recv(65536).decode().strip())
+PYPRE
+)
+echo "  $PRE"
+if echo "$PRE" | grep -q '"kind":"version_mismatch"'; then
+  echo
+  echo "  STOP  the helper at $HELPER speaks a different protocol version than"
+  echo "        this source tree ($WIRE_VERSION). It is a stale build. Run:"
+  echo "            cargo build --release -p liostunnel-helper"
+  echo "        and re-run this script. Nothing below would mean anything."
+  exit 1
+fi
+ok "the helper agrees with the source tree on protocol $WIRE_VERSION"
+
 hdr "socket ownership (spec §7.1 — both platforms enforce mode bits on connect)"
 echo "  socket: mode=$(file_mode "$SOCK") owner=$(file_owner "$SOCK")"
 SOCK_OWNER="$(file_owner "$SOCK")"
