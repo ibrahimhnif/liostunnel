@@ -41,6 +41,11 @@ pub enum PortableAuth {
         private_key: String,
         peer_public_key: String,
     },
+    Shadowsocks {
+        /// The cipher name. Not secret -- both ends agree on it in the clear.
+        method: String,
+        password: String,
+    },
 }
 
 /// Manual impl so a stray `{:?}` (log line, panic backtrace, CLI error path)
@@ -66,6 +71,14 @@ impl std::fmt::Debug for PortableAuth {
                 .debug_struct("PresharedKey")
                 .field("private_key", &"<redacted>")
                 .field("peer_public_key", peer_public_key)
+                .finish(),
+            // The cipher name is not secret and is the useful half when
+            // diagnosing a refused profile; the password is the whole point
+            // of this impl.
+            PortableAuth::Shadowsocks { method, .. } => f
+                .debug_struct("Shadowsocks")
+                .field("method", method)
+                .field("password", &"<redacted>")
                 .finish(),
         }
     }
@@ -109,6 +122,12 @@ impl PortableProfile {
                 private_key: write("private_key", private_key)?,
                 peer_public_key: peer_public_key.clone(),
             },
+            PortableAuth::Shadowsocks { method, password } => AuthMethod::Shadowsocks {
+                method: method.clone(),
+                // Same treatment as every other inlined secret: it lands in a
+                // 0600 file and the profile keeps the path.
+                password: write("password", password)?,
+            },
         };
 
         Ok(ServerProfile {
@@ -148,13 +167,10 @@ impl PortableProfile {
                 private_key: store.resolve(private_key)?.into_inner(),
                 peer_public_key: peer_public_key.clone(),
             },
-            AuthMethod::Shadowsocks { .. } => {
-                // `PortableAuth` gains its own variant with the Phase 1b config
-                // surface (Task 5/6); until then there is nowhere to put the
-                // inlined secret, so export is refused rather than silently
-                // dropping it.
-                return Err(TunnelError::Unsupported("exporting a shadowsocks profile"));
-            }
+            AuthMethod::Shadowsocks { method, password } => PortableAuth::Shadowsocks {
+                method: method.clone(),
+                password: store.resolve(password)?.into_inner(),
+            },
         };
 
         Ok(Self {
@@ -386,6 +402,57 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Before this, `export` returned `Unsupported("exporting a shadowsocks
+    /// profile")` and `PortableAuth` had no arm to import one — so spec §9's
+    /// portable import/export did not cover the protocol Phase 1b added.
+    #[test]
+    fn shadowsocks_round_trips_through_import_and_export() {
+        let dir = tmpdir("shadowsocks_round_trips_through_import_and_export");
+        let original = PortableProfile {
+            id: uuid::Uuid::nil(),
+            name: "lab-ss".into(),
+            protocol: ProtocolKind::Shadowsocks,
+            host: "198.51.100.7".into(),
+            port: 8388,
+            auth: PortableAuth::Shadowsocks {
+                method: "aes-256-gcm".into(),
+                password: "hunter2-SECRET".into(),
+            },
+            dns: serde_json::from_str(r#"["1.1.1.1"]"#).unwrap(),
+            split_tunnel: SplitTunnelRule::AllTraffic,
+            kill_switch: false,
+        };
+
+        let imported = original.clone().import(&dir).unwrap();
+        match &imported.auth {
+            AuthMethod::Shadowsocks { method, password } => {
+                // The inlined secret must land in a file, like every other.
+                assert!(matches!(password, SecretRef::File { .. }));
+                // The cipher is not secret and must survive verbatim: a
+                // defaulted one would be a cipher nobody chose, and
+                // Shadowsocks has no handshake in which to disagree.
+                assert_eq!(method, "aes-256-gcm");
+            }
+            other => panic!("wrong auth variant: {other:?}"),
+        }
+
+        let exported = PortableProfile::export(&imported, &FileSecretStore).unwrap();
+        assert_eq!(exported.auth, original.auth);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_portable_shadowsocks_password_is_never_printed_by_debug() {
+        let a = PortableAuth::Shadowsocks {
+            method: "aes-256-gcm".into(),
+            password: "hunter2-SECRET".into(),
+        };
+        let out = format!("{a:?}");
+        assert!(!out.contains("hunter2-SECRET"), "leaked: {out}");
+        // The cipher IS the useful half when diagnosing a refused profile.
+        assert!(out.contains("aes-256-gcm"), "should name the cipher: {out}");
     }
 
     #[test]

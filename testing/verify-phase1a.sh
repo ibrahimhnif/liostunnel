@@ -43,6 +43,12 @@ TARGET=${LIOS_TARGET:-$(docker inspect docker-target-1 \
 [ -n "$TARGET" ] || { echo "fixture not up — run: make -C testing/docker up"; exit 1; }
 FIXTURE_CIDR=${LIOS_CIDR:-$TARGET/32}
 HELPER=${LIOS_HELPER:-$repo/target/release/liostunnel-helper}
+# Read from the source of truth. Hardcoding it meant a bump turned every check
+# in this script into a version_mismatch, and the script would have reported
+# that as the gate working.
+WIRE_VERSION=$(sed -n 's/^pub const PROTOCOL_VERSION: u32 = \([0-9]*\);.*/\1/p' \
+  "$repo/crates/liostunnel-ffi/src/dto/protocol.rs")
+[ -n "$WIRE_VERSION" ] || { echo "cannot read PROTOCOL_VERSION"; exit 1; }
 
 pass=0; fail=0
 ok()   { echo "  PASS  $*"; pass=$((pass+1)); }
@@ -56,14 +62,33 @@ CLIENT_UID="${SUDO_UID:-}"
 [ -f "$PROFILE" ] || { echo "no profile at $PROFILE"; exit 1; }
 
 # Fills the fixture details into an embedded python client.
+# The protocol under test, read from the profile itself. The two escalation
+# checks below build their own bait profiles, and a bait profile of the WRONG
+# protocol proves the gate for a protocol nobody is testing -- which is what
+# this script did for every Shadowsocks run before the substitutions below.
+PROTO=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["protocol"])' "$PROFILE")
+case "$PROTO" in
+  shadowsocks)
+    BAITFILE='{"type":"shadowsocks","method":"aes-256-gcm","password":{"source":"file","path":"/tmp/lios-verify/rootkey"}}'
+    BAITENV='{"type":"shadowsocks","method":"aes-256-gcm","password":{"source":"env","var":"HOME"}}'
+    ;;
+  *)
+    BAITFILE='{"type":"private_key","private_key":{"source":"file","path":"/tmp/lios-verify/rootkey"}}'
+    BAITENV='{"type":"password","password":{"source":"env","var":"HOME"}}'
+    ;;
+esac
+
 subst() {
   sed -e "s|__HOST__|$SSH_HOST|g" -e "s|__PORT__|$SSH_PORT|g" \
-      -e "s|__CIDR__|$FIXTURE_CIDR|g" -e "s|__SSHUSER__|${LIOS_SSH_USER:-tunneluser}|g"
+      -e "s|__CIDR__|$FIXTURE_CIDR|g" -e "s|__SSHUSER__|${LIOS_SSH_USER:-tunneluser}|g" \
+      -e "s|__VER__|$WIRE_VERSION|g" -e "s|__PROTO__|$PROTO|g" \
+      -e "s|__BAITFILE__|$BAITFILE|g" -e "s|__BAITENV__|$BAITENV|g"
 }
 
 echo "helper : $HELPER"
 echo "client : uid $CLIENT_UID"
 echo "target : $TARGET via $FIXTURE_CIDR"
+echo "wire   : protocol_version $WIRE_VERSION, protocol $PROTO"
 
 # ---------------------------------------------------------------- baseline
 DEFAULT_BEFORE="$(default_route)"
@@ -106,7 +131,7 @@ import socket, sys, time
 try:
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     s.connect(sys.argv[1])
-    s.sendall(b'{"type":"hello","id":1,"protocol_version":1}\n')
+    s.sendall(b'{"type":"hello","id":1,"protocol_version":__VER__}\n')
     time.sleep(0.4)
     print("REPLY:" + repr(s.recv(65536)))
 except Exception as e:
@@ -138,12 +163,12 @@ IF_PRE="$(iface_list)"
 RT_PRE="$(routes | wc -l | tr -d ' ')"
 OUT=$(subst <<'PY' | sudo -u "#$CLIENT_UID" python3 - "$SOCK"
 import socket,sys,json,time
-prof=json.dumps({"id":"b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f","name":"evil","protocol":"ssh",
+prof=json.dumps({"id":"b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f","name":"evil","protocol":"__PROTO__",
   "host":"__HOST__","port":__PORT__,
-  "auth":{"type":"private_key","private_key":{"source":"file","path":"/tmp/lios-verify/rootkey"}},
+  "auth":__BAITFILE__,
   "dns":["1.1.1.1"],"split_tunnel":{"type":"all_traffic"},"kill_switch":False})
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(sys.argv[1])
-s.sendall(b'{"type":"hello","id":1,"protocol_version":1}\n')
+s.sendall(b'{"type":"hello","id":1,"protocol_version":__VER__}\n')
 s.sendall((json.dumps({"type":"connect","id":2,"params":{"profile_json":prof,"user":"__SSHUSER__",
   "route_mode":"test","cidrs":["__CIDR__"],"capture_dns":False,
   "tun_address":"10.90.0.1"}})+"\n").encode())
@@ -162,12 +187,12 @@ echo "$OUT" | grep -q '"kind":"secret_not_permitted"' \
 hdr "P1a-6b — an env-var secret is refused (it would read ROOT's environment)"
 OUT=$(subst <<'PY' | sudo -u "#$CLIENT_UID" python3 - "$SOCK"
 import socket,sys,json,time
-prof=json.dumps({"id":"b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f","name":"evil2","protocol":"ssh",
+prof=json.dumps({"id":"b6f1a0de-1f2c-4c3a-9b7e-0a1b2c3d4e2f","name":"evil2","protocol":"__PROTO__",
   "host":"__HOST__","port":__PORT__,
-  "auth":{"type":"password","password":{"source":"env","var":"HOME"}},
+  "auth":__BAITENV__,
   "dns":["1.1.1.1"],"split_tunnel":{"type":"all_traffic"},"kill_switch":False})
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(sys.argv[1])
-s.sendall(b'{"type":"hello","id":1,"protocol_version":1}\n')
+s.sendall(b'{"type":"hello","id":1,"protocol_version":__VER__}\n')
 s.sendall((json.dumps({"type":"connect","id":2,"params":{"profile_json":prof,"user":"__SSHUSER__",
   "route_mode":"test","cidrs":["__CIDR__"],"capture_dns":False,
   "tun_address":"10.90.0.1"}})+"\n").encode())
@@ -208,7 +233,7 @@ def read(n=1, t=15):
         out.append(json.loads(line))
     return out
 
-send({"type":"hello","id":1,"protocol_version":1}); read(1)
+send({"type":"hello","id":1,"protocol_version":__VER__}); read(1)
 send({"type":"connect","id":2,"params":{"profile_json":prof,"user":"__SSHUSER__",
       "route_mode":"test","cidrs":["__CIDR__"],"capture_dns":False,
       "tun_address":"10.90.0.1"}})
@@ -268,7 +293,7 @@ echo "  route: ${RT_TUN:-<none>}"
 OUT=$(subst <<'PY' | sudo -u "#$CLIENT_UID" python3 - "$SOCK"
 import socket,sys,json,time
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(sys.argv[1])
-s.sendall(b'{"type":"hello","id":1,"protocol_version":1}\n')
+s.sendall(b'{"type":"hello","id":1,"protocol_version":__VER__}\n')
 s.sendall(b'{"type":"get_status","id":2}\n'); time.sleep(0.8)
 print(s.recv(65536).decode().strip())
 PY
@@ -282,7 +307,7 @@ hdr "teardown"
 subst <<'PY' | sudo -u "#$CLIENT_UID" python3 - "$SOCK"
 import socket,sys,time
 s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect(sys.argv[1])
-s.sendall(b'{"type":"hello","id":1,"protocol_version":1}\n')
+s.sendall(b'{"type":"hello","id":1,"protocol_version":__VER__}\n')
 s.sendall(b'{"type":"disconnect","id":2}\n'); time.sleep(1.5)
 print("  "+s.recv(65536).decode().strip().replace("\n","\n  "))
 PY

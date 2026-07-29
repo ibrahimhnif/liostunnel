@@ -98,25 +98,42 @@ fn profile(port: u16, method: &str) -> ServerProfile {
 #[tokio::test]
 #[ignore = "needs the fixture: make -C testing/docker up"]
 async fn the_probe_reaches_a_resolver_only_the_relay_can_reach() {
+    // Whether the resolver answers this machine directly is a property of the
+    // platform, not of the code: Docker Desktop does not route compose
+    // networks to the host, native Linux Docker does. Asserting
+    // unreachability would pass here and fail in CI for a reason having
+    // nothing to do with the tunnel -- and this repo has been bitten by that
+    // exact difference before (see verify-phase1a.sh's note on the bridge
+    // route). It is reported, not asserted.
     let resolver = std::net::SocketAddr::new(internal_resolver(), 53);
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            tokio::net::TcpStream::connect(resolver),
-        )
-        .await
-        .map(|r| r.is_err())
-        .unwrap_or(true),
-        "{resolver} answers this machine directly; the probe succeeding would \
-         then say nothing about whether the relay carried it"
-    );
+    let direct = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect(resolver),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+    eprintln!("note: {resolver} reachable directly from this host: {direct}");
 
-    // And the profile that names it connects anyway, which it can only do by
-    // relaying the probe's query through the Shadowsocks server.
+    // The platform-independent proof is the counters. `CountingStream` wraps
+    // ONLY streams that came out of `ProxyClientStream`, so a byte counted
+    // here is a byte the Shadowsocks server relayed. The probe writes a
+    // 19-byte DNS query and reads its 2-byte length prefix; nothing else in
+    // `connect` moves a byte.
     let mut t = ShadowsocksTunnel::new();
     t.connect(&profile(8388, "aes-256-gcm"), &Pw(password()))
         .await
         .expect("the probe's query must travel through the relay");
+    let s = t.stats();
+    assert_eq!(
+        s.bytes_up, 19,
+        "the probe's query did not go through the relay"
+    );
+    assert!(
+        s.bytes_down >= 2,
+        "nothing came back through the relay: down={}",
+        s.bytes_down
+    );
 }
 
 #[tokio::test]
@@ -144,30 +161,28 @@ async fn connects_to_the_rust_server_with_a_chacha_cipher() {
 
 /// P1b-1 at the protocol layer: bytes out and bytes back.
 ///
-/// The target is reachable only from inside the compose network -- the host
-/// publishes no port for it -- so a successful fetch proves the bytes really
-/// traversed the Shadowsocks relay rather than taking a direct route. The
-/// plan named a public IP for this; that address was example.com's and has
-/// since been retired, which would have failed the test for a reason having
-/// nothing to do with the tunnel, and would have made the result depend on
-/// the machine's own internet access.
+/// The target sits on the compose network and the host publishes no port for
+/// it. The plan named a public IP for this; that address was example.com's
+/// and has since been retired, which would have failed the test for a reason
+/// having nothing to do with the tunnel, and would have made the result
+/// depend on the machine's own internet access.
+///
+/// What proves the bytes traversed the relay is the counter delta below, not
+/// the target's reachability -- whether a compose address answers the host
+/// directly is a property of the platform (Docker Desktop no, native Linux
+/// Docker yes), so asserting on it would pass here and fail in CI.
 #[tokio::test]
 #[ignore = "needs the fixture: make -C testing/docker up"]
 async fn relays_a_real_http_request_to_a_target_only_it_can_reach() {
     let target = internal_target();
-
-    // Not reachable from here, only from inside the compose network. If this
-    // succeeded, the fetch below would prove nothing.
-    assert!(
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            tokio::net::TcpStream::connect(target),
-        )
-        .await
-        .map(|r| r.is_err())
-        .unwrap_or(true),
-        "{target} is reachable without the tunnel; this test would prove nothing"
-    );
+    let direct = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect(target),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+    eprintln!("note: {target} reachable directly from this host: {direct}");
 
     let mut t = ShadowsocksTunnel::new();
     t.connect(&profile(8388, "aes-256-gcm"), &Pw(password()))
