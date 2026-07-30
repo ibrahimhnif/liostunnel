@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=LiosTunnel
+Exec=liostunnel_app
+Icon=liostunnel
+Categories=Network;
+Terminal=false
