@@ -592,6 +592,26 @@ that reads like a Flutter bug, and libfuse2 is what appimagetool needs.
 there means something reinstalling from the app would paper over. Its message
 names the package instead.
 
+**Found during Task 3, and it changes this task's design.** An AppImage mounts
+its squashfs through libfuse **without `allow_other`**, so the kernel denies
+that mountpoint to every user except the one who mounted it — **including
+root**. Pointing `pkexec` at
+`/tmp/.mount_XXXXXX/usr/bin/helper/install-helper.sh` gets EACCES and the
+script never runs.
+
+So the app must **copy `helper/` out of the mount to a real filesystem path
+before elevating**, and run the copy. A temporary directory the invoking user
+owns is the right place; `install-helper.sh` finds its binary beside itself,
+so the whole directory moves together or nothing works. Delete the copy
+afterwards.
+
+`helperBundleDir()` therefore has two jobs that must not be conflated: *where
+the bundled helper is read from* (inside the mount) and *what path is handed
+to `pkexec`* (the copy). A test must assert they differ, because the version
+that "works" on a developer machine — where the app runs from a plain
+directory rather than a mount — is exactly the version that fails only under
+an AppImage.
+
 - [ ] **Step 1: Write the failing unit tests**
 
 Create `app/test/helper_install_test.dart`:
