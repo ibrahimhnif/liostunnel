@@ -1,5 +1,8 @@
 /target
 /target-linux
+# Release archives assembled by packaging/make-bundle.sh. Rebuilt from a
+# commit, never a source of truth, and each one is the whole app.
+/dist
 **/*.rs.bk
 *.pdb
 
