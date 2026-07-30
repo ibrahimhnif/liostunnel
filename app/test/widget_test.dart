@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -13,6 +14,7 @@ import 'package:liostunnel_app/screens/profile_editor.dart';
 import 'package:liostunnel_app/screens/profiles.dart';
 import 'package:liostunnel_app/services/connection_model.dart';
 import 'package:liostunnel_app/services/helper_client.dart';
+import 'package:liostunnel_app/services/helper_install.dart';
 import 'package:liostunnel_app/services/link_export.dart';
 import 'package:liostunnel_app/services/profile_store.dart';
 import 'package:liostunnel_app/services/profile_writer.dart';
@@ -585,6 +587,7 @@ void main() {
   deleteTests();
   listActionTests();
   editorTests();
+  installTests();
 
   test('a missing profiles directory is empty, not an error', () async {
     final loaded = await ProfileStore(
@@ -2268,3 +2271,191 @@ void editorTests() {
         reason: 'one profile went in and one came out');
   });
 }
+
+// --- installing the helper on first launch --------------------------------
+// These pump the real [HomePage], because what is being tested is the wiring:
+// which failure triggers an install, on which platform, and how many times.
+
+/// Pumps the home page with the privileged installer replaced.
+///
+/// No test may raise a real authorization dialog, so the installer is always
+/// injected. The socket path names a file that cannot exist, so the client
+/// fails with ENOENT — the "never installed" case, which is the only one that
+/// triggers an install.
+///
+/// No `runAsync`, unlike [pumpHome]: connecting to an absent unix socket fails
+/// synchronously (the native connect(2) returns ENOENT before any event loop
+/// turn), so the fake-async zone does deliver it. Every assertion below that
+/// reads a banner is there to prove that — a page whose `_attach` had parked
+/// forever would satisfy "the installer was not called" for the wrong reason.
+Future<void> pumpHomeWithInstaller(
+  WidgetTester tester, {
+  required Future<InstallResult> Function(int) installer,
+  bool? installsHelper,
+  String? socketPath,
+}) async {
+  tester.view.physicalSize = const Size(1200, 2400);
+  tester.view.devicePixelRatio = 1.0;
+  addTearDown(tester.view.reset);
+  final dir = Directory.systemTemp.createTempSync('lios-install');
+  addTearDown(() => dir.deleteSync(recursive: true));
+  await tester.pumpWidget(wrap(
+    ConnectionModel(),
+    HomePage(
+      profilesDirectory: dir.path,
+      socketPath: socketPath ?? '${dir.path}/nonexistent.sock',
+      installer: installer,
+      installsHelper: installsHelper,
+    ),
+  ));
+  await tester.pump();
+}
+
+/// Both the install panel and the error banner live on the Connection tab.
+///
+/// The app opens on Profiles, so a `find` straight after [pumpHomeWithInstaller]
+/// is looking at a screen neither one is built into. By icon, because
+/// "Connection" is also the other screen's AppBar title.
+Future<void> showConnectionTab(WidgetTester tester) async {
+  await tester.tap(find.byIcon(Icons.vpn_lock));
+  await tester.pumpAndSettle();
+}
+
+void installTests() {
+  testWidgets('a missing helper installs itself, once', (tester) async {
+    // PKG-7. A successful install sends the app back to `_attach`, where the
+    // socket is still absent — so without a guard the app installs, retries,
+    // installs, retries, raising the polkit dialog every time round. The user
+    // cannot escape that without force-quitting.
+    //
+    // `installsHelper` is overridden because the only platform that reaches
+    // this code is Linux, and this suite runs on macOS too: without it the
+    // count below would be 0 here whether the guard exists or not, and the
+    // test would pass against its own defect.
+    var calls = 0;
+    await pumpHomeWithInstaller(
+      tester,
+      installsHelper: true,
+      installer: (uid) async {
+        calls++;
+        return calls == 1
+            ? const InstallResult(InstallOutcome.installed, '')
+            : const InstallResult(
+                InstallOutcome.cancelled, 'Installation was cancelled.');
+      },
+    );
+    await tester.pump(const Duration(seconds: 5));
+    await tester.pump(const Duration(seconds: 5));
+    expect(calls, 1, reason: 'a second prompt is a loop the user cannot escape');
+  });
+
+  testWidgets('a cancelled install shows the command, not an error',
+      (tester) async {
+    await pumpHomeWithInstaller(
+      tester,
+      installsHelper: true,
+      installer: (uid) async => const InstallResult(
+          InstallOutcome.cancelled, 'Installation was cancelled.'),
+    );
+    await showConnectionTab(tester);
+    expect(find.byKey(const Key('install-panel')), findsOneWidget);
+    expect(find.textContaining('install-helper.sh'), findsOneWidget,
+        reason: 'what remains of "read it before it runs as root"');
+    expect(find.byKey(const Key('install-retry')), findsOneWidget,
+        reason: 'the way back, for the user who asked for it');
+  });
+
+  testWidgets('macOS never runs a privileged command', (tester) async {
+    // PKG-8. No override here, deliberately: this reads the real platform.
+    if (Platform.isLinux) return;
+    var calls = 0;
+    await pumpHomeWithInstaller(
+      tester,
+      installer: (uid) async {
+        calls++;
+        return const InstallResult(InstallOutcome.installed, '');
+      },
+    );
+    await showConnectionTab(tester);
+    expect(calls, 0,
+        reason: 'the package installs the helper; the app must not');
+    // And not because nothing happened: the socket really was absent and the
+    // failure really did arrive. This is the exact case Linux installs on.
+    expect(find.byKey(const Key('error-banner')), findsOneWidget);
+    expect(find.textContaining('installer package'), findsOneWidget,
+        reason: 'a missing helper on macOS is a broken install, and the '
+            'message names the thing that fixes it');
+    expect(find.byKey(const Key('install-panel')), findsNothing);
+  });
+
+  testWidgets('a helper installed for somebody else is not reinstalled',
+      (tester) async {
+    // EACCES, not ENOENT. There IS a helper; it authorizes another account.
+    // Installing a second one cannot help, and the dialog would be asking for
+    // a password to change nothing.
+    //
+    // A directory with no search bit is how the connect is refused, so root —
+    // which traverses it anyway — would get ENOENT and the wrong branch.
+    if (currentUid() == 0) {
+      markTestSkipped('run as root: a 0000 directory refuses nobody');
+      return;
+    }
+    final closed = Directory.systemTemp.createTempSync('lios-closed');
+    addTearDown(() {
+      Process.runSync('chmod', ['0700', closed.path]);
+      closed.deleteSync(recursive: true);
+    });
+    Process.runSync('chmod', ['0000', closed.path]);
+
+    var calls = 0;
+    await pumpHomeWithInstaller(
+      tester,
+      installsHelper: true,
+      socketPath: '${closed.path}/liostunnel.sock',
+      installer: (uid) async {
+        calls++;
+        return const InstallResult(InstallOutcome.installed, '');
+      },
+    );
+    await showConnectionTab(tester);
+    expect(calls, 0, reason: 'a second helper is not the fix for this one');
+    expect(find.textContaining('different user'), findsOneWidget,
+        reason: 'proves the connect failed with EACCES rather than ENOENT — '
+            'without this the count above passes on a page that never got '
+            'as far as failing');
+  });
+
+  testWidgets('the retry button will not put a second dialog over the first',
+      (tester) async {
+    // The panel names the command while the dialog is up, so its button is on
+    // screen at the one moment pressing it would ask for a second password
+    // for the same install.
+    final gate = Completer<InstallResult>();
+    var calls = 0;
+    await pumpHomeWithInstaller(
+      tester,
+      installsHelper: true,
+      installer: (uid) {
+        calls++;
+        return gate.future;
+      },
+    );
+    await showConnectionTab(tester);
+    expect(calls, 1);
+    expect(retryButton(tester).onPressed, isNull,
+        reason: 'an install is already waiting on this user');
+
+    gate.complete(const InstallResult(
+        InstallOutcome.cancelled, 'Installation was cancelled.'));
+    await tester.pumpAndSettle();
+    expect(calls, 1);
+    expect(retryButton(tester).onPressed, isNotNull,
+        reason: 'and afterwards it is the way back');
+  });
+}
+
+/// The panel's one button, read off the widget rather than tapped: a disabled
+/// button swallows a tap, so tapping proves nothing about whether it was
+/// disabled or the handler simply did nothing.
+FilledButton retryButton(WidgetTester tester) =>
+    tester.widget<FilledButton>(find.byKey(const Key('install-retry')));

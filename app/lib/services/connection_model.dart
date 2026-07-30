@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 
 import '../src/rust/api/protocol.dart';
@@ -32,6 +34,18 @@ class ConnectionModel extends ChangeNotifier {
   BigInt _flowsFailed = BigInt.zero;
   BigInt _dnsQueries = BigInt.zero;
   Fault? _lastFault;
+
+  /// What the first-launch installer is doing, if anything.
+  ///
+  /// Separate from [Fault] because it is not a fault: an install in progress
+  /// is a normal startup, and a cancelled one is the user's answer.
+  String? _installNotice;
+  String? get installNotice => _installNotice;
+
+  set installNotice(String? v) {
+    _installNotice = v;
+    notifyListeners();
+  }
 
   String get state => _state;
   bool get isConnected => _state == 'Connected';
@@ -100,9 +114,16 @@ class ConnectionModel extends ChangeNotifier {
   /// would break the first time that text changed.
   String? get userFacingError => switch (_lastFault) {
     null => null,
-    Fault.helperNotInstalled =>
-      'The helper is not installed or not running. '
-          'Run packaging/install-helper.sh.',
+    // Neither shipped artifact has a `packaging/` in it, which is what this
+    // used to send the user looking for. On macOS the package already
+    // installed the helper, so a missing one is a broken install rather than
+    // an absent one — and reinstalling from the app would paper over whatever
+    // removed it. On Linux the app offers to install it itself, in the panel
+    // above this banner, so the sentence does not need to name a command.
+    Fault.helperNotInstalled => Platform.isMacOS
+        ? 'The helper is not installed. Reinstall LiosTunnel from its '
+              'installer package.'
+        : 'The helper is not installed or not running.',
     Fault.notAuthorized =>
       'You are not authorized to use the helper. It was installed '
           'for a different user.',

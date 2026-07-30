@@ -11,11 +11,20 @@ class ConnectionScreen extends StatelessWidget {
     required this.selected,
     required this.onConnect,
     required this.onDisconnect,
+    this.installCommandText,
+    this.onRetryInstall,
   });
 
   final LoadedProfile? selected;
   final VoidCallback onConnect;
   final VoidCallback onDisconnect;
+
+  /// The install command, shown beside the notice so it can be read before it
+  /// is run as root. Null once there is nothing to install.
+  final String? installCommandText;
+
+  /// Asks for the install again — the only thing that does, after a cancel.
+  final VoidCallback? onRetryInstall;
 
   @override
   Widget build(BuildContext context) {
@@ -29,6 +38,38 @@ class ConnectionScreen extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // Above the banner, and not styled as an error: a first launch
+            // that has not installed the helper yet is a normal first launch,
+            // and a cancelled install is the user's answer rather than a
+            // fault.
+            if (m.installNotice != null)
+              Card(
+                key: const Key('install-panel'),
+                color: Theme.of(context).colorScheme.secondaryContainer,
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(m.installNotice!),
+                      if (installCommandText != null) ...[
+                        const SizedBox(height: 8),
+                        // What remains of "read it before it runs as root".
+                        SelectableText(
+                          installCommandText!,
+                          style: const TextStyle(fontFamily: 'monospace'),
+                        ),
+                        const SizedBox(height: 8),
+                        FilledButton.tonal(
+                          key: const Key('install-retry'),
+                          onPressed: onRetryInstall,
+                          child: const Text('Install the helper'),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
             if (m.userFacingError != null)
               Card(
                 key: const Key('error-banner'),
