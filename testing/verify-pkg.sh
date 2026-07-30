@@ -117,20 +117,116 @@ else
   bad "the payload is relocatable; it would install over a stray copy elsewhere"
 fi
 
-# The postinstall: present, executable, and carrying both rules.
+# The postinstall: present, executable, and behaving.
 post="$(find "$tmp/x" -name postinstall | head -1)"
 [ -n "$post" ] && [ -x "$post" ] && ok "postinstall is present and executable" \
                                  || bad "no executable postinstall"
+
+# These used to be three greps -- for `--uid`, for `/dev/console`, and for
+# `-ge 500|-lt 500`. A grep passes on the rule INVERTED, on the rule as dead
+# code after the `exec`, and on the rule sitting in a comment. All three were
+# built as real packages and all three scored a clean sweep, including the one
+# that refuses every human and authorizes _mbsetupuser. So run the file.
+#
+# It can be run for real without touching anything and without root. Installer
+# hands the destination volume's mountpoint to the script as $3, so pointing
+# $3 at a temp tree makes the postinstall resolve its own helper path inside
+# that tree -- where a stub install-helper.sh records the argv it was given and
+# installs nothing. A fake `stat` earlier on PATH supplies the console uid and
+# records how it was asked for it. Nothing is installed, nothing needs root,
+# and /Library/LaunchDaemons is never reachable from here.
+vol="$tmp/vol"
+post_rc=0; post_argv=""; post_msg=""; stat_argv=""
+run_post() { # $1: what `stat -f %u /dev/console` should print
+  # ${tmp:?} and not $tmp: an `rm -rf` whose first component could go empty is
+  # how this repo lost work once already.
+  rm -rf "${vol:?}" "${tmp:?}/bin" "${tmp:?}/argv" "${tmp:?}/statargv"
+  mkdir -p "$vol/Applications/liostunnel_app.app/Contents/Resources/helper" "$tmp/bin"
+  stub="$vol/Applications/liostunnel_app.app/Contents/Resources/helper/install-helper.sh"
+  { echo '#!/usr/bin/env bash'
+    echo "printf '%s' \"\$*\" > '$tmp/argv'"; } > "$stub"
+  { echo '#!/usr/bin/env bash'
+    echo "printf '%s' \"\$*\" > '$tmp/statargv'"
+    echo "printf '%s' '$1'"; } > "$tmp/bin/stat"
+  chmod 755 "$stub" "$tmp/bin/stat"
+  post_msg="$(PATH="$tmp/bin:$PATH" "$post" /dev/null "$vol" "$vol" 2>&1)"; post_rc=$?
+  post_argv="$( [ -f "$tmp/argv" ] && cat "$tmp/argv" || echo '<not called>' )"
+  stat_argv="$(cat "$tmp/statargv" 2>/dev/null || true)"
+}
+
 if [ -n "$post" ]; then
-  grep -q -- '--uid' "$post" && ok "postinstall passes --uid" \
-                             || bad "postinstall does not pass --uid"
-  grep -q '/dev/console' "$post" && ok "postinstall reads the console user" \
-                                 || bad "postinstall does not read the console user"
-  # PKG-3. uid 0 is caught by install-helper.sh; _mbsetupuser (248) is not,
-  # and a helper serving an account that stops existing is the failure.
-  grep -qE '\-ge 500|\-lt 500' "$post" \
-    && ok "postinstall refuses a system account (uid < 500)" \
-    || bad "postinstall would authorize _mbsetupuser during Setup Assistant"
+  # A real console user. This is also the target-volume assertion: the stub it
+  # has to reach lives under $3, not under /Applications, so a postinstall with
+  # the path hardcoded reaches nothing and reports <not called>.
+  run_post 501
+  [ "$post_argv" = "--uid 501" ] \
+    && ok "postinstall hands install-helper.sh --uid 501, on the volume it was given" \
+    || bad "postinstall did not authorize the console user on \$3 (got: $post_argv)"
+  [ "$stat_argv" = "-f %u /dev/console" ] \
+    && ok "postinstall reads the console user with stat -f %u /dev/console" \
+    || bad "postinstall did not read /dev/console (stat argv: $stat_argv)"
+
+  # "Not called, and exited non-zero" is NOT enough to call something a
+  # refusal, and assuming it was cost this file a round: a postinstall with
+  # /Applications hardcoded reaches no install-helper.sh at all, so `exec`
+  # fails and it exits non-zero for EVERY uid -- and three mutants, including
+  # one that refuses every human and authorizes _mbsetupuser, sailed through
+  # the uid assertions on the strength of a crash. A refusal is a rule firing,
+  # and the way to tell one from a crash is that a rule says something useful:
+  # the refusal has to name the command that finishes the job, on the volume
+  # the app actually went to. That is also the whole point of the message --
+  # it lands in /var/log/install.log, where nobody looks, and it is the only
+  # thing an admin gets.
+  refused() { # $1: what it was asked to refuse
+    if [ "$post_argv" != "<not called>" ]; then
+      bad "postinstall authorized $1 (install-helper.sh got: $post_argv)"
+    elif [ "$post_rc" -eq 0 ]; then
+      bad "postinstall exited 0 on $1 without installing the helper"
+    else
+      case "$post_msg" in
+        # A shell diagnostic where the refusal should be. `[ "$uid" -ge 500 ]`
+        # on something that is not a number prints this and returns 2 -- the
+        # `||` catches it, so the refusal is fail-CLOSED either way, and that
+        # is precisely why deleting the `case` guard that parses the uid first
+        # left this whole block green. The difference the guard makes is the
+        # only thing anyone ever sees: whether install.log leads with
+        # "integer expected" or with the sentence that says what to do.
+        *"integer expected"*|*"integer expression expected"*)
+          bad "postinstall refused $1 by way of a shell error, not a rule: $post_msg" ;;
+        *"$vol/Applications/liostunnel_app.app/Contents/Resources/helper/install-helper.sh --uid"*)
+          ok "postinstall refuses $1, and says how to finish the job by hand" ;;
+        *)
+          bad "postinstall failed on $1 without naming the command to run: $post_msg" ;;
+      esac
+    fi
+  }
+
+  # uid 0. install-helper.sh refuses this too, but a postinstall that gets
+  # there has already decided root is a legitimate client.
+  run_post 0
+  refused "console uid 0"
+
+  # PKG-3. _mbsetupuser during Setup Assistant is not 0, so install-helper.sh's
+  # uid-0 guard does not catch it, and a helper serving an account that stops
+  # existing the moment setup finishes is the failure this rule exists for.
+  run_post 248
+  refused "_mbsetupuser (uid 248)"
+
+  # And an unreadable one -- the login window, or SSH with no console session.
+  # `[ "$uid" -lt 500 ]` as an `if` condition is exempt from `set -e` and
+  # returns 2 on a non-integer, which `if` reads as false: this used to fall
+  # through to `exec install-helper.sh --uid ''`.
+  run_post ""
+  refused "a console uid it could not read"
+
+  # Belt and braces on the volume: a literal leading /Applications anywhere in
+  # the code is the hardcoded path coming back. Comments are stripped first --
+  # this file's comments discuss /Applications at length.
+  if sed 's/#.*//' "$post" | grep -qE "(^|[[:space:]\"'=])/Applications"; then
+    bad "postinstall hardcodes /Applications instead of deriving it from \$3"
+  else
+    ok "postinstall does not hardcode /Applications"
+  fi
 fi
 
 echo

@@ -6,21 +6,62 @@
 # root-owned unit file and loads a daemon. So this defers to the one script
 # that owns that logic, rather than being a second implementation of it.
 set -euo pipefail
-helper=/Applications/liostunnel_app.app/Contents/Resources/helper
+
+# Where the payload actually went. Installer passes the destination volume's
+# mountpoint as $3, and `installer -pkg ... -target /Volumes/Spare` puts the
+# app at /Volumes/Spare/Applications/liostunnel_app.app. A hardcoded
+# /Applications would then read a path that does not exist: `exec` fails, the
+# install is reported failed -- with the app already written to disk. That is
+# the same failure relocation causes, and this phase already decided it was
+# worth fixing.
+#
+# The default is for running this by hand, where there is no $3 and `set -u`
+# makes a bare one fatal. The trailing slash is stripped so the join below
+# cannot produce "//Applications".
+vol="${3:-/}"
+vol="${vol%/}"
+helper="$vol/Applications/liostunnel_app.app/Contents/Resources/helper"
 
 # Who is actually using this machine. The installer runs as root and neither
 # SUDO_UID nor PKEXEC_UID exists here, so the console user is the only honest
 # source -- `id -u` would say 0, and a helper authorizing root accepts a root
 # client, which is the whole boundary gone.
-uid="$(stat -f %u /dev/console)"
+#
+# `|| true` because at the login window this can fail outright, and dying on
+# the assignment would take the actionable refusal below with it.
+uid="$(stat -f %u /dev/console 2>/dev/null || true)"
+
+# An install that did not install the helper is a failed install, and saying
+# otherwise would be worse -- so these refusals exit 1 and Installer reports
+# the failure. But the refusal goes to /var/log/install.log, where nobody
+# looks, so it has to carry the command that fixes it. That command is built
+# from the same target-volume path, because on a `-target /Volumes/Spare`
+# install /Applications is not where the script is.
+refuse() {
+  echo "liostunnel: $1" >&2
+  echo "liostunnel: the app is installed; its privileged helper is not." >&2
+  echo "liostunnel: log in as the account that will use it, then run:" >&2
+  echo "liostunnel:   sudo $helper/install-helper.sh --uid \$(id -u)" >&2
+  exit 1
+}
+
+# Refuse what cannot be parsed, BEFORE comparing it. `[ "$uid" -lt 500 ]` as
+# an `if` condition is exempt from `set -e`: on a non-integer it prints
+# "integer expression expected" and returns 2, which `if` reads as false -- so
+# an empty uid fell straight through to `exec install-helper.sh --uid ''`. It
+# was caught only because install-helper.sh validates again. At the login
+# window, over SSH with no console session, and during Setup Assistant this is
+# exactly the input that arrives, and the one rule this file exists to enforce
+# must not fail open on something it could not read.
+case "$uid" in
+  ''|*[!0-9]*) refuse "cannot read the console user (got \"$uid\")" ;;
+esac
 
 # And refuse the system accounts. During Setup Assistant the console user is
 # `_mbsetupuser` (uid 248) -- not 0, so install-helper.sh's uid-0 guard would
 # let it through, and the helper would end up serving an account that stops
 # existing the moment setup finishes. Regular macOS accounts start at 501.
-if [ "$uid" -lt 500 ]; then
-  echo "no logged-in user to authorize (console uid $uid)" >&2
-  exit 1
-fi
+# `||` and not `if`, so a uid too long for `[` to compare refuses too.
+[ "$uid" -ge 500 ] || refuse "no logged-in user to authorize (console uid $uid)"
 
 exec "$helper/install-helper.sh" --uid "$uid"
