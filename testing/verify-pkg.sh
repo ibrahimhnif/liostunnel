@@ -30,8 +30,33 @@ mkdir -p "$tmp/p" && (cd "$tmp/p" && tar xzf "$payload" 2>/dev/null || \
 app="$tmp/p/Applications/liostunnel_app.app"
 helper="$app/Contents/Resources/helper"
 
-[ -d "$app" ] && ok "the payload installs the app to /Applications" \
+# Located, not assumed. A productbuild wrapper puts the component's
+# PackageInfo one level down inside <component>.pkg/, and a hardcoded
+# "$tmp/x/PackageInfo" would then fail a package that is perfectly correct for
+# being wrapped. Everything else in this file already uses `find`.
+pkginfo="$(find "$tmp/x" -name PackageInfo | head -1)"
+[ -n "$pkginfo" ] || { echo "no PackageInfo in the package"; exit 1; }
+
+# Where the payload lands is TWO facts and only one of them is in the payload.
+# The cpio holds `Applications/liostunnel_app.app` -- a RELATIVE path, which
+# says nothing about the root it is unpacked under. PackageInfo's
+# install-location supplies that root. Built with `--install-location
+# /tmp/wrong` the payload is byte-identical and the app installs to
+# /tmp/wrong/Applications/liostunnel_app.app; the postinstall's fixed path
+# then does not exist, `exec` fails, and the install dies AFTER the app has
+# landed in the wrong place -- the same failure relocation causes, approached
+# from the other end. Reading the relative path alone passed that package
+# 13 out of 13.
+[ -d "$app" ] && ok "the payload carries Applications/liostunnel_app.app" \
               || bad "no Applications/liostunnel_app.app in the payload"
+loc="$(sed -n 's/.*install-location="\([^"]*\)".*/\1/p' "$pkginfo" | head -1)"
+# pkgbuild omits the attribute entirely when --install-location is not passed,
+# and an absent one means "/" -- so absent is correct, and anything else is not.
+if [ -z "$loc" ] || [ "$loc" = "/" ]; then
+  ok "the package installs relative to / -- the app lands in /Applications"
+else
+  bad "install-location is \"$loc\"; the app would land in $loc/Applications"
+fi
 [ -x "$app/Contents/MacOS/liostunnel_app" ] \
   && ok "the app executable is present and executable" \
   || bad "no executable at Contents/MacOS/liostunnel_app"
@@ -43,8 +68,17 @@ done
 [ -f "$helper/liostunnel-helper.plist" ] && ok "the launchd plist is present" \
                                          || bad "missing liostunnel-helper.plist"
 # A systemd unit in a macOS package reads as an oversight, not symmetry.
-[ ! -f "$helper/liostunnel-helper.service" ] \
-  && ok "the systemd unit is absent" || bad "a systemd unit is in a macOS package"
+# The directory has to exist before its absence means anything: `[ ! -f ]`
+# against a path under a directory that is not there is trivially true, so a
+# payload with no Contents/Resources/helper at all passed this line while
+# claiming to have looked inside it.
+if [ ! -d "$helper" ]; then
+  bad "no helper directory, so nothing was checked for a systemd unit"
+elif [ ! -f "$helper/liostunnel-helper.service" ]; then
+  ok "the systemd unit is absent"
+else
+  bad "a systemd unit is in a macOS package"
+fi
 
 # A binary that runs on THIS platform -- not a placeholder, not the wrong arch.
 v="$("$helper/liostunnel-helper" --version 2>&1)"
@@ -64,7 +98,20 @@ fi
 # alone appears throughout PackageInfo's own inventory (`<bundle-version>`,
 # `<upgrade-bundle>`, `<strict-identifier>`), so grepping for it fails a
 # perfectly good package. That mistake was made here first.
-if grep -q '<relocate/>' "$tmp/x/PackageInfo"; then
+#
+# But an empty `<relocate/>` only means something if there is a bundle to
+# relocate. Delete Contents/Info.plist from the payload and pkgbuild registers
+# no bundle components at all: `<relocate/>` is empty for want of anything to
+# list, and the suite scored 13 of 13 on an app that cannot launch. So pair
+# them -- the app must BE a registered bundle, and that bundle must not be
+# relocatable. Anchored on the app's own path, which appears once, and not on
+# the nested framework bundles that share its prefix.
+if grep -q '<bundle path="\./Applications/liostunnel_app\.app"' "$pkginfo"; then
+  ok "the app is a registered bundle component"
+else
+  bad "no bundle component for ./Applications/liostunnel_app.app -- is Contents/Info.plist missing?"
+fi
+if grep -q '<relocate/>' "$pkginfo"; then
   ok "the payload is not relocatable"
 else
   bad "the payload is relocatable; it would install over a stray copy elsewhere"
