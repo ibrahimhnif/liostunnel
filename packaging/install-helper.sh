@@ -43,6 +43,20 @@ case "$uid" in ''|*[!0-9]*) die "not a uid: $uid" ;; esac
 [ "$uid" -ne 0 ] || die "refusing to authorize uid 0; the helper must serve an unprivileged user"
 user="$(id -un "$uid" 2>/dev/null || echo "uid $uid")"
 
+# Root last, deliberately, and this ordering is load-bearing.
+#
+# It used to come first, which made every uid assertion below unreachable in a
+# test: the script died here before the uid logic ran, so deleting the uid-0
+# refusal entirely left the suite green. Validating the arguments before
+# demanding the privilege fixes that AND is the better order anyway -- a user
+# who types `--uid 0` should be told that is the problem, not told to try again
+# with sudo and only then be refused.
+#
+# The guard itself is not optional. Without it, running this as a normal user
+# gets part-way through and fails on a permission error from `install`, which
+# reads as a broken installer rather than a missing `sudo`.
+[ "$(id -u)" -eq 0 ] || die "must run as root (use sudo)"
+
 # Beside this script in a bundle, under target/release in a checkout. One
 # script serving both beats a second copy free to drift from the first --
 # the same argument the profile format makes for having one parser.
