@@ -40,26 +40,73 @@ root="$tmp/squashfs-root"
 [ -x "$root/AppRun" ] && ok "AppRun is present and executable" || bad "no executable AppRun"
 [ -x "$root/usr/bin/liostunnel_app" ] && ok "the app executable is present" \
                                       || bad "no executable at usr/bin/liostunnel_app"
-[ -f "$root/liostunnel.desktop" ] && ok "the desktop entry is present" || bad "no .desktop"
-[ -f "$root/liostunnel.png" ] && ok "the icon is present" || bad "no icon"
+# One path does not certify a payload. A Flutter Linux bundle is the executable
+# PLUS the engine it links at runtime PLUS the assets it loads at startup, and
+# the ways to lose the last two while keeping the first are ordinary: an
+# interrupted build, a stale tree, a `cp -R` that hit ENOSPC part-way -- which
+# is not fatal per file, so it copies what it can and returns. Asserting only
+# usr/bin/liostunnel_app passed every one of those, and the AppImage then died
+# at launch with a loader error no assertion here had looked for. This is the
+# same hole as the deleted Info.plist in verify-pkg.sh: an assertion whose
+# subject is "the app" and whose object is a single path.
+[ -s "$root/usr/bin/lib/libflutter_linux_gtk.so" ] \
+  && ok "the Flutter engine library is present and non-empty" \
+  || bad "missing or empty usr/bin/lib/libflutter_linux_gtk.so — the app would not load"
+# Non-empty, not merely present: a `cp -R` interrupted between mkdir and the
+# contents leaves the directory behind, and `-d` alone calls that a payload.
+[ -n "$(ls -A "$root/usr/bin/data/flutter_assets" 2>/dev/null)" ] \
+  && ok "the Flutter assets are present" \
+  || bad "missing or empty usr/bin/data/flutter_assets — the app would not start"
+
+# Presence is not correctness for either of these. `Exec=liostunnel` builds,
+# scores a clean sweep, and integrates into the desktop menu as an entry that
+# launches nothing; the name has to be the executable that is actually in
+# there. Same for Icon=, which the AppImage spec resolves against the icon
+# file's basename at the AppDir root.
+if [ ! -f "$root/liostunnel.desktop" ]; then
+  bad "no .desktop"
+elif ! grep -qE '^Exec=liostunnel_app( |$)' "$root/liostunnel.desktop"; then
+  bad "the desktop entry does not exec liostunnel_app: $(grep -E '^Exec=' "$root/liostunnel.desktop" || echo '<no Exec= line>')"
+elif ! grep -qE '^Icon=liostunnel( |$)' "$root/liostunnel.desktop"; then
+  bad "the desktop entry's Icon= does not name liostunnel.png: $(grep -E '^Icon=' "$root/liostunnel.desktop" || echo '<no Icon= line>')"
+else
+  ok "the desktop entry execs liostunnel_app and names the bundled icon"
+fi
+[ -s "$root/liostunnel.png" ] && ok "the icon is present and non-empty" || bad "no icon, or a zero-byte one"
 
 inner="$root/usr/bin/helper"
 for f in liostunnel-helper install-helper.sh uninstall-helper.sh; do
   [ -x "$inner/$f" ] && ok "$f is inside the AppImage and executable" \
                      || bad "missing or not executable: $f"
 done
-[ -f "$inner/liostunnel-helper.service" ] && ok "the systemd unit is present" \
-                                          || bad "missing liostunnel-helper.service"
-# The directory has to exist before its absence means anything: `[ ! -f ]`
-# against a path under a directory that is not there is trivially true, so a
-# payload with no usr/bin/helper at all would pass this line while claiming
-# to have looked inside it.
-if [ ! -d "$inner" ]; then
-  bad "no helper directory, so nothing was checked for a launchd plist"
-elif [ ! -f "$inner/liostunnel-helper.plist" ]; then
-  ok "the launchd plist is absent"
+# Present is not usable. `-f` passes on a zero-byte file and on one whose
+# @UID@ placeholder has already been substituted or deleted -- and the
+# placeholder is the only thing that makes this file a template.
+# install-helper.sh does `sed "s/@UID@/$uid/" … > "$unit"`: with nothing left
+# to substitute, the unit installs with whatever uid was baked in (someone
+# else's) or with the literal string (which the helper's u32 parse rejects on
+# startup). Either way the failure surfaces as a daemon that never serves
+# anyone and that systemd's Restart=on-failure keeps resurrecting, which is
+# nobody's idea of a diagnostic.
+if [ ! -f "$inner/liostunnel-helper.service" ]; then
+  bad "missing liostunnel-helper.service"
+elif ! grep -q '@UID@' "$inner/liostunnel-helper.service"; then
+  bad "liostunnel-helper.service has no @UID@ for install-helper.sh to substitute"
 else
-  bad "a launchd plist is in a Linux AppImage"
+  ok "the systemd unit is present, with its @UID@ placeholder intact"
+fi
+# Artifact-wide, not one directory. A plist at the AppDir root or under
+# usr/share ships exactly as far as one in usr/bin/helper, and a check scoped
+# to that directory does not see it. Searching $root also retires the "does
+# $inner exist" guard this needed before: `find` over the whole tree cannot go
+# vacuous when a subdirectory is missing, the way `[ ! -f "$inner/x" ]` does.
+# verify-pkg.sh's mirror of this check was equally narrow and is now equally
+# wide -- the mirror argument cuts both ways.
+strays="$(find "$root" -name '*.plist' 2>/dev/null | tr '\n' ' ')"
+if [ -z "$strays" ]; then
+  ok "no launchd plist anywhere in the AppImage"
+else
+  bad "a launchd plist is in a Linux AppImage: $strays"
 fi
 
 v="$("$inner/liostunnel-helper" --version 2>&1)"

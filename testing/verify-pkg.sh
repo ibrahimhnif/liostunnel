@@ -65,19 +65,34 @@ for f in liostunnel-helper install-helper.sh uninstall-helper.sh; do
   [ -x "$helper/$f" ] && ok "$f is inside the app and executable" \
                       || bad "missing or not executable: $f"
 done
-[ -f "$helper/liostunnel-helper.plist" ] && ok "the launchd plist is present" \
-                                         || bad "missing liostunnel-helper.plist"
-# A systemd unit in a macOS package reads as an oversight, not symmetry.
-# The directory has to exist before its absence means anything: `[ ! -f ]`
-# against a path under a directory that is not there is trivially true, so a
-# payload with no Contents/Resources/helper at all passed this line while
-# claiming to have looked inside it.
-if [ ! -d "$helper" ]; then
-  bad "no helper directory, so nothing was checked for a systemd unit"
-elif [ ! -f "$helper/liostunnel-helper.service" ]; then
-  ok "the systemd unit is absent"
+# Present is not usable, and `-f` cannot tell the difference. It passes on a
+# zero-byte file and on one whose @UID@ placeholder has already been
+# substituted or deleted -- and that placeholder is the only thing making this
+# file a template. install-helper.sh does `sed "s/@UID@/$uid/" … > "$unit"`:
+# with nothing left to substitute, the daemon installs with whatever uid was
+# baked in (someone else's) or with the literal string (which the helper's u32
+# parse rejects on startup). Either way it surfaces as a daemon that serves
+# nobody and that launchd's KeepAlive keeps resurrecting.
+if [ ! -f "$helper/liostunnel-helper.plist" ]; then
+  bad "missing liostunnel-helper.plist"
+elif ! grep -q '@UID@' "$helper/liostunnel-helper.plist"; then
+  bad "liostunnel-helper.plist has no @UID@ for install-helper.sh to substitute"
 else
-  bad "a systemd unit is in a macOS package"
+  ok "the launchd plist is present, with its @UID@ placeholder intact"
+fi
+# A systemd unit in a macOS package reads as an oversight, not symmetry.
+# Payload-wide, not one directory: a .service file anywhere in the payload
+# installs exactly as far as one in Contents/Resources/helper, and a check
+# scoped to that directory does not see it. Searching $tmp/p also retires the
+# "does $helper exist" guard this needed before -- `find` over the whole
+# payload cannot go vacuous when a subdirectory is missing, the way
+# `[ ! -f "$helper/x" ]` does. verify-appimage.sh's mirror of this check was
+# equally narrow and is now equally wide; the mirror argument cuts both ways.
+strays="$(find "$tmp/p" -name '*.service' 2>/dev/null | tr '\n' ' ')"
+if [ -z "$strays" ]; then
+  ok "no systemd unit anywhere in the payload"
+else
+  bad "a systemd unit is in a macOS package: $strays"
 fi
 
 # A binary that runs on THIS platform -- not a placeholder, not the wrong arch.
