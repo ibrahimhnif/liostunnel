@@ -11,7 +11,12 @@
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/.." && pwd)"
+# Named for the tree that was built, not the commit it sits on. A package
+# built from a working tree with uncommitted changes carries code that is at
+# no commit at all, and a bare short SHA in the filename is a claim this
+# script had not checked. `-dirty` is the same suffix `git describe` uses.
 sha="$(git -C "$repo" rev-parse --short HEAD)"
+[ -z "$(git -C "$repo" status --porcelain)" ] || sha="$sha-dirty"
 helper="$repo/target/release/liostunnel-helper"
 built="$repo/app/build/macos/Build/Products/Release/liostunnel_app.app"
 
@@ -47,6 +52,15 @@ pkgbuild --analyze --root "$stage" "$comp"
 /usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" "$comp"
 
 out="$dist/LiosTunnel-$sha.pkg"
+# Deliberately unsigned and unnotarized, for now. There is no Developer ID
+# certificate for this project yet, and a package signed with an ad-hoc
+# identity is no more trusted than an unsigned one while being harder to
+# reason about. The consequence is real and belongs in the open: a .pkg
+# downloaded through a browser carries com.apple.quarantine and Gatekeeper
+# blocks it on current macOS. README.md's "Installing the macOS package"
+# section says how to open one anyway. Signing is its own task -- when it
+# lands, `--sign "Developer ID Installer: ..."` goes here and this comment
+# goes away.
 pkgbuild \
   --root "$stage" \
   --component-plist "$comp" \

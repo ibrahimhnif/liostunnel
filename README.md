@@ -37,6 +37,54 @@ A lean build drops the DNS-over-HTTPS stack (`hyper`, `rustls`,
 cargo build --release -p liostunnel-core --no-default-features
 ```
 
+## Installing the macOS package
+
+`packaging/make-pkg.sh` assembles `dist/LiosTunnel-<sha>.pkg`. It assembles
+only — both halves must already be built, so that a failed build is never
+reported as a packaging problem:
+
+```bash
+cargo build --release -p liostunnel-helper
+(cd app && flutter build macos --release)
+./packaging/make-pkg.sh
+```
+
+The package installs the app to `/Applications` and then, as root, installs
+the privileged helper as a launchd daemon authorized for the console user's
+uid. `./testing/verify-pkg.sh dist/LiosTunnel-<sha>.pkg` proves what it would
+do without installing anything or needing root.
+
+**It is unsigned and unnotarized, deliberately for now.** There is no Developer
+ID certificate for this project yet, and an ad-hoc signature buys no trust
+while making the state harder to reason about. The consequence is real: a
+`.pkg` that arrives through a browser carries `com.apple.quarantine`, and
+Gatekeeper on current macOS refuses to open it — double-clicking gives
+"cannot be opened because it is from an unidentified developer", with no
+button that gets you past it. Two ways through, each a deliberate act by the
+person installing:
+
+- **Right-click the `.pkg` in Finder and choose Open**, then confirm at the
+  prompt. The context-menu Open is the documented override; double-clicking
+  is not.
+- **Or bypass Installer.app**, which is what consults Gatekeeper:
+
+  ```bash
+  sudo installer -pkg dist/LiosTunnel-<sha>.pkg -target /
+  ```
+
+  A `-target` other than `/` works too — the app lands in
+  `<target>/Applications` and the postinstall follows it there.
+
+If the helper cannot be installed — at the login window, or over SSH with no
+console session, there is no console user to authorize — the install is
+reported as failed on purpose, and the refusal in `/var/log/install.log`
+names the command that finishes the job by hand.
+
+**The build is arm64 only.** Flutter produces a universal app binary, but
+`liostunnel-helper` is built for the host architecture alone, so a package
+built on Apple silicon installs an app whose helper will not run on an Intel
+Mac. `lipo -archs target/release/liostunnel-helper` says which you have.
+
 ## Use
 
 ```bash
