@@ -131,9 +131,18 @@ polkit password dialog. On success the client retries the socket.
 
 ### Once per launch, and this is not negotiable
 
-`HelperClient` retries an absent socket on a timer. Prompting from that would
-re-raise the password dialog every few seconds after a cancel — a loop the
-user cannot escape without force-quitting.
+**Corrected during Task 5, because the reason given here was wrong.** This
+said `HelperClient` retries an absent socket on a timer, so prompting from
+that would re-raise the dialog every few seconds. It does not:
+`_scheduleRetry` is reachable only from `_onDropped` and from its own catch,
+and a `connect()` that throws ENOENT never gets there — there was no socket
+to drop.
+
+The guard is still required, for a different loop: a successful install calls
+`_attach`, and if that still fails the install would run again, and again.
+The covering test returns `installed` first and `cancelled` second, which is
+what actually reproduces it — the version this spec described would have
+passed with the guard deleted.
 
 **At most one attempt per process launch.** After a cancel or a failure the
 screen shows a panel naming the exact command and offering a retry button, and
