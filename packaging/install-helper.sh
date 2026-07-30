@@ -19,20 +19,43 @@ repo="$(cd "$here/.." && pwd)"
 
 die() { echo "error: $*" >&2; exit 1; }
 
-[ "$(id -u)" -eq 0 ] || die "must run as root (use sudo)"
+# `--uid N` is how the app passes it: the app knows its own uid, and neither
+# osascript nor pkexec preserves the one sudo would have set.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --uid) LIOS_UID="${2:-}"; shift 2 ;;
+    --uid=*) LIOS_UID="${1#--uid=}"; shift ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
 
-# The uid to authorize is the invoking user's, not root's. Installing with the
-# authorized uid set to 0 would mean the helper accepts a root client, which
-# defeats the boundary it exists to enforce: the whole design assumes the
-# caller is unprivileged and must have its secrets checked against its own
-# ownership.
-uid="${SUDO_UID:-}"
-[ -n "$uid" ] || die "SUDO_UID is unset; run this with sudo from the account that will use the app, not as a root login"
+# Three ways in, one rule: the uid to authorize is the HUMAN's, never the
+# elevated process's.
+#   LIOS_UID    --uid, from the app
+#   SUDO_UID    set by sudo
+#   PKEXEC_UID  set by pkexec
+# There is deliberately NO fallback to `id -u`. Under sudo, pkexec and
+# osascript alike that answer is 0, and a helper that authorizes root accepts
+# a root client -- which is the whole boundary this design exists to draw.
+uid="${LIOS_UID:-${SUDO_UID:-${PKEXEC_UID:-}}}"
+[ -n "$uid" ] || die "cannot tell which account to authorize; run with sudo, or pass --uid N"
+case "$uid" in ''|*[!0-9]*) die "not a uid: $uid" ;; esac
 [ "$uid" -ne 0 ] || die "refusing to authorize uid 0; the helper must serve an unprivileged user"
 user="$(id -un "$uid" 2>/dev/null || echo "uid $uid")"
 
-src="$repo/target/release/$BINARY"
-[ -f "$src" ] || die "no release binary at $src — run: cargo build --release -p liostunnel-helper"
+# Beside this script in a bundle, under target/release in a checkout. One
+# script serving both beats a second copy free to drift from the first --
+# the same argument the profile format makes for having one parser.
+#
+# Beside-the-script wins: unpacking a bundle inside a checkout should use the
+# bundle's binary, not whatever is stale in target/.
+if [ -f "$here/$BINARY" ]; then
+  src="$here/$BINARY"
+elif [ -f "$repo/target/release/$BINARY" ]; then
+  src="$repo/target/release/$BINARY"
+else
+  die "no helper binary beside this script or at $repo/target/release/$BINARY — in a checkout, run: cargo build --release -p liostunnel-helper"
+fi
 
 echo "installing $BINARY for $user (uid $uid)"
 
@@ -41,7 +64,10 @@ install -m 0755 "$src" "$LIBEXEC/$BINARY"
 
 case "$(uname -s)" in
   Darwin)
-    unit=/Library/LaunchDaemons/$PLIST_LABEL.plist
+    # LIOS_UNIT_PATH lets tests redirect this write off the real, root-owned
+    # /Library/LaunchDaemons; it is unset (so this is the real path) for every
+    # actual install.
+    unit="${LIOS_UNIT_PATH:-/Library/LaunchDaemons/$PLIST_LABEL.plist}"
     sed "s/@UID@/$uid/" "$here/liostunnel-helper.plist" > "$unit"
     chown root:wheel "$unit"
     chmod 0644 "$unit"
@@ -49,7 +75,7 @@ case "$(uname -s)" in
     launchctl bootstrap system "$unit"
     ;;
   Linux)
-    unit=/etc/systemd/system/liostunnel-helper.service
+    unit="${LIOS_UNIT_PATH:-/etc/systemd/system/liostunnel-helper.service}"
     sed "s/@UID@/$uid/" "$here/liostunnel-helper.service" > "$unit"
     chown root:root "$unit"
     chmod 0644 "$unit"
