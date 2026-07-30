@@ -1,0 +1,26 @@
+#!/bin/bash
+#
+# Runs as root under Installer.app, after the payload is in place.
+#
+# Installing the helper is not a file copy: it bakes an authorized uid into a
+# root-owned unit file and loads a daemon. So this defers to the one script
+# that owns that logic, rather than being a second implementation of it.
+set -euo pipefail
+helper=/Applications/liostunnel_app.app/Contents/Resources/helper
+
+# Who is actually using this machine. The installer runs as root and neither
+# SUDO_UID nor PKEXEC_UID exists here, so the console user is the only honest
+# source -- `id -u` would say 0, and a helper authorizing root accepts a root
+# client, which is the whole boundary gone.
+uid="$(stat -f %u /dev/console)"
+
+# And refuse the system accounts. During Setup Assistant the console user is
+# `_mbsetupuser` (uid 248) -- not 0, so install-helper.sh's uid-0 guard would
+# let it through, and the helper would end up serving an account that stops
+# existing the moment setup finishes. Regular macOS accounts start at 501.
+if [ "$uid" -lt 500 ]; then
+  echo "no logged-in user to authorize (console uid $uid)" >&2
+  exit 1
+fi
+
+exec "$helper/install-helper.sh" --uid "$uid"
