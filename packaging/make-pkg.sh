@@ -36,14 +36,25 @@ install -m 0755 "$here/uninstall-helper.sh"     "$inner/uninstall-helper.sh"
 # oversight rather than symmetry.
 install -m 0644 "$here/liostunnel-helper.plist" "$inner/liostunnel-helper.plist"
 
+# Refuse relocation. `pkgbuild --root` marks an app bundle relocatable by
+# default, which means Installer.app looks up the bundle id on the target
+# machine and redirects the payload onto whatever copy it finds -- a stray one
+# in ~/Downloads, say. The app would land there instead of /Applications, and
+# the postinstall's fixed path would then not exist, so it would fail AFTER the
+# app had already moved. This says: install where I said.
+comp="$dist/component.plist"
+pkgbuild --analyze --root "$stage" "$comp"
+/usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" "$comp"
+
 out="$dist/LiosTunnel-$sha.pkg"
 pkgbuild \
   --root "$stage" \
+  --component-plist "$comp" \
   --scripts "$here/macos-pkg" \
   --identifier com.liostunnel.pkg \
   --version "0.1.0-$sha" \
   --install-location / \
   "$out"
 
-rm -rf "$stage"
+rm -rf "$stage" "$comp"
 echo "$out"

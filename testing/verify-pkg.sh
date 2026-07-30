@@ -54,6 +54,22 @@ else
   bad "the bundled helper did not run: $v"
 fi
 
+# Relocation. `pkgbuild --root` marks an app bundle relocatable by default,
+# and Installer.app then redirects the payload onto any existing copy of that
+# bundle id -- so the app lands somewhere else and the postinstall's fixed
+# /Applications path does not exist. The top-level relocatable="false"
+# attribute is a different thing and does not cover this.
+# An empty `<relocate/>` is the correct state; `<relocate><bundle .../></relocate>`
+# is the defect. Assert on the element's emptiness specifically -- `<bundle `
+# alone appears throughout PackageInfo's own inventory (`<bundle-version>`,
+# `<upgrade-bundle>`, `<strict-identifier>`), so grepping for it fails a
+# perfectly good package. That mistake was made here first.
+if grep -q '<relocate/>' "$tmp/x/PackageInfo"; then
+  ok "the payload is not relocatable"
+else
+  bad "the payload is relocatable; it would install over a stray copy elsewhere"
+fi
+
 # The postinstall: present, executable, and carrying both rules.
 post="$(find "$tmp/x" -name postinstall | head -1)"
 [ -n "$post" ] && [ -x "$post" ] && ok "postinstall is present and executable" \
