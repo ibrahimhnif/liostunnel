@@ -23,7 +23,12 @@ die() { echo "error: $*" >&2; exit 1; }
 # osascript nor pkexec preserves the one sudo would have set.
 while [ $# -gt 0 ]; do
   case "$1" in
-    --uid) LIOS_UID="${2:-}"; shift 2 ;;
+    # The explicit arity check is not decoration. `LIOS_UID="${2:-}"; shift 2`
+    # with nothing after --uid left LIOS_UID empty and then failed the `shift`,
+    # which under `set -e` killed the script with no stdout, no stderr and exit
+    # 1 -- a refusal nobody wrote, and the only thing osascript or pkexec hands
+    # back to the app.
+    --uid) [ $# -ge 2 ] || die "--uid needs a value"; LIOS_UID="$2"; shift 2 ;;
     --uid=*) LIOS_UID="${1#--uid=}"; shift ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -40,6 +45,21 @@ done
 uid="${LIOS_UID:-${SUDO_UID:-${PKEXEC_UID:-}}}"
 [ -n "$uid" ] || die "cannot tell which account to authorize; run with sudo, or pass --uid N"
 case "$uid" in ''|*[!0-9]*) die "not a uid: $uid" ;; esac
+# Digits alone are not enough; both of these are written into the unit file
+# verbatim and the failure is deferred to a daemon that cannot report it.
+#
+# A leading zero is read as decimal here and by the helper's u32 parse, but as
+# OCTAL by `id` on the line below -- so `--uid 010` would announce one account
+# and authorize a different one.
+case "$uid" in 0) ;; 0*) die "not a uid: $uid; drop the leading zero" ;; esac
+# And out of range: the helper takes --uid as a u32, so anything past that
+# makes it exit on startup -- forever, because launchd KeepAlive and systemd
+# Restart=on-failure keep bringing it back. 4294967295 is (uid_t)-1, reserved
+# on both platforms, so the last usable value is one below it. The length test
+# comes first because `[ 99999999999999999999 -le N ]` is not a comparison
+# bash can make: it prints "integer expected" and fails for the wrong reason.
+{ [ "${#uid}" -le 10 ] && [ "$uid" -le 4294967294 ]; } \
+  || die "uid out of range: $uid; the maximum is 4294967294"
 [ "$uid" -ne 0 ] || die "refusing to authorize uid 0; the helper must serve an unprivileged user"
 user="$(id -un "$uid" 2>/dev/null || echo "uid $uid")"
 
@@ -80,7 +100,10 @@ case "$(uname -s)" in
   Darwin)
     # LIOS_UNIT_PATH lets tests redirect this write off the real, root-owned
     # /Library/LaunchDaemons; it is unset (so this is the real path) for every
-    # actual install.
+    # actual install. That last sentence used to be a comment and nothing more
+    # -- repointing these defaults at /tmp left the suite entirely green -- so
+    # verify-install-script.sh now runs both branches with the override unset
+    # and asserts the path bash could not open is this one.
     unit="${LIOS_UNIT_PATH:-/Library/LaunchDaemons/$PLIST_LABEL.plist}"
     sed "s/@UID@/$uid/" "$here/liostunnel-helper.plist" > "$unit"
     chown root:wheel "$unit"
@@ -94,7 +117,13 @@ case "$(uname -s)" in
     chown root:root "$unit"
     chmod 0644 "$unit"
     systemctl daemon-reload
-    systemctl enable --now liostunnel-helper.service
+    # By the name of the file that was just written, not by a second, separate
+    # copy of that name. LIOS_UNIT_PATH used to redirect only the write, so a
+    # redirected install wrote one unit and enabled a different one -- the
+    # override half-applied, in the production path. With it unset, which is
+    # every real install, "${unit##*/}" is liostunnel-helper.service, exactly
+    # what this line said before.
+    systemctl enable --now "${unit##*/}"
     ;;
   *)
     die "unsupported platform $(uname -s); Windows is its own phase"
