@@ -9,6 +9,20 @@
 # packages, and plugins designed to encourage good coding practices.
 include: package:flutter_lints/flutter.yaml
 
+analyzer:
+  exclude:
+    # Vendored third-party build tooling with its own pubspec and its own
+    # analysis_options.yaml. It is not ours to lint, and CI never resolves its
+    # dependencies -- `flutter pub get` in `app/` does not reach it, so every
+    # `package:http`, `package:version` and `package:ed25519_edwards` import in
+    # it is unresolved and `flutter analyze` fails on code we do not own.
+    #
+    # It passes on a developer machine only because an earlier `flutter build`
+    # ran cargokit, which resolved those dependencies into a .dart_tool/ that
+    # then sits there. That difference is why this job was red in CI while
+    # every local run said clean.
+    - rust_builder/**
+
 linter:
   # The lint rules applied to this project can be customized in the
   # section below to disable rules from the `package:flutter_lints/flutter.yaml`
