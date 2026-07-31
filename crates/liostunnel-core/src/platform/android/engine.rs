@@ -278,24 +278,20 @@ async fn assemble(
     let engine = Engine::new(protocol, resolver, handles);
     let shutdown = engine.shutdown_handle();
     let stats = engine.stats_handle();
-    Ok((
-        shutdown,
-        stats,
-        async move {
-            // `run` returning an error means the engine stopped on its own --
-            // a stack-thread panic, or the poller giving up -- rather than
-            // being asked to. Phase 0 shipped the bug of a tunnel sitting
-            // there with no engine behind it while stats still read
-            // Connected, so this records the state instead of discarding it.
-            match engine.run().await {
-                Ok(()) => set_state(EngineState::Idle),
-                Err(e) => {
-                    super::log(super::ANDROID_LOG_ERROR, &format!("engine stopped: {e}"));
-                    set_state(EngineState::Failed(e.to_string()));
-                }
+    Ok((shutdown, stats, async move {
+        // `run` returning an error means the engine stopped on its own --
+        // a stack-thread panic, or the poller giving up -- rather than
+        // being asked to. Phase 0 shipped the bug of a tunnel sitting
+        // there with no engine behind it while stats still read
+        // Connected, so this records the state instead of discarding it.
+        match engine.run().await {
+            Ok(()) => set_state(EngineState::Idle),
+            Err(e) => {
+                super::log(super::ANDROID_LOG_ERROR, &format!("engine stopped: {e}"));
+                set_state(EngineState::Failed(e.to_string()));
             }
-        },
-    ))
+        }
+    }))
 }
 
 /// Where SSH host keys are remembered.

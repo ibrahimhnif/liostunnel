@@ -90,7 +90,10 @@ pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeInit(
         Ok(global) => {
             let _ = SERVICE.set(global);
         }
-        Err(e) => log(ANDROID_LOG_ERROR, &format!("nativeInit: no global ref: {e}")),
+        Err(e) => log(
+            ANDROID_LOG_ERROR,
+            &format!("nativeInit: no global ref: {e}"),
+        ),
     }
     log(ANDROID_LOG_INFO, "nativeInit");
 }

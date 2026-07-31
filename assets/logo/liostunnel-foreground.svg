@@ -1,0 +1,45 @@
+<!-- The mark alone, for Android's adaptive icon foreground layer.
+
+     No background rect: the launcher composites this over the background
+     layer and then masks the pair to whatever shape the device uses, so a
+     background baked in here would show as a square with rounded corners
+     inside a circle.
+
+     Scaled and re-centred rather than reused as-is. An adaptive foreground is
+     a 108dp canvas of which only the middle 72dp is guaranteed to survive
+     masking; the outer ring is parallax and crop. The full mark's art spans
+     638x370 centred at (512, 614) in the source, which is neither centred on
+     the canvas nor inside the safe zone, so it is moved to the middle and
+     scaled to 92%, giving 587px across: comfortably inside the 683px the
+     mask guarantees.
+
+     No double hyphen anywhere in this comment. XML forbids it, qlmanage
+     does not fail on an invalid SVG but thumbnails it as a text document,
+     and the icon then ships as grey lines on white. The parse guard in
+     make-icons.sh caught exactly that while this file was being written. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Opaque, and the same colour as the background layer, because the
+       rasteriser cannot produce transparency: qlmanage writes an opaque white
+       backdrop into every PNG it makes. A foreground layer carrying that white
+       would render as a white square masked to the launcher shape, hiding the
+       background layer completely and looking nothing like the mark. Measured
+       from the output, not assumed: the corner pixels came back 255,255,255
+       at full alpha.
+
+       Keying the white out afterwards is not an option either. The light at
+       the end of the tunnel is #F8FAFC, three steps from white, so a
+       white-to-transparent pass would erase it.
+
+       Filling the whole canvas with the background colour instead makes the
+       two layers composite to exactly the intended image, whatever shape the
+       device masks them to. This value and ic_launcher_background.xml must
+       stay equal; both come from the rect fill in liostunnel.svg. -->
+  <rect width="1024" height="1024" fill="#0B1220"/>
+  <g transform="translate(512,512) scale(0.92) translate(-512,-614)">
+    <path d="M232 760 V468 a280 280 0 0 1 560 0 V760"
+          fill="none" stroke="#22D3EE" stroke-width="78" stroke-linecap="round"/>
+    <path d="M372 760 V500 a140 140 0 0 1 280 0 V760"
+          fill="none" stroke="#0EA5E9" stroke-width="62" stroke-linecap="round" opacity="0.55"/>
+    <circle cx="512" cy="612" r="66" fill="#F8FAFC"/>
+  </g>
+</svg>
