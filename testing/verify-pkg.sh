@@ -61,6 +61,34 @@ fi
   && ok "the app executable is present and executable" \
   || bad "no executable at Contents/MacOS/liostunnel_app"
 
+# NOT SANDBOXED, and this is the one assertion in this file about whether the
+# app can do its job at all rather than whether it is all there.
+#
+# App Sandbox confines a process to its own container, and `connect(2)` to a
+# UNIX socket outside that container is denied with EPERM. The helper's socket
+# is /var/run/liostunnel.sock -- outside, by construction, because a root
+# daemon cannot listen inside a per-app container. A signed control pair
+# measured it: the same binary unsandboxed CONNECTED and sandboxed got EPERM.
+# Worse, helper_client.dart maps EPERM to HelperForbidden, so the app then
+# tells the user the helper "was installed for a different user" on a machine
+# where this very package's postinstall installed it for them.
+#
+# Read off the SHIPPED binary's code signature, not off
+# macos/Runner/Release.entitlements: the entitlement is baked in at signing
+# time, so a stale build carries it however the source file reads. That source
+# file was the whole defect -- `com.apple.security.app-sandbox` and nothing
+# else -- and the binary is the only place the truth is.
+ent="$(codesign -d --entitlements - --xml "$app" 2>/dev/null)"; ent_rc=$?
+if [ $ent_rc -ne 0 ]; then
+  # arm64 refuses to execute an unsigned binary at all, so "no signature" is
+  # not a clean bill of health for "no sandbox" -- it is a worse failure.
+  bad "cannot read the app's code signature; codesign exited $ent_rc"
+elif printf '%s' "$ent" | grep -q 'com.apple.security.app-sandbox'; then
+  bad "the app is App-Sandboxed; it cannot reach /var/run/liostunnel.sock"
+else
+  ok "the app is not App-Sandboxed, so it can reach the helper's socket"
+fi
+
 for f in liostunnel-helper install-helper.sh uninstall-helper.sh; do
   [ -x "$helper/$f" ] && ok "$f is inside the app and executable" \
                       || bad "missing or not executable: $f"

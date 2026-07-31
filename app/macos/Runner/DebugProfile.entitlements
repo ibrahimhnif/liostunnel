@@ -1,9 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  DELIBERATELY NOT SANDBOXED, for the same reason as Release.entitlements —
+  read the comment there. A debug build that cannot reach the helper's socket
+  is a debug build in which the app's one job cannot be exercised at all.
+
+  allow-jit and network.server stay untouched: the Dart VM needs the first,
+  and `flutter run`'s VM service listens for the tooling with the second.
+-->
 <plist version="1.0">
 <dict>
-	<key>com.apple.security.app-sandbox</key>
-	<true/>
 	<key>com.apple.security.cs.allow-jit</key>
 	<true/>
 	<key>com.apple.security.network.server</key>
