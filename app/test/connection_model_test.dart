@@ -138,4 +138,145 @@ void main() {
     m.applyEvent(const StateEvent('Disconnected'));
     expect(m.isConnected, isFalse);
   });
+
+  group('live speed', () {
+    late FakeClock clock;
+    late ConnectionModel m;
+
+    setUp(() {
+      clock = FakeClock();
+      m = ConnectionModel(clock: clock.call);
+      m.applyEvent(const StateEvent('Connected'));
+    });
+
+    test('the first sample has no rate, which is not a rate of zero', () {
+      m.applyEvent(stats(1000, 2000));
+      expect(m.bytesUpPerSec, isNull);
+      expect(m.bytesDownPerSec, isNull);
+    });
+
+    test('two samples a second apart give the delta as the rate', () {
+      m.applyEvent(stats(1000, 2000));
+      clock.advance(const Duration(seconds: 1));
+      m.applyEvent(stats(1500, 4000));
+      expect(m.bytesUpPerSec, 500.0);
+      expect(m.bytesDownPerSec, 2000.0);
+    });
+
+    test('a late frame divides by the time that actually passed', () {
+      // The assertion that fails against the obvious wrong implementation.
+      // Dividing by the 1s tick interval would report 500 and 2000 here,
+      // which is 40% faster than the traffic that occurred.
+      m.applyEvent(stats(1000, 2000));
+      clock.advance(const Duration(milliseconds: 1400));
+      m.applyEvent(stats(1500, 4800));
+      expect(m.bytesUpPerSec, closeTo(357.14, 0.01));
+      expect(m.bytesDownPerSec, closeTo(2000.0, 0.01));
+    });
+
+    test('identical counters are a real zero, not an absent rate', () {
+      m.applyEvent(stats(1000, 2000));
+      clock.advance(const Duration(seconds: 1));
+      m.applyEvent(stats(1000, 2000));
+      expect(m.bytesUpPerSec, 0.0);
+      expect(m.bytesDownPerSec, 0.0);
+    });
+
+    test('a counter going backwards yields no rate, and rebaselines', () {
+      // SPD-3. `_zeroStats` runs on every non-Connected state and a helper
+      // restart zeroes them too, so a total CAN go down without the tunnel
+      // having stopped. Subtracting then gives a negative rate -- or, if
+      // anyone ever reaches for unsigned arithmetic, an enormous one.
+      m.applyEvent(stats(5000, 9000));
+      clock.advance(const Duration(seconds: 1));
+      m.applyEvent(stats(100, 200));
+      expect(m.bytesUpPerSec, isNull, reason: 'a reset is not a negative rate');
+      expect(m.bytesDownPerSec, isNull);
+
+      // And the NEXT sample measures from 100/200, not from 5000/9000.
+      clock.advance(const Duration(seconds: 1));
+      m.applyEvent(stats(400, 700));
+      expect(m.bytesUpPerSec, 300.0);
+      expect(m.bytesDownPerSec, 500.0);
+    });
+
+    test('one counter going backwards does not corrupt the other', () {
+      // Reporting a rate for down against a sample the up-reset invalidated
+      // would be worse than reporting none: the pair comes from one snapshot.
+      m.applyEvent(stats(5000, 9000));
+      clock.advance(const Duration(seconds: 1));
+      m.applyEvent(stats(10, 9500));
+      expect(m.bytesUpPerSec, isNull);
+      expect(m.bytesDownPerSec, isNull);
+    });
+
+    test('disconnecting clears the rate and its baseline', () {
+      // SPD-4. A frozen "1.2 MB/s" asserts traffic is flowing, which is a
+      // louder version of the lie `_zeroStats` already exists to prevent.
+      m.applyEvent(stats(1000, 2000));
+      clock.advance(const Duration(seconds: 1));
+      m.applyEvent(stats(1500, 4000));
+      expect(m.bytesUpPerSec, 500.0);
+
+      m.applyEvent(const StateEvent('Disconnected'));
+      expect(m.bytesUpPerSec, isNull);
+      expect(m.bytesDownPerSec, isNull);
+
+      // The baseline went too: the first sample of the next connection has no
+      // predecessor, rather than being measured against the old session.
+      //
+      // The counters must be LARGER than the stale baseline (1500/4000) for
+      // this to discriminate. Feeding smaller ones lets the backwards-counter
+      // guard return null either way, so the assertion passes whether or not
+      // the baseline was cleared -- which is what it did on the first
+      // attempt, and only a pre-existing widget test caught the mutation.
+      m.applyEvent(const StateEvent('Connected'));
+      clock.advance(const Duration(seconds: 1));
+      m.applyEvent(stats(9000, 9000));
+      expect(
+        m.bytesUpPerSec,
+        isNull,
+        reason: 'measuring against the previous session is worse than none',
+      );
+      expect(m.bytesDownPerSec, isNull);
+    });
+
+    test('two samples at the same instant yield no rate', () {
+      // Guards the division. Two frames can share a timestamp if the clock is
+      // coarse, or if the app was resumed and drained a backlog.
+      m.applyEvent(stats(1000, 2000));
+      m.applyEvent(stats(9000, 9000));
+      expect(m.bytesUpPerSec, isNull);
+      expect(m.bytesDownPerSec, isNull);
+    });
+
+    test('a rate notifies listeners, so the screen redraws', () {
+      // The rate is computed inside applyEvent; one that never notified would
+      // be correct and invisible.
+      var notifications = 0;
+      m.addListener(() => notifications++);
+      m.applyEvent(stats(1000, 2000));
+      clock.advance(const Duration(seconds: 1));
+      m.applyEvent(stats(1500, 4000));
+      expect(notifications, 2);
+    });
+  });
 }
+
+/// A clock the test drives by hand, so rates are asserted exactly rather than
+/// slept for. A wall-clock version would be the shape this project has already
+/// been bitten by: green because a timer expired, not because the arithmetic
+/// was right.
+class FakeClock {
+  var now = DateTime(2026, 1, 1);
+  DateTime call() => now;
+  void advance(Duration d) => now = now.add(d);
+}
+
+StatsEvent stats(int up, int down) => StatsEvent(
+  bytesUp: BigInt.from(up),
+  bytesDown: BigInt.from(down),
+  activeFlows: 0,
+  flowsFailed: BigInt.zero,
+  dnsQueries: BigInt.zero,
+);

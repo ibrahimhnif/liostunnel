@@ -27,6 +27,11 @@ enum Fault {
 /// A single [ChangeNotifier] rather than a state-management framework (D8):
 /// two screens and one live value do not justify Riverpod or Bloc.
 class ConnectionModel extends ChangeNotifier {
+  /// [clock] is injected so tests assert exact rates instead of sleeping.
+  ConnectionModel({DateTime Function()? clock}) : _clock = clock ?? DateTime.now;
+
+  final DateTime Function() _clock;
+
   String _state = 'Disconnected';
   BigInt _bytesUp = BigInt.zero;
   BigInt _bytesDown = BigInt.zero;
@@ -34,6 +39,23 @@ class ConnectionModel extends ChangeNotifier {
   BigInt _flowsFailed = BigInt.zero;
   BigInt _dnsQueries = BigInt.zero;
   Fault? _lastFault;
+
+  /// The previous sample, for the delta. Null means no rate can be computed
+  /// yet -- the first frame of a connection, or the one after a reset.
+  DateTime? _lastSampleAt;
+  BigInt? _lastUp;
+  BigInt? _lastDown;
+  double? _upPerSec;
+  double? _downPerSec;
+
+  /// Current speed in bytes per second, or null when there is no rate.
+  ///
+  /// Null is deliberately not 0.0: zero is a claim that no traffic moved, and
+  /// before the second sample there is no such claim to make. The distinction
+  /// lasts one second per connection -- which is exactly the second someone is
+  /// watching to see whether connecting worked.
+  double? get bytesUpPerSec => _upPerSec;
+  double? get bytesDownPerSec => _downPerSec;
 
   /// What the first-launch installer is doing, if anything.
   ///
@@ -76,6 +98,7 @@ class ConnectionModel extends ChangeNotifier {
         :final flowsFailed,
         :final dnsQueries,
       ):
+        _recomputeRates(bytesUp, bytesDown);
         _bytesUp = bytesUp;
         _bytesDown = bytesDown;
         _activeFlows = activeFlows;
@@ -142,12 +165,59 @@ class ConnectionModel extends ChangeNotifier {
     Fault.internal => 'The helper hit an internal error. Check its log.',
   };
 
+  /// Rate from the measured gap between samples.
+  ///
+  /// Not from the helper's `STATS_INTERVAL`: it ticks every second, but a
+  /// frame arrives late on a loaded machine, and dividing a 1.4s gap by 1s
+  /// reports traffic 40% faster than occurred.
+  void _recomputeRates(BigInt up, BigInt down) {
+    final now = _clock();
+    final prevAt = _lastSampleAt;
+    final prevUp = _lastUp;
+    final prevDown = _lastDown;
+    _lastSampleAt = now;
+    _lastUp = up;
+    _lastDown = down;
+
+    if (prevAt == null || prevUp == null || prevDown == null) {
+      _upPerSec = null;
+      _downPerSec = null;
+      return;
+    }
+    // A total that went down means the counters restarted -- a reconnect
+    // (`_zeroStats`) or a helper restart. Subtracting would give a negative
+    // rate, and unsigned arithmetic an enormous one. Report nothing and let
+    // the sample just stored become the new baseline. Both are dropped
+    // together because they come from one snapshot: a rate for `down`
+    // measured against a sample that `up` proves stale is worse than none.
+    if (up < prevUp || down < prevDown) {
+      _upPerSec = null;
+      _downPerSec = null;
+      return;
+    }
+    final secs = now.difference(prevAt).inMicroseconds / 1e6;
+    if (secs <= 0) {
+      _upPerSec = null;
+      _downPerSec = null;
+      return;
+    }
+    _upPerSec = (up - prevUp).toDouble() / secs;
+    _downPerSec = (down - prevDown).toDouble() / secs;
+  }
+
   void _zeroStats() {
     _bytesUp = BigInt.zero;
     _bytesDown = BigInt.zero;
     _activeFlows = 0;
     _flowsFailed = BigInt.zero;
     _dnsQueries = BigInt.zero;
+    _upPerSec = null;
+    _downPerSec = null;
+    // The baseline too. Keeping it would measure the next connection's first
+    // sample against the previous session's totals.
+    _lastSampleAt = null;
+    _lastUp = null;
+    _lastDown = null;
   }
 
   @visibleForTesting

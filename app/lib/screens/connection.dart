@@ -123,8 +123,14 @@ class ConnectionScreen extends StatelessWidget {
             const SizedBox(height: 28),
             Text('Traffic', style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
-            _StatRow(label: 'Sent', value: _bytes(m.bytesUp)),
-            _StatRow(label: 'Received', value: _bytes(m.bytesDown)),
+            _StatRow(
+              label: 'Sent',
+              value: '${_bytes(m.bytesUp)}   ${_rate(m.bytesUpPerSec)}',
+            ),
+            _StatRow(
+              label: 'Received',
+              value: '${_bytes(m.bytesDown)}   ${_rate(m.bytesDownPerSec)}',
+            ),
             _StatRow(label: 'Active flows', value: '${m.activeFlows}'),
             _StatRow(label: 'Failed flows', value: '${m.flowsFailed}'),
             _StatRow(label: 'DNS queries', value: '${m.dnsQueries}'),
@@ -162,6 +168,16 @@ class _StatRow extends StatelessWidget {
 /// Counters cross the FFI as BigInt (Rust `u64`), so this formats BigInt
 /// rather than int — an `as int` here would throw on a busy tunnel rather
 /// than at any point a test would notice.
+/// A rate, or an em dash when there is none.
+///
+/// Built on [_bytes] rather than a second formatter, so the total and the rate
+/// cannot disagree about what a mebibyte is.
+///
+/// The dash is not decoration: `0 B/s` would be a claim that no traffic moved,
+/// and before the second sample there is no such claim to make.
+String _rate(double? perSec) =>
+    perSec == null ? '—' : '${_bytes(BigInt.from(perSec.round()))}/s';
+
 String _bytes(BigInt n) {
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
   var v = n.toDouble();
