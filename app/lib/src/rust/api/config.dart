@@ -129,13 +129,28 @@ Future<String> fileSecretValue({required List<int> bytes}) =>
 /// Refusals name no field of the profile. Every one of them is
 /// caller-supplied and this error crosses back over the wire.
 ///
-/// **This is the round-trip guard.** `render_ss_uri` is total, but not every
-/// input round-trips: an empty host, port 0, an IPv6 or bracketed host, an
-/// empty cipher and an empty password each render a link that this build's own
-/// `parse_ss_uri` then refuses. `ProfileDto` enforces none of those — its
-/// fields are a `String`, a `u16` and an `Option<String>` — and nothing
-/// upstream is guaranteed to have screened them. Without these checks the user
-/// copies a link, pastes it back, and it does not import.
+/// **This is the well-formedness guard.** `render_ss_uri` is total, but not
+/// every input renders something a Shadowsocks client can read: an empty host,
+/// port 0, an IPv6 or bracketed host, an empty cipher and an empty password
+/// each produce a link that this build's own `parse_ss_uri` then refuses.
+/// `ProfileDto` enforces none of those — its fields are a `String`, a `u16` and
+/// an `Option<String>` — and nothing upstream is guaranteed to have screened
+/// them. Without these checks the user copies something no client can use.
+///
+/// It is deliberately NOT a round-trip guard, and that is the one asymmetry
+/// with [`import_ss_uri`], which calls [`check_cipher`]. A profile written by
+/// the CLI may name `2022-blake3-aes-256-gcm` — today's default server cipher —
+/// and the link this renders for it is perfectly well formed and perfectly
+/// usable in Outline or shadowsocks-rust. That it will not import back into
+/// *this* build is a limitation of this build's cipher feature set, not a
+/// defect in the link, and "copy as a link" exists precisely so a profile can
+/// be used in another client. Refusing here would withhold a working link from
+/// a profile this app cannot connect with OR edit — a dead end, in place of the
+/// one gesture that still gets the user's own credential out. The cipher name
+/// is not secret and the link says it plainly, so nothing is hidden by letting
+/// it through. `a_link_is_rendered_for_a_cipher_this_build_cannot_speak` pins
+/// this decision, including the half that makes it a decision: our own import
+/// still refuses it.
 Future<String> exportSsUri({
   required ProfileDto dto,
   required String password,

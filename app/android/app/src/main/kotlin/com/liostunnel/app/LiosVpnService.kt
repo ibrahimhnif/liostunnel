@@ -29,14 +29,6 @@ class LiosVpnService : VpnService() {
         private const val CHANNEL_ID = "liostunnel"
         private const val NOTIFICATION_ID = 1
 
-        /**
-         * Runs the Task 3 `protect()` probe on start.
-         *
-         * Temporary. Both this flag and everything it reaches are deleted once
-         * the device answer is recorded — the probe opens sockets to an
-         * external host and has no place in a shipped build.
-         */
-        private const val PROBE_PROTECT = true
 
         /**
          * JNI resolves `external fun` against libraries the *JVM* has loaded.
@@ -77,25 +69,25 @@ class LiosVpnService : VpnService() {
         // this side may close it while the engine holds it -- see onDestroy.
         nativeStart(pfd.detachFd())
 
-        // Temporary, Task 3 only: answers whether protect() works on real
-        // hardware. Runs after the tunnel is up because the control leg of the
-        // probe depends on a default route being installed.
-        if (PROBE_PROTECT) {
-            nativeProbeProtect()
-        }
         return START_STICKY
     }
 
     private fun establishTunnel(): ParcelFileDescriptor? =
         Builder()
             .setSession("LiosTunnel")
-            .addAddress("10.0.0.2", 32)
+            // Read from Rust, not written twice. This address and
+            // `StackConfig::address` must be the same one: the smoltcp stack
+            // answers on it, and if the interface carries a different address
+            // the tunnel silently carries nothing. Hardcoding it here is how
+            // that drift starts, and it did — this said 10.0.0.2 while the
+            // stack used 10.90.0.1.
+            .addAddress(nativeTunAddress(), 32)
             // Everything. `protect()` is what keeps the tunnel's own transport
             // out of this route; there is no narrower route that would do the
             // job, because the whole point is to carry arbitrary traffic.
             .addRoute("0.0.0.0", 0)
             .addDnsServer("1.1.1.1")
-            .setMtu(1500)
+            .setMtu(nativeTunMtu())
             .establish()
 
     override fun onDestroy() {
@@ -136,6 +128,10 @@ class LiosVpnService : VpnService() {
     private external fun nativeStart(fd: Int)
     private external fun nativeStop()
 
-    /** Temporary — Task 3 only, deleted with the Rust probe it calls. */
-    private external fun nativeProbeProtect()
+    /** The address the packet stack answers on. Single source of truth. */
+    private external fun nativeTunAddress(): String
+
+    /** The MTU the packet stack expects, for the same reason. */
+    private external fun nativeTunMtu(): Int
+
 }

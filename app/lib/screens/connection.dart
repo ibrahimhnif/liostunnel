@@ -1,12 +1,8 @@
-import 'dart:io';
-
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../services/connection_model.dart';
 import '../services/profile_store.dart';
-import '../services/vpn_platform.dart';
 
 /// Connect/disconnect, the current state, and live stats.
 class ConnectionScreen extends StatelessWidget {
@@ -36,10 +32,7 @@ class ConnectionScreen extends StatelessWidget {
     final dto = selected?.profile;
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Connection'),
-        actions: const [_AndroidVpnSmokeTest()],
-      ),
+      appBar: AppBar(title: const Text('Connection')),
       body: Padding(
         padding: const EdgeInsets.all(20),
         child: Column(
@@ -207,31 +200,3 @@ String _bytes(BigInt n) {
 String _rate(double? perSec) => perSec == null || !perSec.isFinite
     ? '—'
     : '${_bytes(BigInt.from(perSec.round()))}/s';
-
-/// Raises the VPN consent dialog and starts the tunnel service, with no
-/// profile and no engine behind it.
-///
-/// **Temporary — Task 7 replaces this with the real connect path and deletes
-/// it.** It exists because a `BIND_VPN_SERVICE` service cannot be started
-/// from `adb shell`: the system refuses any caller but itself, so the only
-/// way to exercise `LiosVpnService` before the UI is wired is from inside the
-/// app.
-///
-/// Debug builds on Android only, so it cannot reach a release artifact.
-class _AndroidVpnSmokeTest extends StatelessWidget {
-  const _AndroidVpnSmokeTest();
-
-  @override
-  Widget build(BuildContext context) {
-    if (!kDebugMode || !Platform.isAndroid) return const SizedBox.shrink();
-    return IconButton(
-      icon: const Icon(Icons.bug_report),
-      tooltip: 'Start VpnService (debug)',
-      onPressed: () async {
-        if (await VpnPlatform.prepare()) {
-          await VpnPlatform.start();
-        }
-      },
-    );
-  }
-}

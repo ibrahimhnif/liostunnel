@@ -7,12 +7,14 @@ import 'screens/connection.dart';
 import 'screens/dialogs.dart';
 import 'screens/profile_editor.dart';
 import 'screens/profiles.dart';
+import 'services/android_tunnel.dart';
 import 'services/connection_model.dart';
 import 'services/helper_client.dart';
 import 'services/helper_install.dart';
 import 'services/link_export.dart';
 import 'services/profile_store.dart';
 import 'services/profile_writer.dart';
+import 'src/rust/api/android.dart';
 import 'src/rust/api/protocol.dart';
 import 'src/rust/frb_generated.dart';
 
@@ -90,6 +92,10 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   final _client = HelperClient();
+
+  /// The in-process engine, on Android only. Null everywhere else, where the
+  /// root helper owns the tunnel instead.
+  AndroidTunnel? _android;
   late final _store = ProfileStore(directory: widget.profilesDirectory);
   late final _writer = ProfileWriter(directory: _store.directory);
   List<LoadedProfile> _profiles = const [];
@@ -117,8 +123,34 @@ class _HomePageState extends State<HomePage> {
     // Subscribed once, here, rather than inside `_attach`. A successful
     // install runs `_attach` a second time, and a second listener on the same
     // broadcast stream applies every event the helper pushes twice.
-    _client.events.listen(context.read<ConnectionModel>().applyEvent);
-    _attach();
+    final model = context.read<ConnectionModel>();
+    if (AndroidTunnel.isSupported) {
+      // No helper, no socket, and nothing to attach to: the engine is in this
+      // process. Polled state and counters are turned into the same two events
+      // the helper pushes, so `ConnectionModel` -- and live speed with it --
+      // needs no Android-specific code.
+      _android = AndroidTunnel();
+      _android!.events.listen(
+        (e) {
+          model.applyEvent(StateEvent(_stateLabel(e.status)));
+          model.applyEvent(
+            StatsEvent(
+              // The generated bindings give BigInt for every u64; only
+              // `activeFlows` is an int on the helper's side.
+              bytesUp: e.stats.bytesUp,
+              bytesDown: e.stats.bytesDown,
+              activeFlows: e.stats.activeFlows.toInt(),
+              flowsFailed: e.stats.flowsFailed,
+              dnsQueries: e.stats.dnsQueries,
+            ),
+          );
+        },
+        onError: model.applyError,
+      );
+    } else {
+      _client.events.listen(model.applyEvent);
+      _attach();
+    }
     _reload();
   }
 
@@ -214,10 +246,39 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  /// Maps engine state onto the labels the desktop helper already sends, so
+  /// the chip and `ConnectionModel`'s "not Connected clears the numbers" rule
+  /// behave identically on both platforms.
+  static String _stateLabel(EngineStatusDto s) => switch (s.state) {
+    'connected' => 'Connected',
+    'connecting' => 'Connecting',
+    'failed' => 'Failed',
+    _ => 'Disconnected',
+  };
+
+  Future<void> _connectAndroid(LoadedProfile selected) async {
+    final model = context.read<ConnectionModel>();
+    try {
+      final secrets = await resolveSecrets(selected.profile!);
+      await _android!.connect(
+        profile: selected.profile!,
+        // The account on the SERVER. Android has no USER environment
+        // variable to fall back to, so an SSH profile without one is a
+        // profile that cannot connect -- and saying so beats "credentials
+        // rejected".
+        user: selected.sshUser ?? '',
+        secrets: secrets,
+      );
+    } catch (e) {
+      model.applyError(e);
+    }
+  }
+
   Future<void> _connect() async {
     final model = context.read<ConnectionModel>();
     final selected = _selected;
     if (selected?.profile == null) return;
+    if (_android != null) return _connectAndroid(selected!);
     try {
       await _client.sendConnect(
         ConnectParamsDto(
@@ -242,6 +303,10 @@ class _HomePageState extends State<HomePage> {
   Future<void> _disconnect() async {
     final model = context.read<ConnectionModel>();
     try {
+      if (_android != null) {
+        await _android!.disconnect();
+        return;
+      }
       await _client.disconnect();
     } catch (e) {
       model.applyError(e);
@@ -250,6 +315,7 @@ class _HomePageState extends State<HomePage> {
 
   @override
   void dispose() {
+    _android?.dispose();
     _client.close();
     super.dispose();
   }

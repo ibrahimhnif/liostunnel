@@ -6,6 +6,7 @@
 // Static analysis wrongly picks the IO variant, thus ignore this
 // ignore_for_file: argument_type_not_assignable
 
+import 'api/android.dart';
 import 'api/config.dart';
 import 'api/probe.dart';
 import 'api/protocol.dart';
@@ -45,6 +46,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ConnectParamsDto dco_decode_connect_params_dto(dynamic raw);
 
   @protected
+  EngineStatsDto dco_decode_engine_stats_dto(dynamic raw);
+
+  @protected
+  EngineStatusDto dco_decode_engine_status_dto(dynamic raw);
+
+  @protected
   ErrorKindDto dco_decode_error_kind_dto(dynamic raw);
 
   @protected
@@ -63,6 +70,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
 
   @protected
+  List<SecretPair> dco_decode_list_secret_pair(dynamic raw);
+
+  @protected
   String? dco_decode_opt_String(dynamic raw);
 
   @protected
@@ -76,6 +86,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   RequestDto dco_decode_request_dto(dynamic raw);
+
+  @protected
+  SecretPair dco_decode_secret_pair(dynamic raw);
 
   @protected
   int dco_decode_u_16(dynamic raw);
@@ -116,6 +129,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   ConnectParamsDto sse_decode_connect_params_dto(SseDeserializer deserializer);
 
   @protected
+  EngineStatsDto sse_decode_engine_stats_dto(SseDeserializer deserializer);
+
+  @protected
+  EngineStatusDto sse_decode_engine_status_dto(SseDeserializer deserializer);
+
+  @protected
   ErrorKindDto sse_decode_error_kind_dto(SseDeserializer deserializer);
 
   @protected
@@ -134,6 +153,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
 
   @protected
+  List<SecretPair> sse_decode_list_secret_pair(SseDeserializer deserializer);
+
+  @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
 
   @protected
@@ -147,6 +169,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   RequestDto sse_decode_request_dto(SseDeserializer deserializer);
+
+  @protected
+  SecretPair sse_decode_secret_pair(SseDeserializer deserializer);
 
   @protected
   int sse_decode_u_16(SseDeserializer deserializer);
@@ -200,6 +225,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_engine_stats_dto(
+    EngineStatsDto self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_engine_status_dto(
+    EngineStatusDto self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_error_kind_dto(ErrorKindDto self, SseSerializer serializer);
 
   @protected
@@ -221,6 +258,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_list_secret_pair(
+    List<SecretPair> self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
 
   @protected
@@ -234,6 +277,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_request_dto(RequestDto self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_secret_pair(SecretPair self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_16(int self, SseSerializer serializer);

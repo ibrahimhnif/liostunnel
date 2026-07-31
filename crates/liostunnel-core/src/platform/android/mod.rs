@@ -13,14 +13,13 @@
 //! produced `com.liostunnel.liostunnel_app`, and JNI escapes an underscore in
 //! a package segment to `_1`.
 
-use crate::net::android_tun::AndroidTun;
-use crate::net::tun::PacketIo;
+pub mod engine;
+
 use jni::objects::{GlobalRef, JObject, JValue};
 use jni::{JNIEnv, JavaVM};
 use std::ffi::{CString, c_char};
 use std::io;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 // `liblog`'s writer, declared rather than depended on.
@@ -163,248 +162,47 @@ pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeStart(
         return;
     }
     log(ANDROID_LOG_INFO, &format!("nativeStart: fd={fd}"));
-
-    let tun = match AndroidTun::new(fd, MTU) {
-        Ok(t) => t,
-        Err(e) => {
-            log(ANDROID_LOG_ERROR, &format!("nativeStart: {e}"));
-            return;
-        }
-    };
-
-    STOP.store(false, Ordering::SeqCst);
-    std::thread::spawn(move || drain(tun));
+    engine::start(fd);
 }
 
-/// Matches `Builder.setMtu` in `LiosVpnService`. The two have to agree: the
-/// descriptor will not deliver a packet larger than what the builder set.
-const MTU: usize = 1500;
-
-/// Set by `nativeStop` to bring [`drain`] down.
-static STOP: AtomicBool = AtomicBool::new(false);
-
-/// **Task 4 scaffolding.** Reads the tunnel and counts what arrives.
+/// The tunnel address `VpnService.Builder` must use.
 ///
-/// Task 5 replaces this with the smoltcp stack, which consumes the same
-/// `Box<dyn PacketIo>`. It exists because "the descriptor is wired up
-/// correctly" and "the protocols work" are separate claims, and this proves
-/// the first one without depending on the second.
-fn drain(mut tun: AndroidTun) {
-    let mut buf = vec![0u8; MTU + 4];
-    let mut packets: u64 = 0;
-    let mut reported = 0u64;
-
-    while !STOP.load(Ordering::SeqCst) {
-        match tun.read_packet(&mut buf) {
-            Ok(0) => {
-                // Nothing available. Sleep on the descriptor rather than
-                // spinning -- the same contract the desktop driving loop
-                // follows, and the reason `read_packet` maps EWOULDBLOCK to 0
-                // instead of erroring.
-                wait_readable(&tun, 250);
-            }
-            Ok(_) => {
-                packets += 1;
-                // A count, never a byte of payload.
-                if packets >= reported + 25 {
-                    reported = packets;
-                    log(ANDROID_LOG_INFO, &format!("tun: {packets} packets read"));
-                }
-            }
-            Err(e) => {
-                log(ANDROID_LOG_ERROR, &format!("tun: read failed: {e}"));
-                break;
-            }
-        }
+/// Kotlin reads it from here rather than repeating the literal: the builder's
+/// address and `StackConfig::address` have to agree, and a silent divergence
+/// would leave the stack answering on an address the descriptor never carries.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeTunAddress<'a>(
+    env: JNIEnv<'a>,
+    _this: JObject<'a>,
+) -> jni::sys::jstring {
+    let s = engine::TUN_ADDRESS.to_string();
+    match env.new_string(s) {
+        Ok(v) => v.into_raw(),
+        Err(_) => std::ptr::null_mut(),
     }
-    log(
-        ANDROID_LOG_INFO,
-        &format!("tun: drain stopped after {packets} packets"),
-    );
 }
 
-/// Blocks until the descriptor has data or `timeout_ms` elapses.
-fn wait_readable(tun: &AndroidTun, timeout_ms: i32) {
-    let Some(fd) = tun.pollable_fd() else { return };
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+/// The MTU `VpnService.Builder` must use, for the same reason.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeTunMtu(
+    _env: JNIEnv,
+    _this: JObject,
+) -> i32 {
+    engine::TUN_MTU as i32
 }
 
 /// Called from `LiosVpnService.onDestroy`, before the `ParcelFileDescriptor`
 /// is closed.
 ///
-/// Task 2 stub — Task 4 stops the engine and drops the tun.
+/// Blocks until the engine's threads have joined, so the `AndroidTun` holding
+/// the descriptor is dropped before Kotlin closes its own handle to it.
+/// Returning early would leave a thread reading a descriptor that is about to
+/// be closed underneath it.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeStop(
     _env: JNIEnv,
     _this: JObject,
 ) {
-    // The drain thread owns the `AndroidTun` and closes the descriptor when it
-    // drops, so this must return before Kotlin closes its ParcelFileDescriptor.
-    STOP.store(true, Ordering::SeqCst);
+    engine::stop();
     log(ANDROID_LOG_INFO, "nativeStop");
-}
-
-/// **Temporary — Task 3 only. Deleted once the device answer is recorded.**
-///
-/// Establishes the `protect()` result on real hardware, which is the only
-/// place it can be established: every symbol above is
-/// `#[cfg(target_os = "android")]` and compiles nowhere else.
-///
-/// # Why both sockets, in one run
-///
-/// A `protect` that returns `true` while excluding nothing would pass a
-/// protected-only probe. The control socket is what makes the result mean
-/// something: with a default route installed, an *unprotected* connection to
-/// an external host routes into the tunnel and must fail or hang, while a
-/// protected one must succeed.
-///
-/// Both run in the same pass, seconds apart, so the comparison is not across
-/// two different moments of network weather.
-///
-/// **If both succeed, `protect()` is not what made the difference and the
-/// probe has proved nothing** — that is a failed run, not a pass.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeProbeProtect(
-    _env: JNIEnv,
-    _this: JObject,
-) {
-    // A plain thread, deliberately: it proves `attach_current_thread` works
-    // from a thread the JVM has never seen, which is the case every tokio
-    // worker will be in.
-    std::thread::spawn(|| {
-        // `establish()` returning is not the same as the routes being live.
-        //
-        // Found by observation, not reasoning: an earlier run logged
-        // "control: connect OK" 100ms after nativeStart, while a ping issued
-        // 30 seconds later saw 100% loss. Both cannot describe the same
-        // routing state -- the control socket had connected through the
-        // pre-VPN route, so its success said nothing about protect() at all.
-        //
-        // Without this wait the probe reports "both succeeded", which its own
-        // rule calls a failed run. That is the safe direction to be wrong in,
-        // but it would have wasted a hardware session.
-        std::thread::sleep(std::time::Duration::from_secs(5));
-
-        log(ANDROID_LOG_INFO, "probe: begin");
-        probe_one("protected", true);
-        probe_one("control", false);
-        log(ANDROID_LOG_INFO, "probe: end");
-    });
-}
-
-/// One leg of the probe: create a socket, optionally protect it, then connect.
-///
-/// Protection happens before `connect` for the reason [`protect_fd`] states.
-fn probe_one(label: &str, protect: bool) {
-    // The descriptor has to exist before `connect`, so that `protect` can be
-    // called in between -- the same constraint that makes the SSH path use
-    // `TcpSocket` instead of `TcpStream::connect`. `socket(2)` directly avoids
-    // pulling a crate in for a function that is deleted at the end of the task.
-    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        let e = io::Error::last_os_error();
-        log(ANDROID_LOG_ERROR, &format!("probe {label}: socket: {e}"));
-        return;
-    }
-
-    if protect {
-        match protect_fd(fd) {
-            Ok(()) => log(ANDROID_LOG_INFO, &format!("probe {label}: protect OK")),
-            Err(e) => {
-                log(
-                    ANDROID_LOG_ERROR,
-                    &format!("probe {label}: protect FAILED: {e}"),
-                );
-                unsafe { libc::close(fd) };
-                return;
-            }
-        }
-    }
-
-    // 1.1.1.1:80 as a literal, so no DNS lookup happens on a descriptor whose
-    // routing is the thing under test.
-    let addr = libc::sockaddr_in {
-        sin_family: libc::AF_INET as libc::sa_family_t,
-        sin_port: 80u16.to_be(),
-        sin_addr: libc::in_addr {
-            s_addr: u32::from_be_bytes([1, 1, 1, 1]).to_be(),
-        },
-        sin_zero: [0; 8],
-    };
-    // Non-blocking, so the attempt can be given a deadline. A blocking connect
-    // into the tunnel takes the kernel's full SYN-retry budget -- measured at
-    // 133 seconds on the emulator, which reads like a hang rather than a
-    // result and makes a hardware session needlessly slow.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-
-    let rc = unsafe {
-        libc::connect(
-            fd,
-            (&raw const addr).cast::<libc::sockaddr>(),
-            size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        )
-    };
-
-    let outcome = if rc == 0 {
-        Ok(())
-    } else {
-        let e = io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::EINPROGRESS) {
-            Err(e)
-        } else {
-            connect_result(fd, 15_000)
-        }
-    };
-
-    match outcome {
-        Ok(()) => log(ANDROID_LOG_INFO, &format!("probe {label}: connect OK")),
-        Err(e) => log(
-            ANDROID_LOG_ERROR,
-            &format!("probe {label}: connect FAILED: {e}"),
-        ),
-    }
-    unsafe { libc::close(fd) };
-}
-
-/// Waits for an in-progress connect to finish, or `timeout_ms` to elapse.
-///
-/// Temporary — deleted with the rest of the probe.
-fn connect_result(fd: RawFd, timeout_ms: i32) -> io::Result<()> {
-    let mut pfd = libc::pollfd {
-        fd,
-        events: libc::POLLOUT,
-        revents: 0,
-    };
-    match unsafe { libc::poll(&mut pfd, 1, timeout_ms) } {
-        0 => return Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out")),
-        n if n < 0 => return Err(io::Error::last_os_error()),
-        _ => {}
-    }
-
-    // A writable socket is not necessarily a connected one: a refused or
-    // unreachable connection also wakes poll, and the reason is in SO_ERROR.
-    let mut err: libc::c_int = 0;
-    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_ERROR,
-            (&raw mut err).cast(),
-            &mut len,
-        )
-    };
-    if rc < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if err != 0 {
-        return Err(io::Error::from_raw_os_error(err));
-    }
-    Ok(())
 }

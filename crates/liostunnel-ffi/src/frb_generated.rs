@@ -27,7 +27,7 @@
 // Section: imports
 
 use flutter_rust_bridge::for_generated::byteorder::{NativeEndian, ReadBytesExt, WriteBytesExt};
-use flutter_rust_bridge::for_generated::{Lifetimeable, Lockable, transform_result_dco};
+use flutter_rust_bridge::for_generated::{transform_result_dco, Lifetimeable, Lockable};
 use flutter_rust_bridge::{Handler, IntoIntoDart};
 
 // Section: boilerplate
@@ -38,7 +38,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.12.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 975681145;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -339873829;
 
 // Section: executor
 
@@ -46,6 +46,110 @@ flutter_rust_bridge::frb_generated_default_handler!();
 
 // Section: wire_funcs
 
+fn wire__crate__api__android__android_stage_profile_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "android_stage_profile",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api__dto = <crate::dto::profile::ProfileDto>::sse_decode(&mut deserializer);
+            let api__user = <String>::sse_decode(&mut deserializer);
+            let api__secrets =
+                <Vec<crate::api::android::SecretPair>>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, String>((move || {
+                    let output_ok = crate::api::android::android_stage_profile(
+                        api__dto,
+                        api__user,
+                        api__secrets,
+                    )?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__android__android_stats_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "android_stats",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, ()>((move || {
+                    let output_ok = Result::<_, ()>::Ok(crate::api::android::android_stats())?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__android__android_status_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "android_status",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, ()>((move || {
+                    let output_ok = Result::<_, ()>::Ok(crate::api::android::android_status())?;
+                    Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
 fn wire__crate__api__config__check_profile_impl(
     port_: flutter_rust_bridge::for_generated::MessagePort,
     ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
@@ -545,6 +649,36 @@ impl SseDecode for crate::api::protocol::ConnectParamsDto {
     }
 }
 
+impl SseDecode for crate::api::android::EngineStatsDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_bytesUp = <u64>::sse_decode(deserializer);
+        let mut var_bytesDown = <u64>::sse_decode(deserializer);
+        let mut var_activeFlows = <u64>::sse_decode(deserializer);
+        let mut var_flowsFailed = <u64>::sse_decode(deserializer);
+        let mut var_dnsQueries = <u64>::sse_decode(deserializer);
+        return crate::api::android::EngineStatsDto {
+            bytes_up: var_bytesUp,
+            bytes_down: var_bytesDown,
+            active_flows: var_activeFlows,
+            flows_failed: var_flowsFailed,
+            dns_queries: var_dnsQueries,
+        };
+    }
+}
+
+impl SseDecode for crate::api::android::EngineStatusDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_state = <String>::sse_decode(deserializer);
+        let mut var_detail = <String>::sse_decode(deserializer);
+        return crate::api::android::EngineStatusDto {
+            state: var_state,
+            detail: var_detail,
+        };
+    }
+}
+
 impl SseDecode for crate::api::protocol::ErrorKindDto {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -633,6 +767,18 @@ impl SseDecode for Vec<u8> {
         let mut ans_ = Vec::with_capacity(len_ as usize);
         for idx_ in 0..len_ {
             ans_.push(<u8>::sse_decode(deserializer));
+        }
+        return ans_;
+    }
+}
+
+impl SseDecode for Vec<crate::api::android::SecretPair> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut len_ = <i32>::sse_decode(deserializer);
+        let mut ans_ = Vec::with_capacity(len_ as usize);
+        for idx_ in 0..len_ {
+            ans_.push(<crate::api::android::SecretPair>::sse_decode(deserializer));
         }
         return ans_;
     }
@@ -761,6 +907,20 @@ impl SseDecode for crate::api::protocol::RequestDto {
     }
 }
 
+impl SseDecode for crate::api::android::SecretPair {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_kind = <String>::sse_decode(deserializer);
+        let mut var_key = <String>::sse_decode(deserializer);
+        let mut var_value = <String>::sse_decode(deserializer);
+        return crate::api::android::SecretPair {
+            kind: var_kind,
+            key: var_key,
+            value: var_value,
+        };
+    }
+}
+
 impl SseDecode for u16 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -803,20 +963,25 @@ fn pde_ffi_dispatcher_primary_impl(
 ) {
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
-        1 => wire__crate__api__config__check_profile_impl(port, ptr, rust_vec_len, data_len),
-        2 => wire__crate__api__protocol__decode_message_impl(port, ptr, rust_vec_len, data_len),
-        3 => wire__crate__api__probe__echo_probe_impl(port, ptr, rust_vec_len, data_len),
-        4 => wire__crate__api__protocol__encode_request_impl(port, ptr, rust_vec_len, data_len),
-        5 => wire__crate__api__config__export_profile_impl(port, ptr, rust_vec_len, data_len),
-        6 => wire__crate__api__config__export_ss_uri_impl(port, ptr, rust_vec_len, data_len),
-        7 => wire__crate__api__config__file_secret_value_impl(port, ptr, rust_vec_len, data_len),
-        8 => wire__crate__api__config__import_ss_uri_impl(port, ptr, rust_vec_len, data_len),
-        9 => wire__crate__api__config__new_profile_id_impl(port, ptr, rust_vec_len, data_len),
-        10 => wire__crate__api__config__offered_ciphers_impl(port, ptr, rust_vec_len, data_len),
-        11 => wire__crate__api__config__parse_profile_impl(port, ptr, rust_vec_len, data_len),
-        12 => wire__crate__api__config__profile_summary_impl(port, ptr, rust_vec_len, data_len),
-        13 => wire__crate__api__protocol__protocol_version_impl(port, ptr, rust_vec_len, data_len),
-        14 => wire__crate__api__config__ss_uri_password_impl(port, ptr, rust_vec_len, data_len),
+        1 => {
+            wire__crate__api__android__android_stage_profile_impl(port, ptr, rust_vec_len, data_len)
+        }
+        2 => wire__crate__api__android__android_stats_impl(port, ptr, rust_vec_len, data_len),
+        3 => wire__crate__api__android__android_status_impl(port, ptr, rust_vec_len, data_len),
+        4 => wire__crate__api__config__check_profile_impl(port, ptr, rust_vec_len, data_len),
+        5 => wire__crate__api__protocol__decode_message_impl(port, ptr, rust_vec_len, data_len),
+        6 => wire__crate__api__probe__echo_probe_impl(port, ptr, rust_vec_len, data_len),
+        7 => wire__crate__api__protocol__encode_request_impl(port, ptr, rust_vec_len, data_len),
+        8 => wire__crate__api__config__export_profile_impl(port, ptr, rust_vec_len, data_len),
+        9 => wire__crate__api__config__export_ss_uri_impl(port, ptr, rust_vec_len, data_len),
+        10 => wire__crate__api__config__file_secret_value_impl(port, ptr, rust_vec_len, data_len),
+        11 => wire__crate__api__config__import_ss_uri_impl(port, ptr, rust_vec_len, data_len),
+        12 => wire__crate__api__config__new_profile_id_impl(port, ptr, rust_vec_len, data_len),
+        13 => wire__crate__api__config__offered_ciphers_impl(port, ptr, rust_vec_len, data_len),
+        14 => wire__crate__api__config__parse_profile_impl(port, ptr, rust_vec_len, data_len),
+        15 => wire__crate__api__config__profile_summary_impl(port, ptr, rust_vec_len, data_len),
+        16 => wire__crate__api__protocol__protocol_version_impl(port, ptr, rust_vec_len, data_len),
+        17 => wire__crate__api__config__ss_uri_password_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -857,6 +1022,51 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::protocol::ConnectParamsDto>
     for crate::api::protocol::ConnectParamsDto
 {
     fn into_into_dart(self) -> crate::api::protocol::ConnectParamsDto {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::android::EngineStatsDto {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.bytes_up.into_into_dart().into_dart(),
+            self.bytes_down.into_into_dart().into_dart(),
+            self.active_flows.into_into_dart().into_dart(),
+            self.flows_failed.into_into_dart().into_dart(),
+            self.dns_queries.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::android::EngineStatsDto
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::android::EngineStatsDto>
+    for crate::api::android::EngineStatsDto
+{
+    fn into_into_dart(self) -> crate::api::android::EngineStatsDto {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::android::EngineStatusDto {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.state.into_into_dart().into_dart(),
+            self.detail.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::android::EngineStatusDto
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::android::EngineStatusDto>
+    for crate::api::android::EngineStatusDto
+{
+    fn into_into_dart(self) -> crate::api::android::EngineStatusDto {
         self
     }
 }
@@ -1054,6 +1264,28 @@ impl flutter_rust_bridge::IntoIntoDart<crate::api::protocol::RequestDto>
         self
     }
 }
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::android::SecretPair {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.kind.into_into_dart().into_dart(),
+            self.key.into_into_dart().into_dart(),
+            self.value.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive
+    for crate::api::android::SecretPair
+{
+}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::android::SecretPair>
+    for crate::api::android::SecretPair
+{
+    fn into_into_dart(self) -> crate::api::android::SecretPair {
+        self
+    }
+}
 
 impl SseEncode for String {
     // Codec=Sse (Serialization based), see doc to use other codecs
@@ -1078,6 +1310,25 @@ impl SseEncode for crate::api::protocol::ConnectParamsDto {
         <Vec<String>>::sse_encode(self.cidrs, serializer);
         <bool>::sse_encode(self.capture_dns, serializer);
         <String>::sse_encode(self.tun_address, serializer);
+    }
+}
+
+impl SseEncode for crate::api::android::EngineStatsDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <u64>::sse_encode(self.bytes_up, serializer);
+        <u64>::sse_encode(self.bytes_down, serializer);
+        <u64>::sse_encode(self.active_flows, serializer);
+        <u64>::sse_encode(self.flows_failed, serializer);
+        <u64>::sse_encode(self.dns_queries, serializer);
+    }
+}
+
+impl SseEncode for crate::api::android::EngineStatusDto {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.state, serializer);
+        <String>::sse_encode(self.detail, serializer);
     }
 }
 
@@ -1165,6 +1416,16 @@ impl SseEncode for Vec<u8> {
         <i32>::sse_encode(self.len() as _, serializer);
         for item in self {
             <u8>::sse_encode(item, serializer);
+        }
+    }
+}
+
+impl SseEncode for Vec<crate::api::android::SecretPair> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(self.len() as _, serializer);
+        for item in self {
+            <crate::api::android::SecretPair>::sse_encode(item, serializer);
         }
     }
 }
@@ -1259,6 +1520,15 @@ impl SseEncode for crate::api::protocol::RequestDto {
     }
 }
 
+impl SseEncode for crate::api::android::SecretPair {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <String>::sse_encode(self.kind, serializer);
+        <String>::sse_encode(self.key, serializer);
+        <String>::sse_encode(self.value, serializer);
+    }
+}
+
 impl SseEncode for u16 {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -1303,7 +1573,7 @@ mod io {
     use flutter_rust_bridge::for_generated::byteorder::{
         NativeEndian, ReadBytesExt, WriteBytesExt,
     };
-    use flutter_rust_bridge::for_generated::{Lifetimeable, Lockable, transform_result_dco};
+    use flutter_rust_bridge::for_generated::{transform_result_dco, Lifetimeable, Lockable};
     use flutter_rust_bridge::{Handler, IntoIntoDart};
 
     // Section: boilerplate
@@ -1327,7 +1597,7 @@ mod web {
     };
     use flutter_rust_bridge::for_generated::wasm_bindgen;
     use flutter_rust_bridge::for_generated::wasm_bindgen::prelude::*;
-    use flutter_rust_bridge::for_generated::{Lifetimeable, Lockable, transform_result_dco};
+    use flutter_rust_bridge::for_generated::{transform_result_dco, Lifetimeable, Lockable};
     use flutter_rust_bridge::{Handler, IntoIntoDart};
 
     // Section: boilerplate
