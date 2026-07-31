@@ -147,6 +147,10 @@ class _HomePageState extends State<HomePage> {
         },
         onError: model.applyError,
       );
+      // Reflect a tunnel that is already running. `_attach` does this on
+      // desktop by asking the helper for status; the engine here outlives the
+      // Activity in exactly the same way, so the UI has to ask.
+      _android!.attach();
     } else {
       _client.events.listen(model.applyEvent);
       _attach();

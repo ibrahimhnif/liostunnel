@@ -39,7 +39,13 @@ class VpnChannel(private val activity: Activity) : MethodChannel.MethodCallHandl
                 result.success(null)
             }
             "stop" -> {
-                activity.stopService(Intent(activity, LiosVpnService::class.java))
+                // Delivered TO the service rather than stopping it from here:
+                // the VPN framework keeps a VpnService alive while its tunnel
+                // is established, so stopService returns having done nothing.
+                activity.startService(
+                    Intent(activity, LiosVpnService::class.java)
+                        .setAction(LiosVpnService.ACTION_DISCONNECT)
+                )
                 result.success(null)
             }
             else -> result.notImplemented()

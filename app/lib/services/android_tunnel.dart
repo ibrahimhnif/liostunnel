@@ -38,6 +38,19 @@ class AndroidTunnel {
 
   static bool get isSupported => Platform.isAndroid;
 
+  /// Starts reflecting whatever the engine is already doing.
+  ///
+  /// The Android counterpart of the desktop client's `getStatus()` on launch,
+  /// and required for the same reason (P1a-4): the engine outlives the UI. A
+  /// foreground service keeps the tunnel up while the Activity is destroyed,
+  /// so a recreated Activity that only polled after its own [connect] call
+  /// showed Disconnected and zeroed counters over a running tunnel — with the
+  /// Disconnect button unreachable, because it is gated on `isConnected`.
+  /// There was then no way to stop the tunnel from the app at all.
+  ///
+  /// Safe when nothing is running: the engine reports idle and zeros.
+  void attach() => _startPolling();
+
   /// Stages the profile, asks for VPN consent, then starts the service.
   ///
   /// Returns false when the user declined consent. That is an answer rather
@@ -58,14 +71,19 @@ class AndroidTunnel {
     return true;
   }
 
-  Future<void> disconnect() async {
-    await VpnPlatform.stop();
-    // One last read, so the UI settles on the real post-stop state rather
-    // than the last value seen while it was still running.
-    await _tick();
-    _poll?.cancel();
-    _poll = null;
-  }
+  /// Asks the service to tear the tunnel down.
+  ///
+  /// **Polling deliberately keeps running.** Teardown is not instantaneous —
+  /// the engine's threads have to join and the descriptor has to close — so a
+  /// read taken the moment `stop` returns still reports Connected. Cancelling
+  /// the timer on that read left the screen saying Connected, with a
+  /// Disconnect button, over a tunnel that was already gone: no key icon, no
+  /// service, no route.
+  ///
+  /// The timer is owned by [attach] for the life of the page and stopped in
+  /// [dispose]. Letting it run is also what makes the UI notice an engine that
+  /// stops on its own.
+  Future<void> disconnect() => VpnPlatform.stop();
 
   void _startPolling() {
     _poll?.cancel();

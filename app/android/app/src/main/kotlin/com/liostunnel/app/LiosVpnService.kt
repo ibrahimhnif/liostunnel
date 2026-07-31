@@ -29,6 +29,9 @@ class LiosVpnService : VpnService() {
         private const val CHANNEL_ID = "liostunnel"
         private const val NOTIFICATION_ID = 1
 
+        /** Asks a running service to tear the tunnel down. See onStartCommand. */
+        const val ACTION_DISCONNECT = "com.liostunnel.app.DISCONNECT"
+
 
         /**
          * JNI resolves `external fun` against libraries the *JVM* has loaded.
@@ -45,7 +48,30 @@ class LiosVpnService : VpnService() {
 
     private var tunnel: ParcelFileDescriptor? = null
 
+    /** Guards [teardown] against running twice. */
+    private var tornDown = false
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Stopping has to be asked for from inside the service.
+        //
+        // `stopService` from the Activity does not destroy a VpnService whose
+        // tunnel is established: the VPN framework holds its own reference, so
+        // the call returns having done nothing. Measured, not assumed --
+        // Disconnect appeared to do nothing at all, with no error and no log,
+        // while the tunnel stayed up and the notification stayed put.
+        if (intent?.action == ACTION_DISCONNECT) {
+            Log.i(TAG, "disconnect requested")
+            // Tear down here rather than leaving it to onDestroy. stopSelf()
+            // alone does not destroy the service either: the VPN stays up
+            // until the tunnel descriptor is closed, and that descriptor now
+            // belongs to the engine. Closing it is what brings the interface
+            // down, which is what lets the service finish.
+            teardown()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
         startForeground(NOTIFICATION_ID, buildNotification())
 
         // Before establish(), and before any socket exists: this hands native
@@ -64,12 +90,17 @@ class LiosVpnService : VpnService() {
             return START_NOT_STICKY
         }
 
+        tornDown = false
         tunnel = pfd
         // Ownership of the descriptor transfers to native code. Nothing on
         // this side may close it while the engine holds it -- see onDestroy.
         nativeStart(pfd.detachFd())
 
-        return START_STICKY
+        // Not START_STICKY: a restart hands onStartCommand a null intent, and
+        // there is no staged profile then -- the engine would refuse and the
+        // tunnel would be a shell. A tunnel should come back because someone
+        // asked for it, not because the process died.
+        return START_NOT_STICKY
     }
 
     private fun establishTunnel(): ParcelFileDescriptor? =
@@ -90,12 +121,26 @@ class LiosVpnService : VpnService() {
             .setMtu(nativeTunMtu())
             .establish()
 
-    override fun onDestroy() {
-        // Before closing the descriptor: the engine is still reading from it
-        // until this returns.
+    /**
+     * Stops the engine and releases the tunnel.
+     *
+     * Idempotent: the disconnect path calls it and so does [onDestroy], which
+     * still runs afterwards, and `nativeStop` on an already-stopped engine
+     * would otherwise try to join a runtime that is gone.
+     */
+    @Synchronized
+    private fun teardown() {
+        if (tornDown) return
+        tornDown = true
+        // Before closing the descriptor: nativeStop blocks until the engine's
+        // threads have joined, so nothing is still reading when this returns.
         nativeStop()
         tunnel?.close()
         tunnel = null
+    }
+
+    override fun onDestroy() {
+        teardown()
         super.onDestroy()
     }
 
