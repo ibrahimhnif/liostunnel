@@ -32,6 +32,12 @@ class ConnectionModel extends ChangeNotifier {
 
   final DateTime Function() _clock;
 
+  /// Samples closer together than this carry no usable rate.
+  ///
+  /// The helper ticks once a second, so a gap this small means frames were
+  /// buffered and drained, not that traffic was measured over it.
+  static const _minSampleGap = 0.25;
+
   String _state = 'Disconnected';
   BigInt _bytesUp = BigInt.zero;
   BigInt _bytesDown = BigInt.zero;
@@ -175,11 +181,15 @@ class ConnectionModel extends ChangeNotifier {
     final prevAt = _lastSampleAt;
     final prevUp = _lastUp;
     final prevDown = _lastDown;
-    _lastSampleAt = now;
-    _lastUp = up;
-    _lastDown = down;
+
+    void rebaseline() {
+      _lastSampleAt = now;
+      _lastUp = up;
+      _lastDown = down;
+    }
 
     if (prevAt == null || prevUp == null || prevDown == null) {
+      rebaseline();
       _upPerSec = null;
       _downPerSec = null;
       return;
@@ -191,16 +201,28 @@ class ConnectionModel extends ChangeNotifier {
     // together because they come from one snapshot: a rate for `down`
     // measured against a sample that `up` proves stale is worse than none.
     if (up < prevUp || down < prevDown) {
+      rebaseline();
       _upPerSec = null;
       _downPerSec = null;
       return;
     }
     final secs = now.difference(prevAt).inMicroseconds / 1e6;
-    if (secs <= 0) {
+    if (secs < _minSampleGap) {
+      // Not just a zero gap. The isolate stalls -- a GC pause, a window
+      // resize, sleep/wake -- while the helper keeps writing one frame per
+      // second into the socket buffer. On resume `LineSplitter` emits them
+      // back to back, microseconds apart, and a megabyte over 16us is
+      // 62 GB/s. Measured gaps in a tight loop: 0, 1 and 16us.
+      //
+      // And deliberately WITHOUT rebaselining: returning before the baseline
+      // is updated leaves the old sample in place, so the next well-separated
+      // frame measures across the whole stall instead of against a drained
+      // one. Rebaselining here would replace one wrong answer with another.
       _upPerSec = null;
       _downPerSec = null;
       return;
     }
+    rebaseline();
     _upPerSec = (up - prevUp).toDouble() / secs;
     _downPerSec = (down - prevDown).toDouble() / secs;
   }
