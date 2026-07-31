@@ -127,7 +127,7 @@ void main() {
     final path = ref.substring(5);
     expect(File(path).readAsStringSync(), 'hunter2');
 
-    final mode = (await Process.run('stat', ['-f', '%Lp', path])).stdout
+    final mode = (await Process.run(_statArgv0, _statArgs(path))).stdout
         .toString()
         .trim();
     expect(mode, '600', reason: 'the helper refuses anything looser');
@@ -144,7 +144,7 @@ void main() {
     // anyone which hosts you have credentials for.
     final w = ProfileWriter(directory: dir.path);
     await w.writeSecret('Home VPS', 'hunter2');
-    final mode = (await Process.run('stat', ['-f', '%Lp', w.secretsDirectory]))
+    final mode = (await Process.run(_statArgv0, _statArgs(w.secretsDirectory)))
         .stdout
         .toString()
         .trim();
@@ -626,7 +626,7 @@ void duplicateTests() {
     // through `writeSecret`, not with a bare `writeAsStringSync`, which would
     // leave a live password in a 0644 file.
     final copyPath = copyDto.authSecretSource.substring(5);
-    final mode = (await Process.run('stat', ['-f', '%Lp', copyPath]))
+    final mode = (await Process.run(_statArgv0, _statArgs(copyPath)))
         .stdout
         .toString()
         .trim();
@@ -854,7 +854,7 @@ void duplicateTests() {
     final copyPass = copyDto.authPassphraseSource!.substring(5);
     expect(File(copyPass).readAsStringSync(), 'original-phrase',
         reason: 'and it must be the passphrase, not a stub');
-    final mode = (await Process.run('stat', ['-f', '%Lp', copyPass]))
+    final mode = (await Process.run(_statArgv0, _statArgs(copyPass)))
         .stdout
         .toString()
         .trim();
@@ -1042,3 +1042,15 @@ void duplicateTests() {
     dir.deleteSync(recursive: true);
   });
 }
+
+/// Reading a file's permission bits portably.
+///
+/// `stat -f %Lp` is BSD. On Linux `-f` means *filesystem* status, so it does
+/// not fail over to something else -- it SUCCEEDS and prints
+/// `File: "/path"`, and the assertion compares that to '600'. A `||`
+/// fallback would never fire for the same reason. This project learned that
+/// once already in its shell scripts; these tests reintroduced it, and it was
+/// invisible until CI ran them on Linux.
+const _statArgv0 = 'stat';
+List<String> _statArgs(String path) =>
+    Platform.isMacOS ? ['-f', '%Lp', path] : ['-c', '%a', path];
