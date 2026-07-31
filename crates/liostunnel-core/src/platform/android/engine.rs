@@ -95,8 +95,13 @@ pub enum EngineState {
 }
 
 struct Running {
-    shutdown: ShutdownHandle,
-    stats: StatsHandle,
+    /// `None` until the protocol has connected.
+    ///
+    /// The runtime is stored before connecting, because connecting happens on
+    /// it and it must outlive the attempt -- so these two arrive later than
+    /// the struct does.
+    shutdown: Option<ShutdownHandle>,
+    stats: Option<StatsHandle>,
     runtime: tokio::runtime::Runtime,
 }
 
@@ -123,7 +128,11 @@ pub fn stats() -> (u64, u64, u64, u64, u64) {
     let Some(r) = guard.as_ref() else {
         return (0, 0, 0, 0, 0);
     };
-    let s = r.stats.load();
+    let Some(handle) = r.stats.as_ref() else {
+        // Connecting: the engine exists but has no counters yet.
+        return (0, 0, 0, 0, 0);
+    };
+    let s = handle.load();
     (
         s.bytes_up,
         s.bytes_down,
@@ -184,25 +193,54 @@ pub fn start(fd: std::os::fd::RawFd) {
         }
     };
 
-    match runtime.block_on(assemble(request, tun)) {
-        Ok((shutdown, stats, task)) => {
-            runtime.spawn(task);
-            *RUNNING.lock().expect("running lock") = Some(Running {
-                shutdown,
-                stats,
-                runtime,
-            });
-            set_state(EngineState::Connected);
-            super::log(super::ANDROID_LOG_INFO, "start: engine running");
+    // Connecting happens ON the runtime, not on the caller's thread.
+    //
+    // `nativeStart` is called from `VpnService.onStartCommand`, which runs on
+    // the main thread. `assemble` resolves the host, opens a TCP connection,
+    // completes a protocol handshake and runs a probe -- seconds of work
+    // against a slow network or a stalled resolver. Blocking on it here would
+    // freeze the UI thread for that long and invite an ANR kill.
+    //
+    // The state machine is what makes this safe to do asynchronously: the UI
+    // polls, sees Connecting, and gets Connected or Failed when it lands.
+    let handle = runtime.handle().clone();
+    *RUNNING.lock().expect("running lock") = Some(Running {
+        shutdown: None,
+        stats: None,
+        runtime,
+    });
+
+    handle.spawn(async move {
+        match assemble(request, tun).await {
+            Ok((shutdown, stats, task)) => {
+                {
+                    let mut guard = RUNNING.lock().expect("running lock");
+                    let Some(r) = guard.as_mut() else {
+                        // `stop` ran while this was connecting. The tunnel it
+                        // was building is nobody's now, so let it drop rather
+                        // than resurrect a session the user cancelled.
+                        super::log(
+                            super::ANDROID_LOG_INFO,
+                            "start: stopped while connecting; discarding",
+                        );
+                        return;
+                    };
+                    r.shutdown = Some(shutdown);
+                    r.stats = Some(stats);
+                }
+                set_state(EngineState::Connected);
+                super::log(super::ANDROID_LOG_INFO, "start: engine running");
+                task.await;
+            }
+            Err(e) => {
+                // The message is the protocol's own. Profile content never
+                // reaches it -- `shadowsocks.rs` and `ssh.rs` both enforce
+                // that in their own error paths, and this only forwards.
+                super::log(super::ANDROID_LOG_ERROR, &format!("start failed: {e}"));
+                set_state(EngineState::Failed(e.to_string()));
+            }
         }
-        Err(e) => {
-            // The message is the protocol's own. Profile content never
-            // reaches it -- `shadowsocks.rs` and `ssh.rs` both enforce that
-            // in their own error paths, and this only forwards.
-            super::log(super::ANDROID_LOG_ERROR, &format!("start failed: {e}"));
-            set_state(EngineState::Failed(e.to_string()));
-        }
-    }
+    });
 }
 
 /// Connects the protocol, starts the stack, and builds the engine.
@@ -306,7 +344,11 @@ fn known_hosts_path() -> std::path::PathBuf {
 pub fn stop() {
     let taken = RUNNING.lock().expect("running lock").take();
     if let Some(r) = taken {
-        r.shutdown.shutdown();
+        // `None` when the connect was still in flight. Dropping the runtime
+        // below cancels it either way; this only asks nicely first.
+        if let Some(shutdown) = r.shutdown {
+            shutdown.shutdown();
+        }
         // Dropping the runtime joins its threads, so the stack -- and with it
         // the `AndroidTun` that owns the descriptor -- is fully torn down
         // before this returns. Kotlin closes its ParcelFileDescriptor next,

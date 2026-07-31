@@ -19,14 +19,17 @@ sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
 ndk="$sdk/ndk/$NDK_VERSION"
 [ -d "$ndk" ] || { echo "NDK $NDK_VERSION not found at $ndk" >&2; exit 1; }
 
-case "$(uname -s)" in
-    Darwin) host=darwin-x86_64 ;;
-    Linux)  host=linux-x86_64 ;;
-    *)      echo "unsupported host: $(uname -s)" >&2; exit 1 ;;
-esac
-
-bin="$ndk/toolchains/llvm/prebuilt/$host/bin"
-[ -d "$bin" ] || { echo "NDK toolchain not found at $bin" >&2; exit 1; }
+# Discovered, not assumed. The NDK ships exactly one prebuilt host directory
+# and its name does not track the machine: on Apple Silicon it is still
+# `darwin-x86_64`, holding universal binaries with an arm64 slice. Hardcoding
+# a name derived from `uname -m` would fail on the very machines it looked
+# like it was written for.
+prebuilt="$ndk/toolchains/llvm/prebuilt"
+bin=""
+for d in "$prebuilt"/*/bin; do
+    [ -d "$d" ] && bin="$d" && break
+done
+[ -n "$bin" ] || { echo "no NDK toolchain under $prebuilt" >&2; exit 1; }
 
 # aws-lc-sys (BoringSSL, via russh) compiles C and looks for a bare
 # `aarch64-linux-android-clang`, which the NDK does not ship -- its clang

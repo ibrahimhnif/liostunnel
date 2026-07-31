@@ -263,14 +263,27 @@ class _HomePageState extends State<HomePage> {
   Future<void> _connectAndroid(LoadedProfile selected) async {
     final model = context.read<ConnectionModel>();
     try {
+      // The account on the SERVER, and only SSH has one. Desktop falls back
+      // to $USER; Android gives an app no such variable, so there is nothing
+      // to fall back to.
+      //
+      // Refused here rather than passed on as an empty string. An empty user
+      // reaches the server and comes back as an authentication failure, which
+      // reads as "your password is wrong" and sends the reader to the one
+      // thing that is not the problem. The comment here used to claim this
+      // was said out loud while the code quietly sent `''`.
+      final user = selected.sshUser;
+      if (selected.profile!.protocol == 'ssh' && (user == null || user.isEmpty)) {
+        throw StateError(
+          'This SSH profile has no user. Add a "<profile>.json.user" file '
+          'beside it naming the account on the server.',
+        );
+      }
+
       final secrets = await resolveSecrets(selected.profile!);
       await _android!.connect(
         profile: selected.profile!,
-        // The account on the SERVER. Android has no USER environment
-        // variable to fall back to, so an SSH profile without one is a
-        // profile that cannot connect -- and saying so beats "credentials
-        // rejected".
-        user: selected.sshUser ?? '',
+        user: user ?? '',
         secrets: secrets,
       );
     } catch (e) {
