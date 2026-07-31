@@ -171,6 +171,53 @@ jobs:
   # The first thing in this workflow that runs `flutter build`. `flutter test`
   # exercises none of cargokit, CMake, the Xcode project or the podspec, so a
   # change that broke the macOS bundle passed every other check here.
+  # Android is its own job rather than a third entry in `package`'s matrix:
+  # the APK builds on any host, so running it on both would pay twice for one
+  # artifact, and every step below is Android-specific anyway.
+  package-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+          # cargokit builds all four; without them the Gradle build fails
+          # inside a Rust step, which reads like a cargokit bug.
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      # `app/android/app/build.gradle.kts` pins this version deliberately, so a
+      # Flutter upgrade cannot move it silently. The runner ships a different
+      # one, which means it has to be installed rather than assumed.
+      - name: install the pinned NDK
+        run: |
+          sdkmanager --install "ndk;27.1.12297006"
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: flutter pub get
+        run: flutter pub get
+        working-directory: app
+      # --split-per-abi, never a universal APK: one carries every ABI and is
+      # three times the size for no benefit on any single phone.
+      - name: build the APKs
+        run: flutter build apk --release --split-per-abi
+        working-directory: app
+      # Checks contents rather than filenames. `--split-per-abi` names its
+      # outputs after the ABI whether or not the split took effect.
+      - name: verify the APKs
+        run: |
+          for apk in app/build/app/outputs/flutter-apk/*release*.apk; do
+            ./testing/verify-apk.sh "$apk"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: liostunnel-android-${{ github.sha }}
+          path: app/build/app/outputs/flutter-apk/*release*.apk
+
   package:
     runs-on: ${{ matrix.os }}
     strategy:
