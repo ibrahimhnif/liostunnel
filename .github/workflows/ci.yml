@@ -194,17 +194,35 @@ jobs:
       # one, which means it has to be installed rather than assumed.
       - name: install the pinned NDK
         run: |
-          # `yes |` because sdkmanager refuses to install anything whose
-          # licence has not been accepted, and it asks interactively -- on a
-          # runner that means it hangs until the job times out rather than
-          # failing with something that names the cause.
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager --install "ndk;27.1.12297006"
-          # Named explicitly rather than left to discovery: cargokit resolves
-          # the NDK through the environment, and the runner has a different
-          # version preinstalled that it would otherwise find first.
-          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.1.12297006" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/27.1.12297006" >> "$GITHUB_ENV"
+          set -u
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          [ -n "$sdk" ] || { echo "no Android SDK on this runner" >&2; exit 1; }
+
+          # Located, not called by name. The runner ships the SDK but does not
+          # put sdkmanager on PATH -- it lives under cmdline-tools -- and the
+          # first version of this step died with "sdkmanager: command not
+          # found" before installing anything.
+          mgr="$(find "$sdk/cmdline-tools" -type f -name sdkmanager 2>/dev/null | head -1)"
+          [ -x "$mgr" ] || { echo "no sdkmanager under $sdk/cmdline-tools" >&2; ls -R "$sdk/cmdline-tools" >&2 || true; exit 1; }
+          echo "using $mgr"
+
+          # `yes |` because sdkmanager asks interactively about licences, and
+          # on a runner an interactive prompt is a job that hangs until the
+          # timeout rather than one that fails with a cause.
+          yes | "$mgr" --licenses > /dev/null 2>&1 || true
+          "$mgr" --install "ndk;27.1.12297006"
+
+          # Assert rather than assume: sdkmanager exits 0 on plenty of things
+          # that install nothing, and the failure would otherwise surface much
+          # later as a confusing cargokit error.
+          ndk="$sdk/ndk/27.1.12297006"
+          [ -d "$ndk" ] || { echo "NDK still absent at $ndk after install" >&2; ls "$sdk/ndk" >&2 || true; exit 1; }
+
+          # Named explicitly: cargokit resolves the NDK through the
+          # environment, and the runner has a different version preinstalled
+          # that it would otherwise find first.
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ndk" >> "$GITHUB_ENV"
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
