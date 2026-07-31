@@ -52,6 +52,35 @@ use crate::stats::{ConnectionState, ConnectionStats};
 /// those three names told a user with a typo to switch to a cipher that then
 /// failed with "not a known cipher" -- advice that cannot work is worse than
 /// no advice.
+/// The connect options every relayed flow is opened with.
+///
+/// # Why a hook rather than a call site
+///
+/// On Android the tunnel's own connection to the Shadowsocks server must be
+/// excluded from the tunnel's routing, or it is routed into itself. Unlike
+/// SSH -- one long-lived socket, protected once -- this crate opens **one
+/// socket per flow**, bounded only by [`MAX_CONCURRENT_FLOWS`], and it owns
+/// their creation. There is no call site of ours to protect them at.
+///
+/// `set_vpn_socket_protect` is the crate's answer: it hands us every socket
+/// it opens, before connecting. A socket that escapes it does not fail
+/// loudly -- it routes into the tunnel and that one flow hangs, which
+/// presents as an intermittent stall under load after the happy path has
+/// already passed.
+///
+/// # Everywhere else this is the previous behaviour, exactly
+///
+/// Off Android this returns `ConnectOpts::default()`, which is what
+/// `ProxyClientStream::connect` used implicitly before. Desktop conduct is
+/// unchanged by construction rather than by inspection.
+fn connect_opts() -> shadowsocks::net::ConnectOpts {
+    #[allow(unused_mut)]
+    let mut opts = shadowsocks::net::ConnectOpts::default();
+    #[cfg(target_os = "android")]
+    opts.set_vpn_socket_protect(|fd| crate::platform::android::protect_fd(fd));
+    opts
+}
+
 const OFFERED: &[&str] = &["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"];
 
 /// The offered cipher names, for callers that must agree with this list
@@ -804,7 +833,7 @@ impl ShadowsocksTunnel {
             };
 
         // The connect is bounded here rather than through
-        // `ServerConfig::set_timeout` -- which `ProxyClientStream::connect`
+        // `ServerConfig::set_timeout` -- which `ProxyClientStream::connect_with_opts`
         // would honour -- for one reason: the crate's own timeout error is
         // `format!("connect {} timeout", svr_cfg.addr())`, and `addr` is the
         // address this profile's `host` resolved to. That string reaches the
@@ -813,7 +842,9 @@ impl ShadowsocksTunnel {
         // profile content into either is the rule `cipher` and
         // `probe_over_tls` already follow. Ours names the timeout and
         // nothing else.
-        let connect = ProxyClientStream::connect(ctx, cfg, Address::SocketAddress(dest));
+        let opts = connect_opts();
+        let connect =
+            ProxyClientStream::connect_with_opts(ctx, cfg, Address::SocketAddress(dest), &opts);
         let stream = match tokio::time::timeout(self.flow_connect_timeout, connect).await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
