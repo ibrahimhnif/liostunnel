@@ -313,8 +313,15 @@ void main() {
         await s.close();
       });
 
-      final client = HelperClient(retryDelay: const Duration(milliseconds: 20));
+      // Long enough that no reconnect happens inside this test's window. At
+      // 20ms against a server that drops every 50ms it ran a reconnect loop
+      // through its own assertions, and a retry's in-flight hello() completed
+      // with an error after the test had finished -- "this test failed after
+      // it had already completed", about one run in eight. What is under test
+      // is the FIRST drop producing a Disconnected event, not reconnection.
+      final client = HelperClient(retryDelay: const Duration(seconds: 30));
       final states = <String>[];
+      addTearDown(client.close);
       await client.connect(path);
       client.events.listen((e) {
         if (e is StateEvent) states.add(e.state);
@@ -336,6 +343,42 @@ void main() {
       } catch (_) {}
     },
   );
+
+  test('closing fails an in-flight request rather than hanging it', () async {
+    // close() used to leave `_pending` untouched, so a caller awaiting a
+    // request when the client shut down waited forever. Same hang the test
+    // below prevents for a dropped socket, reached by closing deliberately --
+    // which is what quitting the app does.
+    final path = sock('closehang');
+    try {
+      File(path).deleteSync();
+    } catch (_) {}
+    final addr = InternetAddress(path, type: InternetAddressType.unix);
+    // Accepts and never answers, so the request stays in flight.
+    final server = await ServerSocket.bind(addr, 0);
+    final sub = server.listen((_) {});
+
+    final client = HelperClient(retryDelay: const Duration(seconds: 30));
+    await client.connect(path);
+    final inflight = client.hello();
+    // The expectation is attached BEFORE the close. close() completes the
+    // error synchronously, and a future that already carries an error with no
+    // listener is reported as unhandled -- so awaiting expectLater afterwards
+    // fails the test on the very behaviour it is asserting.
+    final expectation = expectLater(
+      inflight.timeout(const Duration(seconds: 2)),
+      throwsA(isA<HelperUnavailable>()),
+      reason: 'a hang here is a connect button that spins for ever',
+    );
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    await client.close();
+    await expectation;
+    await sub.cancel();
+    await server.close();
+    try {
+      File(path).deleteSync();
+    } catch (_) {}
+  });
 
   test('an in-flight request fails when the socket drops', () async {
     // Otherwise the future never completes and the connect button spins
