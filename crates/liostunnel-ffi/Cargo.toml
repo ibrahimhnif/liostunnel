@@ -8,8 +8,16 @@ license.workspace = true
 [lib]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[features]
+# Forwarded so a build can drop DNS-over-HTTPS. `default` keeps the previous
+# behaviour: the core's own `default = ["doh"]` was reaching this crate
+# implicitly, and without this section `--no-default-features` here disabled
+# nothing and exited 0.
+default = ["doh"]
+doh = ["liostunnel-core/doh"]
+
 [dependencies]
-liostunnel-core = { path = "../liostunnel-core" }
+liostunnel-core = { path = "../liostunnel-core", default-features = false }
 flutter_rust_bridge = "=2.12.0"
 serde.workspace = true
 uuid.workspace = true

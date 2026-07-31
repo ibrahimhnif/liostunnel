@@ -168,6 +168,49 @@ To remove it, run `uninstall-helper.sh` from the same directory as root. It
 stops the daemon — which reverts any routes it installed and clears its state
 file — and deletes the unit.
 
+## Installing on Android
+
+CI builds one APK per ABI on every push. Take the one matching your phone —
+`arm64-v8a` for anything made in the last decade — and sideload it:
+
+```bash
+adb install app-arm64-v8a-release.apk
+```
+
+`--split-per-abi`, never a universal APK: a universal one carries every
+architecture and is roughly three times the size for no benefit on any single
+phone.
+
+**The APKs are signed with the debug keystore.** That is enough to install and
+run, and not enough for the Play Store. Nothing here targets it.
+
+### What is different on Android
+
+There is no privileged helper, and there never will be one. On desktop the
+engine runs as root in `liostunnel-helper` and the app drives it over a unix
+socket; the socket path and the uid it authorizes are the security boundary.
+Android's per-app sandbox is that boundary instead, so the engine runs inside
+the app process and the app talks to it directly over FFI.
+
+That removes the entire install-a-root-daemon apparatus — no `pkexec`, no
+launchd or systemd unit, no `install-helper.sh`, no uid to authorize. It also
+means a missing helper is not an error state on Android, and the app does not
+report one.
+
+**The first connection raises the system VPN consent dialog**, once per
+install. Declining is an answer: the app does not ask again on its own.
+
+Routing is `VpnService`'s, not ours. The tunnel's own connection to the server
+is excluded from it with `VpnService.protect`, which is the Android equivalent
+of the desktop route pin — without it the transport routes into the tunnel it
+is carrying.
+
+Credentials go from the UI to the engine over FFI and stop there. Nothing is
+passed to Kotlin and nothing goes into the `Intent` that starts the service:
+an `Intent` extra can be written to the system log, and `MethodChannel`
+arguments are ordinary Java objects visible in a heap dump. The only value
+that crosses into Kotlin is a file descriptor number.
+
 ## Use
 
 ```bash

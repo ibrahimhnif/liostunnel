@@ -45,9 +45,16 @@ Ubuntu and nothing else.
   once, or `sudo installer -pkg LiosTunnel-<sha>.pkg -target /` from a
   terminal. A consequence of the decision, stated in the README rather than
   discovered.
-- **The macOS build is single-architecture.** cargokit compiles the Rust
-  static library for the runner's host arch and GitHub's `macos-latest` is
-  arm64, so the `.pkg` will not run on an Intel Mac.
+- ~~**The macOS build is single-architecture.**~~ **Corrected 2026-07-31, by
+  measurement.** `file` reports the shipped framework as a *universal* binary
+  with both x86_64 and arm64 slices, at 39 MB — roughly 20 MB per slice. The
+  claim that cargokit builds only the host arch is wrong, and half the
+  framework's size is the second architecture.
+
+  Checked against a local `Release` build. **Whether the CI artifact is also
+  universal has not been verified** — check the `.pkg` from a real run before
+  relying on either answer. Claiming the CI output matches this one would
+  repeat the error being corrected here.
 
 ## 4. The macOS package
 

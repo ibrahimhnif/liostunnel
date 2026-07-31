@@ -45,6 +45,44 @@ const MAX_CONCURRENT_CHANNELS: usize = 64;
 /// page load resolves a handful of hostnames, not dozens at once).
 const MAX_CONCURRENT_DNS_CHANNELS: usize = 8;
 
+/// Opens the transport to the SSH server, protected from our own tunnel.
+///
+/// # Why not `TcpStream::connect`
+///
+/// On Android the tunnel's own transport must be excluded from the tunnel's
+/// routing, and `VpnService.protect` takes a descriptor. `TcpStream::connect`
+/// creates and connects in one step, leaving no instant in which the socket
+/// exists but the SYN has not been sent -- and protecting afterwards is too
+/// late, because the handshake has already been routed into the tunnel we are
+/// trying to stay out of.
+///
+/// `TcpSocket` creates the descriptor without connecting. That gap is the only
+/// correct place for the call.
+///
+/// Unlike Shadowsocks, which opens a socket per flow and therefore needs the
+/// crate's own hook, SSH is one long-lived connection: one socket, protected
+/// once, here.
+async fn dial(addr: SocketAddr) -> Result<tokio::net::TcpStream, TunnelError> {
+    let sock = match addr {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4(),
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6(),
+    }
+    .map_err(|e| TunnelError::Protocol(format!("cannot create socket: {e}")))?;
+
+    #[cfg(target_os = "android")]
+    {
+        use std::os::fd::AsRawFd;
+        crate::platform::android::protect_fd(sock.as_raw_fd())
+            .map_err(|e| TunnelError::Protocol(format!("cannot protect socket: {e}")))?;
+    }
+
+    // No host or profile content in this message, for the reason `connect_inner`
+    // already documents about its own errors.
+    sock.connect(addr)
+        .await
+        .map_err(|e| TunnelError::Protocol(format!("cannot connect: {e}")))
+}
+
 pub struct SshTunnel {
     user: String,
     policy: HostKeyPolicy,
@@ -466,7 +504,7 @@ impl SshTunnel {
                 .collect();
         let addr = pick_ipv4(candidates)?;
 
-        let mut handle = client::connect(config, addr, handler).await?;
+        let mut handle = client::connect_stream(config, dial(addr).await?, handler).await?;
 
         let result = match &profile.auth {
             AuthMethod::Password { password } => {

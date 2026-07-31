@@ -1,3 +1,5 @@
+#[cfg(unix)]
+pub mod android_tun;
 pub mod local_stream;
 pub mod nat_table;
 pub mod smoltcp_stack;

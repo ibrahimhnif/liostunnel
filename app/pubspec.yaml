@@ -36,6 +36,10 @@ dependencies:
   cupertino_icons: ^1.0.8
   flutter_rust_bridge: 2.12.0
   freezed_annotation: ^3.1.0
+  # Android has no HOME, so the desktop `$HOME/.liostunnel` rule resolves to a
+  # relative path the app cannot write to. This is how a platform names its
+  # app-private writable directory.
+  path_provider: ^2.1.5
   provider: ^6.1.5+1
   liostunnel_ffi:
     path: rust_builder

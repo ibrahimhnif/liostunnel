@@ -116,11 +116,22 @@ impl PacketIo for FakePacketIo {
 /// Phase 0 never caught it because all of its traffic-carrying exit criteria
 /// ran in a Linux container, where `tun-rs` adds no header and the second
 /// framing was correctly skipped.
+///
+/// **Not built for Android.** `tun-rs` exposes no `DeviceBuilder` there and its
+/// `SyncDevice` has no `name()`, because on Android nothing creates a TUN
+/// device: the descriptor comes from `VpnService.establish()` and arrives
+/// already configured. `AndroidTun` implements [`PacketIo`] over that fd
+/// instead, so this type has no Android counterpart and needs none.
+///
+/// Nothing inside this crate consumes `TunDevice` — only the helper, the CLI
+/// and `tests/tun_e2e.rs` do, and none of those is part of an Android build.
+#[cfg(not(target_os = "android"))]
 pub struct TunDevice {
     inner: tun_rs::SyncDevice,
     mtu: usize,
 }
 
+#[cfg(not(target_os = "android"))]
 impl TunDevice {
     pub fn open(cfg: TunConfig) -> Result<Self, TunnelError> {
         let mut builder = tun_rs::DeviceBuilder::new()
@@ -161,13 +172,14 @@ impl TunDevice {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "android")))]
 impl std::os::fd::AsRawFd for TunDevice {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.inner.as_raw_fd()
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl PacketIo for TunDevice {
     fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize, TunnelError> {
         // Bare IP on every platform: tun-rs removes the utun address-family
