@@ -13,9 +13,12 @@
 //! produced `com.liostunnel.liostunnel_app`, and JNI escapes an underscore in
 //! a package segment to `_1`.
 
-use jni::JNIEnv;
-use jni::objects::JObject;
+use jni::objects::{GlobalRef, JObject, JValue};
+use jni::{JNIEnv, JavaVM};
 use std::ffi::{CString, c_char};
+use std::io;
+use std::os::fd::RawFd;
+use std::sync::OnceLock;
 
 // `liblog`'s writer, declared rather than depended on.
 //
@@ -48,6 +51,91 @@ fn log(prio: i32, msg: &str) {
         return;
     };
     unsafe { __android_log_write(prio, tag.as_ptr(), text.as_ptr()) };
+}
+
+/// The JVM, captured once so native threads can attach to it later.
+static VM: OnceLock<JavaVM> = OnceLock::new();
+
+/// A global reference to the live `LiosVpnService`.
+///
+/// A plain `JObject` is only valid for the JNI call that produced it, so it
+/// cannot be stored. `protect` is called from tokio worker threads long after
+/// `nativeInit` returned, which is exactly what a global reference is for.
+static SERVICE: OnceLock<GlobalRef> = OnceLock::new();
+
+/// Captures the JVM and the service instance.
+///
+/// Called by `LiosVpnService.onStartCommand` before the tunnel is established
+/// and therefore before any socket exists to protect.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeInit(
+    env: JNIEnv,
+    this: JObject,
+) {
+    match env.get_java_vm() {
+        Ok(vm) => {
+            let _ = VM.set(vm);
+        }
+        Err(e) => {
+            log(ANDROID_LOG_ERROR, &format!("nativeInit: no JavaVM: {e}"));
+            return;
+        }
+    }
+    match env.new_global_ref(this) {
+        // `set` fails only if the service was started twice without the
+        // process dying. The first reference is still valid, so keeping it is
+        // correct rather than merely convenient.
+        Ok(global) => {
+            let _ = SERVICE.set(global);
+        }
+        Err(e) => log(ANDROID_LOG_ERROR, &format!("nativeInit: no global ref: {e}")),
+    }
+    log(ANDROID_LOG_INFO, "nativeInit");
+}
+
+/// Excludes `fd` from the VPN's own routing table, via `VpnService.protect`.
+///
+/// # This must be called before the socket connects
+///
+/// Protecting an already-connected socket is too late: the handshake has
+/// already been routed into the tunnel we are trying to stay out of. Callers
+/// create the descriptor without connecting — `tokio::net::TcpSocket` for SSH,
+/// and for Shadowsocks the crate's own hook, which it invokes at the same
+/// point.
+///
+/// # Failure is not cosmetic
+///
+/// A socket that escapes this routes into the tunnel and the flow hangs. For
+/// Shadowsocks that is one socket *per flow*, so a partial failure looks like
+/// an intermittent stall under load rather than a clean error.
+pub fn protect_fd(fd: RawFd) -> io::Result<()> {
+    let vm = VM
+        .get()
+        .ok_or_else(|| io::Error::other("JavaVM not captured; nativeInit did not run"))?;
+    let service = SERVICE
+        .get()
+        .ok_or_else(|| io::Error::other("no VpnService reference; nativeInit did not run"))?;
+
+    // Tokio worker threads are native threads the JVM has never seen. Without
+    // attaching, any JNI call from them is undefined behaviour rather than an
+    // error -- this is the single most important line in the file.
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|e| io::Error::other(format!("cannot attach thread to JVM: {e}")))?;
+
+    let protected = env
+        .call_method(service.as_obj(), "protect", "(I)Z", &[JValue::Int(fd)])
+        .and_then(|v| v.z())
+        .map_err(|e| io::Error::other(format!("VpnService.protect failed: {e}")))?;
+
+    if protected {
+        Ok(())
+    } else {
+        // `protect` returns false rather than throwing when it declines.
+        // Treating that as success is the exact bug this function exists to
+        // prevent, so it becomes an error here.
+        Err(io::Error::other("VpnService.protect returned false"))
+    }
 }
 
 /// Called by `LiosVpnService.onStartCommand` with the descriptor from
@@ -84,4 +172,97 @@ pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeStop(
     _this: JObject,
 ) {
     log(ANDROID_LOG_INFO, "nativeStop");
+}
+
+/// **Temporary — Task 3 only. Deleted once the device answer is recorded.**
+///
+/// Establishes the `protect()` result on real hardware, which is the only
+/// place it can be established: every symbol above is
+/// `#[cfg(target_os = "android")]` and compiles nowhere else.
+///
+/// # Why both sockets, in one run
+///
+/// A `protect` that returns `true` while excluding nothing would pass a
+/// protected-only probe. The control socket is what makes the result mean
+/// something: with a default route installed, an *unprotected* connection to
+/// an external host routes into the tunnel and must fail or hang, while a
+/// protected one must succeed.
+///
+/// Both run in the same pass, seconds apart, so the comparison is not across
+/// two different moments of network weather.
+///
+/// **If both succeed, `protect()` is not what made the difference and the
+/// probe has proved nothing** — that is a failed run, not a pass.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeProbeProtect(
+    _env: JNIEnv,
+    _this: JObject,
+) {
+    // A plain thread, deliberately: it proves `attach_current_thread` works
+    // from a thread the JVM has never seen, which is the case every tokio
+    // worker will be in.
+    std::thread::spawn(|| {
+        log(ANDROID_LOG_INFO, "probe: begin");
+        probe_one("protected", true);
+        probe_one("control", false);
+        log(ANDROID_LOG_INFO, "probe: end");
+    });
+}
+
+/// One leg of the probe: create a socket, optionally protect it, then connect.
+///
+/// Protection happens before `connect` for the reason [`protect_fd`] states.
+fn probe_one(label: &str, protect: bool) {
+    // The descriptor has to exist before `connect`, so that `protect` can be
+    // called in between -- the same constraint that makes the SSH path use
+    // `TcpSocket` instead of `TcpStream::connect`. `socket(2)` directly avoids
+    // pulling a crate in for a function that is deleted at the end of the task.
+    let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        let e = io::Error::last_os_error();
+        log(ANDROID_LOG_ERROR, &format!("probe {label}: socket: {e}"));
+        return;
+    }
+
+    if protect {
+        match protect_fd(fd) {
+            Ok(()) => log(ANDROID_LOG_INFO, &format!("probe {label}: protect OK")),
+            Err(e) => {
+                log(
+                    ANDROID_LOG_ERROR,
+                    &format!("probe {label}: protect FAILED: {e}"),
+                );
+                unsafe { libc::close(fd) };
+                return;
+            }
+        }
+    }
+
+    // 1.1.1.1:80 as a literal, so no DNS lookup happens on a descriptor whose
+    // routing is the thing under test.
+    let addr = libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: 80u16.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_be_bytes([1, 1, 1, 1]).to_be(),
+        },
+        sin_zero: [0; 8],
+    };
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            (&raw const addr).cast::<libc::sockaddr>(),
+            size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        log(ANDROID_LOG_INFO, &format!("probe {label}: connect OK"));
+    } else {
+        let e = io::Error::last_os_error();
+        log(
+            ANDROID_LOG_ERROR,
+            &format!("probe {label}: connect FAILED: {e}"),
+        );
+    }
+    unsafe { libc::close(fd) };
 }

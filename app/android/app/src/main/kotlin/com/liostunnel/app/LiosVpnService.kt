@@ -30,6 +30,15 @@ class LiosVpnService : VpnService() {
         private const val NOTIFICATION_ID = 1
 
         /**
+         * Runs the Task 3 `protect()` probe on start.
+         *
+         * Temporary. Both this flag and everything it reaches are deleted once
+         * the device answer is recorded — the probe opens sockets to an
+         * external host and has no place in a shipped build.
+         */
+        private const val PROBE_PROTECT = true
+
+        /**
          * JNI resolves `external fun` against libraries the *JVM* has loaded.
          *
          * Dart loads this same `.so` through `DynamicLibrary.open` for FFI, but
@@ -47,6 +56,12 @@ class LiosVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification())
 
+        // Before establish(), and before any socket exists: this hands native
+        // code the JavaVM and a reference to this service, which is what
+        // protect(fd) is called through. Without it every protect fails and
+        // the tunnel's own transport routes into itself.
+        nativeInit()
+
         val pfd = establishTunnel()
         if (pfd == null) {
             // `establish()` returns null when consent was revoked or another
@@ -61,6 +76,13 @@ class LiosVpnService : VpnService() {
         // Ownership of the descriptor transfers to native code. Nothing on
         // this side may close it while the engine holds it -- see onDestroy.
         nativeStart(pfd.detachFd())
+
+        // Temporary, Task 3 only: answers whether protect() works on real
+        // hardware. Runs after the tunnel is up because the control leg of the
+        // probe depends on a default route being installed.
+        if (PROBE_PROTECT) {
+            nativeProbeProtect()
+        }
         return START_STICKY
     }
 
@@ -110,6 +132,10 @@ class LiosVpnService : VpnService() {
             .build()
     }
 
+    private external fun nativeInit()
     private external fun nativeStart(fd: Int)
     private external fun nativeStop()
+
+    /** Temporary — Task 3 only, deleted with the Rust probe it calls. */
+    private external fun nativeProbeProtect()
 }
