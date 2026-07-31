@@ -194,7 +194,17 @@ jobs:
       # one, which means it has to be installed rather than assumed.
       - name: install the pinned NDK
         run: |
+          # `yes |` because sdkmanager refuses to install anything whose
+          # licence has not been accepted, and it asks interactively -- on a
+          # runner that means it hangs until the job times out rather than
+          # failing with something that names the cause.
+          yes | sdkmanager --licenses > /dev/null || true
           sdkmanager --install "ndk;27.1.12297006"
+          # Named explicitly rather than left to discovery: cargokit resolves
+          # the NDK through the environment, and the runner has a different
+          # version preinstalled that it would otherwise find first.
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.1.12297006" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/27.1.12297006" >> "$GITHUB_ENV"
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
