@@ -63,6 +63,36 @@ const aProfile = LoadedProfile(
 void main() {
   setUpAll(() async => await RustLib.init());
 
+  testWidgets('speed reads a dash until there is a rate, then a rate',
+      (tester) async {
+    // SPD-5. One sample is not a rate: `0 B/s` would claim no traffic moved,
+    // and that claim has no basis until a second sample exists.
+    final clock = _TestClock();
+    final m = ConnectionModel(clock: clock.call);
+    await tester.pumpWidget(
+      wrap(
+        m,
+        ConnectionScreen(
+          selected: aProfile,
+          onConnect: () {},
+          onDisconnect: () {},
+        ),
+      ),
+    );
+    m.applyEvent(const StateEvent('Connected'));
+    m.applyEvent(_stats(1000, 2000));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('—'), findsNWidgets(2));
+    expect(find.textContaining('/s'), findsNothing);
+
+    clock.advance(const Duration(seconds: 1));
+    m.applyEvent(_stats(1000 + 2048, 2000 + 4096));
+    await tester.pumpAndSettle();
+    expect(find.textContaining('—'), findsNothing);
+    expect(find.textContaining('2.0 KiB/s'), findsOneWidget);
+    expect(find.textContaining('4.0 KiB/s'), findsOneWidget);
+  });
+
   testWidgets('the button reads Connect when disconnected', (tester) async {
     final m = ConnectionModel();
     await tester.pumpWidget(
@@ -194,8 +224,10 @@ void main() {
       ),
     );
     await tester.pump();
-    expect(find.text('2.0 KiB'), findsOneWidget);
-    expect(find.text('4.0 KiB'), findsOneWidget);
+    // The row carries the total and the rate together, and one sample is not
+    // a rate -- so the dash is part of what "as they arrive" now means.
+    expect(find.text('2.0 KiB   —'), findsOneWidget);
+    expect(find.text('4.0 KiB   —'), findsOneWidget);
     expect(find.text('3'), findsOneWidget);
   });
 
@@ -2575,3 +2607,19 @@ void installTests() {
 /// disabled or the handler simply did nothing.
 FilledButton retryButton(WidgetTester tester) =>
     tester.widget<FilledButton>(find.byKey(const Key('install-retry')));
+
+/// Drives the model's clock by hand, so the widget test asserts an exact rate
+/// rather than waiting for one.
+class _TestClock {
+  var now = DateTime(2026, 1, 1);
+  DateTime call() => now;
+  void advance(Duration d) => now = now.add(d);
+}
+
+StatsEvent _stats(int up, int down) => StatsEvent(
+  bytesUp: BigInt.from(up),
+  bytesDown: BigInt.from(down),
+  activeFlows: 0,
+  flowsFailed: BigInt.zero,
+  dnsQueries: BigInt.zero,
+);

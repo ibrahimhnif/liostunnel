@@ -123,8 +123,14 @@ class ConnectionScreen extends StatelessWidget {
             const SizedBox(height: 28),
             Text('Traffic', style: Theme.of(context).textTheme.titleMedium),
             const SizedBox(height: 8),
-            _StatRow(label: 'Sent', value: _bytes(m.bytesUp)),
-            _StatRow(label: 'Received', value: _bytes(m.bytesDown)),
+            _StatRow(
+              label: 'Sent',
+              value: '${_bytes(m.bytesUp)}   ${_rate(m.bytesUpPerSec)}',
+            ),
+            _StatRow(
+              label: 'Received',
+              value: '${_bytes(m.bytesDown)}   ${_rate(m.bytesDownPerSec)}',
+            ),
             _StatRow(label: 'Active flows', value: '${m.activeFlows}'),
             _StatRow(label: 'Failed flows', value: '${m.flowsFailed}'),
             _StatRow(label: 'DNS queries', value: '${m.dnsQueries}'),
@@ -147,10 +153,16 @@ class _StatRow extends StatelessWidget {
       child: Row(
         children: [
           SizedBox(width: 140, child: Text(label)),
-          Text(
-            value,
-            style: const TextStyle(
-              fontFeatures: [FontFeature.tabularFigures()],
+          // Expanded because the value now carries a total AND a rate:
+          // "1.1 TiB   117.7 MiB/s" is 21 characters on a busy tunnel, and
+          // a non-flexible Row child overflows a narrow window.
+          Expanded(
+            child: Text(
+              value,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                fontFeatures: [FontFeature.tabularFigures()],
+              ),
             ),
           ),
         ],
@@ -172,3 +184,19 @@ String _bytes(BigInt n) {
   }
   return i == 0 ? '$n B' : '${v.toStringAsFixed(1)} ${units[i]}';
 }
+
+/// A rate, or an em dash when there is none.
+///
+/// Built on [_bytes] rather than a second formatter, so the total and the rate
+/// cannot disagree about what a mebibyte is.
+///
+/// The dash is not decoration: `0 B/s` would be a claim that no traffic moved,
+/// and before the second sample there is no such claim to make.
+///
+/// `!isFinite` is guarded here rather than trusted to the model. `round()`
+/// throws on Infinity and NaN, and this runs inside `build` -- so a division
+/// that ever produced one would replace the whole screen with a red error box
+/// rather than one wrong number.
+String _rate(double? perSec) => perSec == null || !perSec.isFinite
+    ? '—'
+    : '${_bytes(BigInt.from(perSec.round()))}/s';
