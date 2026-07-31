@@ -26,6 +26,85 @@ void main() {
     expect(cmd, contains('--uid 501'));
   });
 
+  test('the command the panel shows is one root can actually read', () async {
+    // The panel's monospace line used to be
+    // `<AppImage mount>/usr/bin/helper/install-helper.sh --uid N`. Run plain
+    // it says "must run as root"; run under sudo it gets EACCES on the FUSE
+    // mountpoint, because an AppImage mounts its squashfs without
+    // `allow_other` and the kernel denies that mountpoint to every uid but the
+    // one that mounted it -- root included. That is the same failure
+    // `runInstallPrivileged` copies out of the bundle to avoid, printed as an
+    // instruction.
+    //
+    // So run the command. `sudo` is a stub on PATH that execs its arguments:
+    // nothing is escalated, nothing is installed, and no root is needed. It
+    // cannot reproduce the FUSE refusal -- a temp directory is not a
+    // mountpoint, which is the same blind spot make-appimage.sh's own comment
+    // records -- so the load-bearing assertion is structural: the path handed
+    // to the privileged program must not be inside the bundle.
+    final tmp = Directory.systemTemp.createTempSync('lios-manual');
+    addTearDown(() => tmp.deleteSync(recursive: true));
+    final record = '${tmp.path}/argv';
+    final exe = fakeBundle(installScript: '''
+#!/usr/bin/env bash
+{ printf '%s\\n' "\$0" "\$@"; ls "\$(dirname "\$0")"; } > '$record'
+''');
+    final bundle = helperBundleDir(resolvedExecutable: exe);
+    final bin = Directory('${tmp.path}/bin')..createSync();
+    File('${bin.path}/sudo').writeAsStringSync('#!/bin/sh\nexec "\$@"\n');
+    Process.runSync('chmod', ['0755', '${bin.path}/sudo']);
+    final env = {'PATH': '${bin.path}:${Platform.environment['PATH']}'};
+
+    // Checked BEFORE the command is run, and not merely arranged: if the real
+    // sudo were reachable this would raise a password prompt and hang the
+    // suite. `expect` throws, so nothing below runs when it does not hold.
+    final which = await Process.run(
+      'bash', ['-c', 'command -v sudo'], environment: env);
+    expect('${which.stdout}'.trim(), '${bin.path}/sudo',
+        reason: 'precondition: no test in this repo may run a real sudo');
+
+    final r = await Process.run(
+      'bash',
+      ['-c', installCommand(501, resolvedExecutable: exe)],
+      environment: env,
+    );
+    expect(r.exitCode, 0, reason: 'the command must run: ${r.stderr}');
+
+    final out = File(record).readAsLinesSync();
+    final ran = out.first;
+    addTearDown(() {
+      final d = File(ran).parent;
+      if (d.existsSync()) d.deleteSync(recursive: true);
+    });
+    expect(ran, isNot(startsWith(bundle)),
+        reason: 'root cannot read the AppImage mount the bundle is inside');
+    expect(ran, endsWith('/install-helper.sh'));
+    expect(out.sublist(1, 3), ['--uid', '501']);
+    // The whole directory moved, not the script: install-helper.sh reads both
+    // of these from beside itself, so a copy of the script alone installs
+    // nothing.
+    expect(out, contains('liostunnel-helper'));
+    expect(out, contains('liostunnel-helper.service'));
+  });
+
+  test('a bundle path with a quote in it survives the shell', () {
+    // The bundle path is dirname(resolvedExecutable)/helper -- whatever
+    // directory the user put the AppImage in. This is a string a person is
+    // invited to paste into a shell, so an unescaped `'` does not merely fail:
+    // it changes what the rest of the line means.
+    final cmd = installCommand(
+      501,
+      resolvedExecutable: "/home/me/O'Brien's Apps/usr/bin/liostunnel_app",
+    );
+    // `-n` reads the command and does not execute it, so nothing here runs
+    // sudo, cp or mktemp. Unescaped, the `'` closes the quote this opens and
+    // bash reports an unterminated string.
+    final r = Process.runSync('bash', ['-nc', cmd]);
+    expect(r.exitCode, 0,
+        reason: 'the command must parse as one shell command: ${r.stderr}');
+    expect(cmd, contains(r"'\''"), reason: 'the quote is escaped, not dropped');
+  });
+
   test('pkexec is pointed OUT of the bundle, never into it', () async {
     // The one that matters, and the one a developer machine cannot notice.
     //
@@ -159,26 +238,48 @@ void main() {
     expect(r.message, contains('install-helper.sh'));
   });
 
-  test('a command the user is told to run still exists to be run', () async {
-    // The copy is deleted after a normal run. On the two failures whose whole
-    // message is "run this yourself", deleting it would name a path that is
-    // already gone -- and the bundle's own path is the one root cannot read.
+  test('the command in the message is the one the panel shows', () async {
+    // Two commands on screen at once is one too many, and the pair used to
+    // disagree about which one worked: the notice named `sudo
+    // /tmp/liostunnel-helper-XXXX/install-helper.sh`, the panel's monospace
+    // line directly beneath it named the in-mount path that root cannot read.
+    // They are now the same string, so there is one command and it is the one
+    // that works.
     final exe = fakeBundle();
-    late String staged;
-    final r = await runInstallPrivileged(
-      501,
-      resolvedExecutable: exe,
-      run: (_, a) async {
-        staged = File(a.first).parent.path;
-        return ProcessResult(0, 127, '', '');
-      },
-    );
-    addTearDown(() {
-      final d = Directory(staged);
-      if (d.existsSync()) d.deleteSync(recursive: true);
-    });
-    expect(r.message, contains(staged));
-    expect(File('$staged/install-helper.sh').existsSync(), isTrue);
+    final expected = installCommand(501, resolvedExecutable: exe);
+    for (final r in [
+      await runInstallPrivileged(501,
+          resolvedExecutable: exe, run: (_, _) async => ProcessResult(0, 127, '', '')),
+      await runInstallPrivileged(501,
+          resolvedExecutable: exe,
+          run: (_, _) async =>
+              throw ProcessException('pkexec', const [], 'No such file', 2)),
+    ]) {
+      expect(r.outcome, InstallOutcome.failed);
+      expect(r.message, contains(expected));
+    }
+  });
+
+  test('the staged copy is always cleaned up, on every outcome', () async {
+    // It is no longer kept for a message to name -- the message names
+    // `installCommand`, which stages its own -- so nothing should survive any
+    // of these.
+    final staged = <String>[];
+    Future<ProcessResult> Function(String, List<String>) recorder(
+            ProcessResult result) =>
+        (_, a) async {
+          staged.add(File(a.first).parent.path);
+          return result;
+        };
+    final exe = fakeBundle();
+    for (final code in [0, 126, 127, 1]) {
+      await runInstallPrivileged(501,
+          resolvedExecutable: exe, run: recorder(ProcessResult(0, code, '', '')));
+    }
+    expect(staged, hasLength(4), reason: 'precondition: four runs, four copies');
+    for (final d in staged) {
+      expect(Directory(d).existsSync(), isFalse, reason: d);
+    }
   });
 
   test("a failing script's own words are shown", () async {
@@ -232,12 +333,34 @@ void main() {
     // ENOENT means no helper. EACCES means there IS one, installed for
     // somebody else -- installing a second is not the fix, and the user
     // cannot authorize their way out of another account's socket.
-    expect(installWouldFix(const HelperUnavailable()), isTrue);
+    expect(installWouldFix(const HelperNotInstalled()), isTrue);
     expect(installWouldFix(const HelperForbidden()), isFalse);
     expect(
       installWouldFix(const HelperError(ErrorKindDto.unauthorized, 'no')),
       isFalse,
     );
+  });
+
+  test('a helper that answered once is never reinstalled over', () {
+    // This read `e is HelperUnavailable`, and helper_client.dart throws that
+    // from four places. Three of them are on a socket that OPENED -- the
+    // connection dropped, a send with no socket, a failed write -- and the
+    // fourth is every connect errno that is not EACCES/EPERM, ECONNREFUSED
+    // included, which is a socket that is there with a dead daemon behind it.
+    // All four said "install the helper", so on Linux a crashed helper raised
+    // the polkit dialog at startup and, on approval, reinstalled over itself.
+    for (final e in const [
+      HelperUnavailable('Connection refused'),
+      HelperUnavailable('the connection dropped'),
+      HelperUnavailable('not connected'),
+      HelperUnavailable('SocketException: write failed'),
+    ]) {
+      expect(installWouldFix(e), isFalse, reason: '$e');
+    }
+    // And the subtype relationship is the trap this has to survive: a
+    // HelperNotInstalled IS a HelperUnavailable, so an `is HelperUnavailable`
+    // test still passes on the one case that should say yes.
+    expect(const HelperNotInstalled(), isA<HelperUnavailable>());
   });
 }
 
@@ -246,14 +369,15 @@ void main() {
 /// The app at `usr/bin/liostunnel_app`, its helper directory beside it at
 /// `usr/bin/helper` — the layout `make-appimage.sh` builds. Returns the path
 /// of the executable, which is what the app knows about itself.
-String fakeBundle({String prefix = 'lios-bundle'}) {
+String fakeBundle({String prefix = 'lios-bundle', String? installScript}) {
   final root = Directory.systemTemp.createTempSync(prefix);
   addTearDown(() {
     if (root.existsSync()) root.deleteSync(recursive: true);
   });
   final bin = Directory('${root.path}/usr/bin')..createSync(recursive: true);
   final helper = Directory('${bin.path}/helper')..createSync();
-  _executable('${helper.path}/install-helper.sh', '#!/usr/bin/env bash\n');
+  _executable(
+      '${helper.path}/install-helper.sh', installScript ?? '#!/usr/bin/env bash\n');
   _executable('${helper.path}/liostunnel-helper', 'not really an ELF\n');
   File('${helper.path}/liostunnel-helper.service')
       .writeAsStringSync('[Unit]\n');

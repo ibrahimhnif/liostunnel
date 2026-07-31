@@ -35,22 +35,43 @@ bool appInstallsHelper() => Platform.isLinux;
 
 /// Whether installing the helper is what would fix [e].
 ///
-/// ENOENT — [HelperUnavailable] — means no helper was ever installed.
-/// [HelperForbidden] is EACCES: there IS one, installed for another account,
-/// and a second install is not the fix. Everything else came back down a
-/// socket that opened, so the helper is present by definition.
-bool installWouldFix(Object e) => e is HelperUnavailable;
-
-/// The install script, named so it can be read before it is run as root.
+/// [HelperNotInstalled] is ENOENT and nothing else: there is no socket, so no
+/// helper was ever installed, and installing one is the fix.
 ///
-/// Shown in the panel if the user cancels. Note this is the path *inside* the
-/// bundle: readable by the user who launched the app, which is what reading it
-/// needs. It is deliberately not what gets elevated — see
-/// [runInstallPrivileged], which runs a copy, because root cannot read an
-/// AppImage's own mountpoint.
-String installCommand(int uid, {String? resolvedExecutable}) =>
-    '${helperBundleDir(resolvedExecutable: resolvedExecutable)}'
-    '/install-helper.sh --uid $uid';
+/// Every other failure is a helper that exists. [HelperForbidden] is
+/// EACCES/EPERM — one IS installed, for another account, and the user cannot
+/// authorize their way out of somebody else's socket. Plain
+/// [HelperUnavailable] is ECONNREFUSED (a socket with a dead daemon behind
+/// it), a dropped connection, a send with no socket, a failed write: all of
+/// them a helper that is present. This read `e is HelperUnavailable`, which
+/// caught all four of those, so on Linux a helper that was installed and had
+/// crashed raised the polkit dialog at startup and reinstalled over itself.
+bool installWouldFix(Object e) => e is HelperNotInstalled;
+
+/// A command the user can paste that installs the helper, for the panel.
+///
+/// It has to work when pasted, which the bundle's own path does not: run plain
+/// it refuses with "must run as root", and run under `sudo` it gets EACCES on
+/// the AppImage's FUSE mountpoint — the exact failure [runInstallPrivileged]
+/// copies out of the bundle to avoid. So this is the shell form of what that
+/// function does: copy the directory somewhere root can read, then elevate
+/// against the copy. The copy is made as the invoking user, who mounted the
+/// AppImage and is the one uid the kernel lets read it.
+///
+/// The whole directory, not the script: `install-helper.sh` reads the helper
+/// binary and the unit file from beside itself.
+String installCommand(int uid, {String? resolvedExecutable}) {
+  final bundle = helperBundleDir(resolvedExecutable: resolvedExecutable);
+  return 'd="\$(mktemp -d)" && cp -R ${_shellQuote('$bundle/.')} "\$d" '
+      '&& sudo "\$d/install-helper.sh" --uid $uid';
+}
+
+/// Single-quotes [s] for a POSIX shell.
+///
+/// The bundle path is `dirname(Platform.resolvedExecutable)/helper` — whatever
+/// directory the user put the AppImage in, so spaces and quotes are theirs to
+/// choose, and this is a string a person is invited to paste into a shell.
+String _shellQuote(String s) => "'${s.replaceAll("'", r"'\''")}'";
 
 /// This process's real uid.
 ///
@@ -114,10 +135,13 @@ Future<InstallResult> runInstallPrivileged(
 
   final script = '${staged.path}/install-helper.sh';
   final exec = run ?? (String e, List<String> a) => Process.run(e, a);
-  // Kept only when the message tells the user to run it themselves — a
-  // command naming a path that has just been deleted is not a command, and
-  // the bundle's own path is the one root cannot read.
-  var keep = false;
+  // Every message that tells the user to run something names
+  // [installCommand] — the same string the panel prints, which stages its own
+  // copy. This used to name `sudo ${staged.path}/install-helper.sh` and keep
+  // the copy alive for it, which put two different commands on screen at
+  // once: this one in the notice, and the panel's `installCommand` directly
+  // beneath it. The panel's was the unusable in-mount path, so the pair was
+  // not merely inconsistent — one of them was wrong.
   try {
     final ProcessResult r;
     try {
@@ -129,11 +153,11 @@ Future<InstallResult> runInstallPrivileged(
       // shell's convention, not this one. Uncaught, a system without polkit
       // got an unhandled exception out of an unawaited callback rather than
       // the one sentence that fixes it.
-      keep = true;
       return InstallResult(
         InstallOutcome.failed,
         'This system has no pkexec, so the helper cannot be installed from '
-        'the app. Run it yourself: sudo $script --uid $uid',
+        'the app. Run it yourself: '
+        '${installCommand(uid, resolvedExecutable: resolvedExecutable)}',
       );
     }
 
@@ -153,11 +177,10 @@ Future<InstallResult> runInstallPrivileged(
     // 127 is pkexec's "could not execute the program" — a /tmp mounted
     // noexec, or no authentication agent to ask.
     if (r.exitCode == 127) {
-      keep = true;
       return InstallResult(
         InstallOutcome.failed,
         'The installer could not be run. Run it yourself: '
-        'sudo $script --uid $uid',
+        '${installCommand(uid, resolvedExecutable: resolvedExecutable)}',
       );
     }
     // Past here the script itself ran and refused. Its messages are fixed
@@ -169,7 +192,7 @@ Future<InstallResult> runInstallPrivileged(
       err.isEmpty ? 'The installer failed (exit ${r.exitCode}).' : err,
     );
   } finally {
-    if (!keep && staged.existsSync()) staged.deleteSync(recursive: true);
+    if (staged.existsSync()) staged.deleteSync(recursive: true);
   }
 }
 

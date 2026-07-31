@@ -2359,10 +2359,126 @@ void installTests() {
     );
     await showConnectionTab(tester);
     expect(find.byKey(const Key('install-panel')), findsOneWidget);
-    expect(find.textContaining('install-helper.sh'), findsOneWidget,
-        reason: 'what remains of "read it before it runs as root"');
+    // The exact string, not `contains('install-helper.sh')`: the panel used to
+    // print `<AppImage mount>/usr/bin/helper/install-helper.sh --uid N`, which
+    // contains it and which nobody can run -- plain it refuses without root,
+    // and under sudo it gets EACCES on the FUSE mountpoint. Pinned to
+    // `installCommand`, whose own test runs the thing it produces.
+    expect(find.text(installCommand(currentUid())), findsOneWidget,
+        reason: 'what remains of "read it before it runs as root" has to be a '
+            'command that works');
     expect(find.byKey(const Key('install-retry')), findsOneWidget,
         reason: 'the way back, for the user who asked for it');
+  });
+
+  testWidgets('the retry button asks again — the only thing that does',
+      (tester) async {
+    // PKG-7's stated answer: "the panel's retry button is the way back."
+    // Nothing tapped it. `_installHelper(force: true)` and the whole `force`
+    // parameter had no coverage at all, so deleting `force: true` from the
+    // call site left every test green while the button became an enabled
+    // control that silently did nothing -- `_installAttempted` is already true
+    // by the time the panel is on screen, and that guard is what `force`
+    // exists to get past.
+    var calls = 0;
+    await pumpHomeWithInstaller(
+      tester,
+      installsHelper: true,
+      installer: (uid) async {
+        calls++;
+        return const InstallResult(
+            InstallOutcome.cancelled, 'Installation was cancelled.');
+      },
+    );
+    await showConnectionTab(tester);
+    expect(calls, 1, reason: 'precondition: first launch asked once, and the '
+        'user said no');
+    expect(retryButton(tester).onPressed, isNotNull,
+        reason: 'precondition: nothing is in flight, so it is pressable');
+
+    await tester.tap(find.byKey(const Key('install-retry')));
+    await tester.pumpAndSettle();
+
+    expect(calls, 2, reason: 'the button asked again');
+    expect(find.byKey(const Key('install-panel')), findsOneWidget,
+        reason: 'and the second cancel leaves the way back on screen');
+  });
+
+  testWidgets('a successful retry clears the panel and re-attaches',
+      (tester) async {
+    // The other half of the button: the panel is what it dismisses. Without
+    // this, "calls == 2" above is satisfied by a retry that installs and then
+    // leaves the user looking at the same notice forever.
+    var calls = 0;
+    await pumpHomeWithInstaller(
+      tester,
+      installsHelper: true,
+      installer: (uid) async {
+        calls++;
+        return calls == 1
+            ? const InstallResult(
+                InstallOutcome.cancelled, 'Installation was cancelled.')
+            : const InstallResult(InstallOutcome.installed, '');
+      },
+    );
+    await showConnectionTab(tester);
+    expect(find.byKey(const Key('install-panel')), findsOneWidget);
+
+    await tester.tap(find.byKey(const Key('install-retry')));
+    await tester.pumpAndSettle();
+
+    expect(calls, 2);
+    expect(find.byKey(const Key('install-panel')), findsNothing);
+    // `_attach` ran again and failed again -- the socket in this test never
+    // exists -- which is the honest outcome and is what the banner says.
+    expect(find.byKey(const Key('error-banner')), findsOneWidget);
+  });
+
+  testWidgets('a helper that is installed but not listening is left alone',
+      (tester) async {
+    // ECONNREFUSED, not ENOENT: the socket is there and the daemon behind it
+    // has died. `installWouldFix` read `e is HelperUnavailable`, which
+    // helper_client.dart threw for every connect errno that was not
+    // EACCES/EPERM -- so this raised the polkit dialog at startup and, on
+    // approval, reinstalled over a helper that was already installed.
+    //
+    // The socket is made by binding, RENAMING (which keeps the inode, so it is
+    // still the listening socket) and then closing the server: Dart unlinks
+    // the path it bound, which no longer exists, so the renamed entry survives
+    // with its listener gone. No subprocess, no root, nothing installed.
+    final dir = Directory.systemTemp.createTempSync('lios-dead-helper');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final dead = '${dir.path}/liostunnel.sock';
+    await tester.runAsync(() async {
+      final bound = '${dir.path}/bound.sock';
+      final server = await ServerSocket.bind(
+          InternetAddress(bound, type: InternetAddressType.unix), 0);
+      final sub = server.listen((s) => s.destroy());
+      File(bound).renameSync(dead);
+      await sub.cancel();
+      await server.close();
+    });
+    expect(File(dead).existsSync(), isTrue,
+        reason: 'precondition: the socket outlived its listener');
+
+    var calls = 0;
+    await pumpHomeWithInstaller(
+      tester,
+      installsHelper: true,
+      socketPath: dead,
+      installer: (uid) async {
+        calls++;
+        return const InstallResult(InstallOutcome.installed, '');
+      },
+    );
+    await showConnectionTab(tester);
+    expect(calls, 0,
+        reason: 'a second install cannot start a daemon that crashed');
+    // And not because nothing happened: the connect really was refused. Two
+    // assertions rather than one, because "no install panel" is also what a
+    // page that never got as far as failing would show.
+    expect(find.byKey(const Key('error-banner')), findsOneWidget);
+    expect(find.byKey(const Key('install-panel')), findsNothing);
   });
 
   testWidgets('macOS never runs a privileged command', (tester) async {
