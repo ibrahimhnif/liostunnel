@@ -1,0 +1,13 @@
+<!-- The same mark, simplified for 16 and 32 px.
+     The full logo's two concentric arches merge into a blur below ~48px and
+     the light dot nearly disappears (checked by rendering, not assumed). So
+     the small sizes get one heavier arch and a larger dot. This is what icon
+     sets normally do; drawing one glyph and trusting it to scale is how a
+     menu-bar icon ends up an unreadable smudge. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" rx="230" fill="#0B1220"/>
+  <path d="M264 764 V486 a248 248 0 0 1 496 0 V764"
+        fill="none" stroke="#22D3EE" stroke-width="132" stroke-linecap="round"/>
+  <circle cx="512" cy="596" r="104" fill="#0B1220"/>
+  <circle cx="512" cy="596" r="62" fill="#F8FAFC"/>
+</svg>

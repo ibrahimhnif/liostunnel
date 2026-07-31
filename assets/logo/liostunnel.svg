@@ -1,0 +1,12 @@
+<!-- LiosTunnel's mark: a tunnel seen head-on, with light at the far end.
+     Deliberately geometric so it survives rasterisation at 16px, which is
+     where a macOS menu-bar icon actually lives. Two arches rather than three:
+     a third mushes together below 32px. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" rx="230" fill="#0B1220"/>
+  <path d="M232 760 V468 a280 280 0 0 1 560 0 V760"
+        fill="none" stroke="#22D3EE" stroke-width="78" stroke-linecap="round"/>
+  <path d="M372 760 V500 a140 140 0 0 1 280 0 V760"
+        fill="none" stroke="#0EA5E9" stroke-width="62" stroke-linecap="round" opacity="0.55"/>
+  <circle cx="512" cy="612" r="66" fill="#F8FAFC"/>
+</svg>
