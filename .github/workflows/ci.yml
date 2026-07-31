@@ -98,6 +98,15 @@ jobs:
       - name: lean build (--no-default-features)
         run: cargo build -p liostunnel-core --no-default-features
 
+      # Task 1's 24 assertions on install-helper.sh's authorization boundary --
+      # which uid the helper is installed to serve, and the refusals that keep
+      # it from serving root or a system account. It is hermetic (stubs every
+      # privileged command and redirects the unit-file write) and covers both
+      # the Darwin and Linux branches from either host, so it runs here rather
+      # than gated to one OS in the matrix.
+      - name: install-script guards
+        run: ./testing/verify-install-script.sh
+
   # T4: a real sshd + target HTTP server in Docker. No TUN, no privileges —
   # only Docker, which the runner already has.
   integration:
@@ -158,3 +167,58 @@ jobs:
       - run: cargo build -p liostunnel-core --tests
       - name: run TUN e2e tests as root
         run: sudo -E env "PATH=$PATH" cargo test -p liostunnel-core --test tun_e2e -- --ignored
+
+  # The first thing in this workflow that runs `flutter build`. `flutter test`
+  # exercises none of cargokit, CMake, the Xcode project or the podspec, so a
+  # change that broke the macOS bundle passed every other check here.
+  package:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # A macOS failure should still produce the Linux artifact: the two share
+      # nothing but install-helper.sh.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.93"
+      - uses: Swatinem/rust-cache@v2
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      # `flutter build linux` needs these, and without them it fails with a
+      # CMake error that reads like a Flutter bug rather than a missing
+      # package. libfuse2 is for appimagetool.
+      - name: linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libgtk-3-dev libfuse2
+      - name: build the helper
+        run: cargo build --release -p liostunnel-helper
+      - name: flutter pub get
+        run: flutter pub get
+        working-directory: app
+      # cargokit compiles the FFI crate during this, which is why the Rust
+      # toolchain is installed above rather than only for the step before.
+      - name: build the app
+        run: flutter build ${{ runner.os == 'macOS' && 'macos' || 'linux' }} --release
+        working-directory: app
+      - name: build the macOS package
+        if: runner.os == 'macOS'
+        run: ./packaging/make-pkg.sh
+      - name: verify the macOS package
+        if: runner.os == 'macOS'
+        run: ./testing/verify-pkg.sh dist/*.pkg
+      - name: build the AppImage
+        if: runner.os == 'Linux'
+        run: ./packaging/make-appimage.sh
+      - name: verify the AppImage
+        if: runner.os == 'Linux'
+        run: ./testing/verify-appimage.sh dist/*.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: liostunnel-${{ runner.os }}-${{ github.sha }}
+          path: |
+            dist/*.pkg
+            dist/*.AppImage

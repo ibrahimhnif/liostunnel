@@ -1,8 +1,24 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  DELIBERATELY NOT SANDBOXED. Do not "restore" com.apple.security.app-sandbox.
+
+  App Sandbox confines the process to its own container, and connect(2) to a
+  UNIX socket outside that container is denied with EPERM. The whole app is a
+  client of a root daemon listening on /var/run/liostunnel.sock, which is
+  outside by construction: a root daemon cannot listen inside a per-app
+  container. A signed control pair measured exactly this — the same binary
+  unsandboxed CONNECTED, sandboxed got EPERM — and the app then reports
+  "installed for a different user", because helper_client.dart maps EPERM to
+  HelperForbidden. So the sandbox does not merely restrict the app; it makes
+  it lie about why it is broken.
+
+  The trade is real and is taken with eyes open: this is not a Mac App Store
+  build (the store requires the sandbox), and signing and notarization are out
+  of scope for this phase — see README.md, "Installing the macOS package".
+  testing/verify-pkg.sh asserts the shipped binary's own code signature, so a
+  regression here fails the package build rather than the user's first launch.
+-->
 <plist version="1.0">
-<dict>
-	<key>com.apple.security.app-sandbox</key>
-	<true/>
-</dict>
+<dict/>
 </plist>

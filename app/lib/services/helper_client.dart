@@ -29,12 +29,32 @@ class StatsEvent extends HelperEvent {
   });
 }
 
-/// The helper is not reachable: no socket, or the connection dropped.
+/// The helper is not reachable: the connection dropped, or the daemon is down.
+///
+/// Note what this does NOT mean: that nothing is installed. It covers a socket
+/// that opened and then failed, and a socket that is there with no daemon
+/// behind it. [HelperNotInstalled] is the narrower case.
 class HelperUnavailable implements Exception {
   final String detail;
   const HelperUnavailable([this.detail = 'the helper is not reachable']);
   @override
   String toString() => 'HelperUnavailable: $detail';
+}
+
+/// There is no socket at all — `connect(2)` returned ENOENT.
+///
+/// The one condition installing the helper fixes, which is why it is its own
+/// type. `installWouldFix` used to read `e is HelperUnavailable`, and three of
+/// that type's four throw sites are on a socket that opened: a dropped
+/// connection, a send with no socket, a failed write — plus ECONNREFUSED,
+/// which is a socket that is *there* with a dead daemon behind it. On Linux
+/// the app installs the helper itself when it believes none is installed, so
+/// collapsing those meant a crashed helper raised a root-password dialog at
+/// startup and, on approval, reinstalled over the one already there.
+class HelperNotInstalled extends HelperUnavailable {
+  const HelperNotInstalled([super.detail = 'no socket at the helper path']);
+  @override
+  String toString() => 'HelperNotInstalled: $detail';
 }
 
 /// The socket exists but this user cannot open it.
@@ -105,12 +125,24 @@ class HelperClient {
       // The port argument is required and ignored for unix sockets.
       _socket = await Socket.connect(addr, 0);
     } on SocketException catch (e) {
-      // Split by errno, because the two have opposite fixes. ENOENT means the
-      // helper was never installed; EACCES/EPERM means it was, for someone
-      // else.
+      // Split by errno, because these have different fixes and only one of
+      // them is "install the helper".
+      //
+      // ENOENT (2): nothing is there. That is the ONLY errno an install
+      // fixes, and it is the only one that becomes HelperNotInstalled.
+      // EACCES (13) / EPERM (1): the socket is there and this process may not
+      // open it — a helper installed for another account. (EPERM is also what
+      // App Sandbox returns for a socket outside the container, which is why
+      // macos/Runner/Release.entitlements has no sandbox key and says so.)
+      // Anything else — ECONNREFUSED for a socket whose daemon has died,
+      // ENOTSOCK for a path that is not a socket — is a helper that is
+      // present and not answering. Reinstalling over it is not the fix, and
+      // on Linux it is a root-password dialog raised for nothing.
       final code = e.osError?.errorCode;
       if (code == 13 || code == 1) throw const HelperForbidden();
-      throw HelperUnavailable(e.osError?.message ?? 'cannot open $_path');
+      final detail = e.osError?.message ?? 'cannot open $_path';
+      if (code == 2) throw HelperNotInstalled(detail);
+      throw HelperUnavailable(detail);
     }
 
     _reader = _socket!

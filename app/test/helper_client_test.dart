@@ -161,7 +161,47 @@ void main() {
       final client = HelperClient();
       await expectLater(
         client.connect('${Directory.systemTemp.path}/definitely-not-here.sock'),
-        throwsA(isA<HelperUnavailable>()),
+        throwsA(isA<HelperNotInstalled>()),
+      );
+    },
+  );
+
+  test(
+    'a socket with nothing behind it is a dead helper, not an absent one',
+    () async {
+      // ECONNREFUSED. The socket file is there; the daemon that was listening
+      // on it is gone -- a crashed helper, or one stopped by hand. This threw
+      // the same HelperUnavailable as a missing socket, and helper_install's
+      // `installWouldFix` read that as "never installed": on Linux the app
+      // then raised a root-password dialog at startup and, on approval,
+      // reinstalled over a helper that was already there.
+      //
+      // Made without a subprocess and without root. Bind a real listening
+      // socket, RENAME it -- which moves the directory entry and keeps the
+      // inode, so it is still the same listening socket -- then close the
+      // server. Dart unlinks the path it bound, which no longer exists, so the
+      // renamed entry survives with its listener destroyed.
+      final dir = Directory.systemTemp.createTempSync('lios-dead');
+      addTearDown(() => dir.deleteSync(recursive: true));
+      final bound = '${dir.path}/bound.sock';
+      final dead = '${dir.path}/dead.sock';
+      final server = await ServerSocket.bind(
+        InternetAddress(bound, type: InternetAddressType.unix),
+        0,
+      );
+      final sub = server.listen((s) => s.destroy());
+      File(bound).renameSync(dead);
+      await sub.cancel();
+      await server.close();
+      expect(File(dead).existsSync(), isTrue,
+          reason: 'precondition: the socket file outlived its listener');
+
+      final client = HelperClient();
+      await expectLater(
+        client.connect(dead),
+        throwsA(
+          allOf(isA<HelperUnavailable>(), isNot(isA<HelperNotInstalled>())),
+        ),
       );
     },
   );

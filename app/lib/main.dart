@@ -9,6 +9,7 @@ import 'screens/profile_editor.dart';
 import 'screens/profiles.dart';
 import 'services/connection_model.dart';
 import 'services/helper_client.dart';
+import 'services/helper_install.dart';
 import 'services/link_export.dart';
 import 'services/profile_store.dart';
 import 'services/profile_writer.dart';
@@ -44,6 +45,8 @@ class HomePage extends StatefulWidget {
     super.key,
     this.profilesDirectory,
     this.socketPath = kSocketPath,
+    this.installer,
+    this.installsHelper,
   });
 
   /// Where profiles live. Null means the operator's own `~/.liostunnel`.
@@ -60,6 +63,19 @@ class HomePage extends StatefulWidget {
   /// reaching a helper that may genuinely be running on this machine.
   final String socketPath;
 
+  /// Injected so no test raises a real authorization dialog.
+  final Future<InstallResult> Function(int)? installer;
+
+  /// Whether this platform installs the helper from the app at all.
+  ///
+  /// Null asks the platform, which is what production does — see
+  /// [appInstallsHelper]. Overridden only by the tests that drive the Linux
+  /// path on a machine that is not Linux; without that seam the once-only
+  /// guard and the panel have no test on any machine this suite runs on,
+  /// because the platform gate would answer first and every assertion would
+  /// pass against its own defect.
+  final bool? installsHelper;
+
   @override
   State<HomePage> createState() => _HomePageState();
 }
@@ -72,9 +88,28 @@ class _HomePageState extends State<HomePage> {
   LoadedProfile? _selected;
   int _tab = 0;
 
+  /// At most once per process launch. See [_installHelper].
+  bool _installAttempted = false;
+  String? _installCommandText;
+
+  /// True while a privileged install is in flight.
+  ///
+  /// The panel names the command while the dialog is up — deliberately, so it
+  /// can be read before it runs as root — which puts its button on screen at
+  /// the one moment pressing it would raise a SECOND dialog over the first.
+  /// Disabled rather than hidden: the command stays readable, which is the
+  /// panel's other job.
+  bool _installRunning = false;
+
+  bool get _installsHelper => widget.installsHelper ?? appInstallsHelper();
+
   @override
   void initState() {
     super.initState();
+    // Subscribed once, here, rather than inside `_attach`. A successful
+    // install runs `_attach` a second time, and a second listener on the same
+    // broadcast stream applies every event the helper pushes twice.
+    _client.events.listen(context.read<ConnectionModel>().applyEvent);
     _attach();
     _reload();
   }
@@ -111,20 +146,63 @@ class _HomePageState extends State<HomePage> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
   }
 
-  /// Connects to the helper and mirrors everything it pushes into the model.
+  /// Connects to the helper and asks it where things stand.
   ///
   /// Asking for status immediately is what makes a relaunched app re-sync to
   /// a tunnel that is still running rather than show Disconnected over a
   /// working one (P1a-4). The helper owns the tunnel; this only reflects it.
+  ///
+  /// Runs again after a first-launch install, so it must be safe to repeat —
+  /// hence the event subscription living in [initState] instead.
   Future<void> _attach() async {
     final model = context.read<ConnectionModel>();
-    _client.events.listen(model.applyEvent);
     try {
       await _client.connect(widget.socketPath);
       await _client.hello();
       await _client.getStatus();
     } catch (e) {
       model.applyError(e);
+      // Only ENOENT, and only on Linux. `HelperForbidden` means the helper IS
+      // installed, for somebody else. macOS is installed by its package.
+      if (installWouldFix(e) && _installsHelper) await _installHelper();
+    }
+  }
+
+  /// Installs the bundled helper under pkexec, raising the polkit dialog.
+  ///
+  /// Guarded by [_installAttempted] because a successful install sends the app
+  /// straight back to [_attach] — where the socket may still be absent, the
+  /// daemon not yet listening, the unit refused. Unguarded, that installs,
+  /// retries, installs, retries, raising the dialog every time round: a loop
+  /// the user cannot escape without force-quitting. A user who cancels has
+  /// said no, and asking again unprompted is how an app becomes something you
+  /// close. The panel's retry button is the way back, because that one was
+  /// asked for.
+  Future<void> _installHelper({bool force = false}) async {
+    if (_installAttempted && !force) return;
+    if (_installRunning) return;
+    _installAttempted = true;
+    final model = context.read<ConnectionModel>();
+    final uid = currentUid();
+    setState(() {
+      _installCommandText = installCommand(uid);
+      _installRunning = true;
+    });
+    model.installNotice =
+        'Installing the privileged helper. Your system is asking for your '
+        'password.';
+    final run = widget.installer ?? runInstallPrivileged;
+    final result = await run(uid);
+    if (!mounted) return;
+    setState(() => _installRunning = false);
+    switch (result.outcome) {
+      case InstallOutcome.installed:
+        model.installNotice = null;
+        setState(() => _installCommandText = null);
+        await _attach();
+      case InstallOutcome.cancelled:
+      case InstallOutcome.failed:
+        model.installNotice = result.message;
     }
   }
 
@@ -221,6 +299,9 @@ class _HomePageState extends State<HomePage> {
         selected: _selected,
         onConnect: _connect,
         onDisconnect: _disconnect,
+        installCommandText: _installCommandText,
+        onRetryInstall:
+            _installRunning ? null : () => _installHelper(force: true),
       ),
     ];
 
