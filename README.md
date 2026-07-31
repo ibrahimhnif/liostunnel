@@ -63,9 +63,15 @@ Gatekeeper on current macOS refuses to open it — double-clicking gives
 button that gets you past it. Two ways through, each a deliberate act by the
 person installing:
 
-- **Right-click the `.pkg` in Finder and choose Open**, then confirm at the
-  prompt. The context-menu Open is the documented override; double-clicking
-  is not.
+- **Double-click it, let it be blocked, then open System Settings → Privacy &
+  Security**, scroll to the Security section at the bottom, and click **Open
+  Anyway** beside the message naming the package. Only needed once per file.
+
+  Not the Control-click → Open route older instructions give: macOS 15 removed
+  that override precisely so a malicious installer could not talk somebody
+  through it, and going to System Settings is the replacement Apple named.
+  This README said Control-click for a while and it had already stopped
+  working.
 - **Or bypass Installer.app**, which is what consults Gatekeeper:
 
   ```bash
@@ -84,6 +90,83 @@ names the command that finishes the job by hand.
 `liostunnel-helper` is built for the host architecture alone, so a package
 built on Apple silicon installs an app whose helper will not run on an Intel
 Mac. `lipo -archs target/release/liostunnel-helper` says which you have.
+
+**The app is deliberately not App-Sandboxed** (`macos/Runner/*.entitlements`,
+which say so at length). App Sandbox denies `connect(2)` to a UNIX socket
+outside the app's container, and the helper's socket is at
+`/var/run/liostunnel.sock` — outside by construction, since a root daemon
+cannot listen inside a per-app container. A sandboxed build reaches the helper
+on no machine at all. `verify-pkg.sh` reads the shipped binary's own code
+signature and fails the package if the entitlement comes back.
+
+## Installing the Linux AppImage
+
+`packaging/make-appimage.sh` assembles
+`dist/LiosTunnel-<sha>-x86_64.AppImage`. Like `make-pkg.sh` it assembles only,
+so a failed build is never reported as a packaging problem:
+
+```bash
+cargo build --release -p liostunnel-helper
+(cd app && flutter build linux --release)
+./packaging/make-appimage.sh
+```
+
+`flutter build linux` needs `ninja-build` and `libgtk-3-dev`; `appimagetool`
+needs `libfuse2`. `appimagetool` itself is downloaded on first run into
+`~/.cache/liostunnel`, where it survives `rm -rf dist` and `git clean`.
+`./testing/verify-appimage.sh dist/LiosTunnel-<sha>-x86_64.AppImage` proves
+what the artifact carries — including that `AppRun` really launches the
+bundled app — without mounting it, installing anything, or needing root.
+
+**x86_64 only.** `make-appimage.sh` fetches the x86_64 `appimagetool` and
+builds with `ARCH=x86_64`, and `liostunnel-helper` is built for the host
+architecture alone.
+
+To run it:
+
+```bash
+chmod +x LiosTunnel-<sha>-x86_64.AppImage
+./LiosTunnel-<sha>-x86_64.AppImage
+```
+
+The `chmod` is yours to do: a file that has been through a browser, a zip, or
+a CI artifact download has lost the executable bit that `appimagetool` set.
+
+**The first launch asks for your root password, once.** An AppImage has no
+install step and nothing inside it runs as root, so — unlike the macOS package,
+whose `postinstall` does this under Installer.app — the app installs the
+privileged helper itself. It asks `pkexec` to run the bundled
+`install-helper.sh` authorized for *your* uid, which registers
+`liostunnel-helper.service` with systemd and starts it. **The polkit dialog is
+the consent gate**; nothing escalates without it.
+
+It asks only when there is no helper socket at all, and at most once per
+launch. A helper that is installed but stopped, or one installed for a
+different account, does not raise the dialog — neither is something a second
+install would fix.
+
+**If you cancel, or the system has no polkit,** a panel appears at the top of
+the Connection tab. It carries the command that finishes the job — selectable,
+so it can be read before it is run as root — and an **Install the helper**
+button that asks again. That command looks like this:
+
+```bash
+d="$(mktemp -d)" && cp -R '/tmp/.mount_XXXXXX/usr/bin/helper/.' "$d" \
+  && sudo "$d/install-helper.sh" --uid 1000
+```
+
+The copy is not ceremony. An AppImage mounts its squashfs through libfuse
+*without* `allow_other`, so the kernel denies that mountpoint to every uid
+except the one that mounted it — root included. A `sudo` pointed straight at
+`install-helper.sh` inside the mount gets EACCES on the path itself and never
+runs the script. Copying the whole directory out as yourself, onto a real
+filesystem, and elevating against the copy is what the app does too, and it
+has to be the whole directory: `install-helper.sh` reads the helper binary and
+the unit file from beside itself.
+
+To remove it, run `uninstall-helper.sh` from the same directory as root. It
+stops the daemon — which reverts any routes it installed and clears its state
+file — and deletes the unit.
 
 ## Use
 
@@ -196,11 +279,40 @@ cargo test -p liostunnel-core --lib dns::over_https -- --ignored     # 1 test, n
 sudo -E cargo test -p liostunnel-core --test tun_e2e -- --ignored    # 2 tests, real TUN device, needs root
 ```
 
-CI (`.github/workflows/ci.yml`) runs the first two on every push/PR (on both
-Linux and macOS for the hermetic suite), the DoH network test as a
-non-blocking job, and the TUN e2e tests as root on a Linux runner. It does
-not and cannot run the release gates below — those need a real server and a
-human's own machine.
+The Flutter half needs the FFI library staged where the Dart VM's loader can
+open it — `flutter test` runs with no Xcode or CMake build behind it, so it
+opens a dynamic library by path rather than linking one:
+
+```bash
+./testing/build-ffi-for-tests.sh && (cd app && flutter analyze && flutter test)
+```
+
+CI (`.github/workflows/ci.yml`) has six jobs:
+
+- **`unit`** — `cargo fmt --check`, `clippy -D warnings`, `cargo test
+  --workspace`, the lean `--no-default-features` build, and
+  `testing/verify-install-script.sh`, which pins `install-helper.sh`'s
+  authorization boundary (which uid the helper is installed to serve, and the
+  refusals that keep it from serving root or a system account). Both Linux and
+  macOS: D2 forces the two platforms to diverge as little as possible, so both
+  are covered from the first commit.
+- **`flutter`** — `flutter analyze` and `flutter test`, on both platforms,
+  after staging the FFI library.
+- **`integration`** — the SSH and Shadowsocks suites against a real sshd in
+  Docker. No TUN, no root.
+- **`doh-network`** — the one ignored test needing outbound internet.
+  Non-blocking: it depends on a third party being reachable.
+- **`tun-e2e`** — the root-gated TUN tests, on a Linux runner with a real
+  kernel.
+- **`package`** — the only job that runs `flutter build`, so it is the only
+  one that exercises cargokit, CMake, the Xcode project and the podspec at
+  all. It builds the `.pkg` on macOS and the AppImage on Linux, runs
+  `verify-pkg.sh` / `verify-appimage.sh` against what it built, and uploads
+  both as artifacts. `fail-fast: false`, so a macOS failure still produces the
+  Linux artifact.
+
+CI does not and cannot run the release gates below — those need a real server
+and a human's own machine.
 
 Release gates for the exit criteria that need a live network, a real route
 table, or a real server live in [`testing/gates/`](testing/gates/README.md).
