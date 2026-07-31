@@ -86,8 +86,9 @@ install -m 0644 "$here/liostunnel-helper.service" "$inner/liostunnel-helper.serv
 
 install -m 0644 "$here/appimage/liostunnel.desktop" "$appdir/liostunnel.desktop"
 # Reuse the macOS icon rather than adding a second one to keep in step.
-install -m 0644 "$repo/app/macos/Runner/Assets.xcassets/AppIcon.appiconset/app_icon_256.png" \
-                "$appdir/liostunnel.png"
+# The canonical raster, not the macOS asset catalogue: reaching into another
+# platform's icon set to build this one is how the two quietly diverge.
+install -m 0644 "$repo/assets/logo/liostunnel-1024.png" "$appdir/liostunnel.png"
 
 cat > "$appdir/AppRun" <<'RUN'
 #!/bin/sh
