@@ -20,7 +20,24 @@ ok()  { echo "  PASS  $*"; pass=$((pass+1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail+1)); }
 
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-chmod +x "$img"
+
+# ASSERTED, not established. This was `chmod +x "$img"`, which made the
+# condition true and then never looked at it -- so an AppImage that shipped
+# without the bit passed a verifier that had silently repaired it, and the user
+# who downloaded it got "permission denied". appimagetool marks its own output
+# 0755, so a non-executable one is a real defect in whatever produced this
+# file. Nothing below can read the artifact without it either -- extraction
+# runs the AppImage -- so this reports and stops rather than cascading into a
+# dozen assertions about an empty directory.
+if [ -x "$img" ]; then
+  ok "the AppImage is executable"
+else
+  bad "the AppImage is not executable; appimagetool marks its output 0755"
+  echo
+  echo "=== $pass passed, $fail failed ==="
+  exit 1
+fi
+
 # --appimage-extract needs no FUSE, so this works in a container. Its stderr is
 # KEPT (`2>&1 >/dev/null` sends stderr to the substitution and stdout to the
 # bin): discarding it is what turned the relative-path bug above into an
@@ -114,6 +131,49 @@ if [ $? -eq 0 ] && [ "${v#liostunnel-helper }" != "$v" ]; then
   ok "the bundled helper runs: $v"
 else
   bad "the bundled helper did not run: $v"
+fi
+
+# AppRun, RUN. Everything above about AppRun was `-x "$root/AppRun"`, which
+# appimagetool already refuses to build without -- so it asserted a
+# precondition of the artifact existing and never read a byte of the script
+# that is the entry point for every launch. An AppRun that execs
+# `liostunnel_app` by bare name (PATH lookup, nothing there), or that reads
+# $APPDIR (unset under --appimage-extract-and-run, and unset for a user who
+# extracted the AppImage by hand), or that drops "$@", builds and passes and
+# then launches nothing.
+#
+# Against a stub, so this does not start a GUI, and so the assertion is about
+# AppRun rather than about Flutter. The stub replaces the real executable in
+# the EXTRACTION -- a temp tree this script owns and deletes -- never in the
+# artifact. Deliberately last, after every assertion that reads the real
+# usr/bin/liostunnel_app.
+#
+# From `/`, so a relative path or a dependence on the caller's cwd fails here
+# rather than in the one place nobody is watching.
+argv="$tmp/apprun-argv"
+cat > "$root/usr/bin/liostunnel_app" <<STUB
+#!/bin/sh
+printf '%s\n' "\$0" >  '$argv'
+printf '%s\n' "\$@" >> '$argv'
+STUB
+chmod 755 "$root/usr/bin/liostunnel_app"
+apprun_err="$(cd / && "$root/AppRun" --a-flag 2>&1 >/dev/null)"
+rootreal="$(cd "$root" && pwd -P)"
+if [ ! -f "$argv" ]; then
+  bad "AppRun launched nothing: ${apprun_err:-no output}"
+else
+  ran="$(sed -n 1p "$argv")"
+  passed="$(sed -n 2p "$argv")"
+  case "$ran" in
+    "$rootreal"/usr/bin/liostunnel_app)
+      if [ "$passed" = "--a-flag" ]; then
+        ok "AppRun execs the bundled app, resolved from its own location, with its arguments"
+      else
+        bad "AppRun dropped its arguments (the app saw: ${passed:-<none>})"
+      fi ;;
+    *)
+      bad "AppRun ran $ran, not the liostunnel_app inside this AppImage" ;;
+  esac
 fi
 
 echo

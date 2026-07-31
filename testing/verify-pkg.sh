@@ -89,6 +89,29 @@ else
   ok "the app is not App-Sandboxed, so it can reach the helper's socket"
 fi
 
+# One path does not certify a bundle. A Flutter macOS app is the executable
+# PLUS the engine framework it links at runtime PLUS the assets it loads at
+# startup, and all three live under Contents/Frameworks. Delete that directory
+# from the payload -- no FlutterMacOS.framework, no App.framework, therefore no
+# flutter_assets -- repackage with the same `pkgbuild` invocation, and the
+# suite scored 18 of 18 on a bundle that cannot launch. make-pkg.sh copies the
+# built app with `cp -R`, which is not fatal per file on ENOSPC: it copies what
+# it can and returns 0, so a full disk produces exactly that package.
+# verify-appimage.sh already closed this hole for Linux; this is its mirror,
+# and the mirror argument cuts both ways.
+[ -d "$app/Contents/Frameworks" ] \
+  && ok "the app carries Contents/Frameworks" \
+  || bad "no Contents/Frameworks — the app has neither engine nor assets"
+# Non-empty, and through the framework's own symlinks, so this reads the Mach-O
+# and not the directory that holds it. `-d` on the .framework alone passes on a
+# `cp -R` interrupted between mkdir and the contents.
+[ -s "$app/Contents/Frameworks/FlutterMacOS.framework/FlutterMacOS" ] \
+  && ok "the Flutter engine framework is present and non-empty" \
+  || bad "missing or empty FlutterMacOS.framework/FlutterMacOS — the app would not load"
+[ -n "$(ls -A "$app/Contents/Frameworks/App.framework/Resources/flutter_assets" 2>/dev/null)" ] \
+  && ok "the Flutter assets are present" \
+  || bad "missing or empty App.framework/Resources/flutter_assets — the app would not start"
+
 for f in liostunnel-helper install-helper.sh uninstall-helper.sh; do
   [ -x "$helper/$f" ] && ok "$f is inside the app and executable" \
                       || bad "missing or not executable: $f"
