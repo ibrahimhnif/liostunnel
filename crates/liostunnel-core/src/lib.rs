@@ -5,6 +5,7 @@ pub mod dns;
 pub mod engine;
 pub mod error;
 pub mod net;
+pub mod platform;
 pub mod protocols;
 pub mod route;
 pub mod stats;

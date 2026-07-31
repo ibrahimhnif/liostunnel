@@ -51,3 +51,9 @@ doh = [
 # the probe's timeout test would otherwise burn 8s of real wall clock, which
 # was the whole module's runtime.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "time", "test-util"] }
+
+# Android only. `jni` is how `LiosVpnService` reaches native code and how
+# native code calls `VpnService.protect`; gating it by target keeps it out of
+# every desktop build rather than carrying it everywhere for one platform.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
