@@ -32,7 +32,7 @@ LiosTunnel release outputs are platform specific:
 - **Linux:** `.AppImage`
 - **Android:** ABI-specific `.apk` files (for example `arm64-v8a`)
 
-Build and packaging scripts are provided under `/home/runner/work/liostunnel/liostunnel/packaging`, and verification scripts are available under `/home/runner/work/liostunnel/liostunnel/testing`.
+Build and packaging scripts are provided under `packaging/`, and verification scripts are available under `testing/`.
 
 ## CLI quick usage
 
@@ -59,8 +59,8 @@ sudo liostunnel connect myserver.liostunnel.json --user me --route-mode default
 
 ## Repository references
 
-- Product requirements: `/home/runner/work/liostunnel/liostunnel/PRD.md`
-- App source: `/home/runner/work/liostunnel/liostunnel/app`
-- Rust crates: `/home/runner/work/liostunnel/liostunnel/crates`
-- Packaging scripts: `/home/runner/work/liostunnel/liostunnel/packaging`
-- Verification assets: `/home/runner/work/liostunnel/liostunnel/testing`
+- Product requirements: `PRD.md`
+- App source: `app/`
+- Rust crates: `crates/`
+- Packaging scripts: `packaging/`
+- Verification assets: `testing/`
