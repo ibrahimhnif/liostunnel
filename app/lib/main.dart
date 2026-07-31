@@ -20,12 +20,20 @@ import 'src/rust/frb_generated.dart';
 const kSocketPath = '/var/run/liostunnel.sock';
 
 Future<void> main() async {
+  // `defaultDirectory` reaches a platform channel on Android, which needs the
+  // binding up first.
+  WidgetsFlutterBinding.ensureInitialized();
   await RustLib.init();
-  runApp(const LiosApp());
+  runApp(LiosApp(profilesDirectory: await ProfileStore.defaultDirectory()));
 }
 
 class LiosApp extends StatelessWidget {
-  const LiosApp({super.key});
+  const LiosApp({super.key, this.profilesDirectory});
+
+  /// Resolved once at startup rather than per-[ProfileStore], because on
+  /// Android it can only be obtained asynchronously and every construction
+  /// site here is synchronous.
+  final String? profilesDirectory;
 
   @override
   Widget build(BuildContext context) {
@@ -34,7 +42,7 @@ class LiosApp extends StatelessWidget {
       child: MaterialApp(
         title: 'LiosTunnel',
         theme: ThemeData(useMaterial3: true),
-        home: const HomePage(),
+        home: HomePage(profilesDirectory: profilesDirectory),
       ),
     );
   }

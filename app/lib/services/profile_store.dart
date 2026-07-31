@@ -1,5 +1,7 @@
 import 'dart:io';
 
+import 'package:path_provider/path_provider.dart';
+
 import '../src/rust/api/config.dart';
 import '../src/rust/dto/profile.dart';
 
@@ -44,6 +46,25 @@ class ProfileStore {
   static String _defaultDir() {
     final home = Platform.environment['HOME'] ?? '.';
     return '$home/.liostunnel';
+  }
+
+  /// The default store directory for the platform this is running on.
+  ///
+  /// Async because Android will not tell us synchronously. Resolve it once at
+  /// startup and hand the result to [ProfileStore]; the synchronous
+  /// [_defaultDir] fallback stays exactly as it was for desktop.
+  ///
+  /// **Android has no `HOME`.** The desktop rule then produced `./.liostunnel`
+  /// — relative to the process working directory, which on Android is `/` and
+  /// is not writable by an app. The store silently read as empty and any save
+  /// would have failed. Observed on a device, not reasoned about: the empty
+  /// state rendered the path it was using and the path was wrong.
+  static Future<String> defaultDirectory() async {
+    if (Platform.isAndroid) {
+      final dir = await getApplicationDocumentsDirectory();
+      return '${dir.path}/.liostunnel';
+    }
+    return _defaultDir();
   }
 
   Future<List<LoadedProfile>> load() async {
