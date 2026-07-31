@@ -268,6 +268,17 @@ class HelperClient {
     _reader = null;
     _socket?.destroy();
     _socket = null;
+    // Fail whatever was in flight. Closing used to leave `_pending`
+    // untouched, so a caller awaiting a request when the client shut down
+    // waited forever -- the same hang the test below this one exists to
+    // prevent for a dropped socket, reached instead by closing deliberately.
+    final inflight = _pending.values.toList();
+    _pending.clear();
+    for (final c in inflight) {
+      if (!c.isCompleted) {
+        c.completeError(const HelperUnavailable('the client was closed'));
+      }
+    }
     await _events.close();
   }
 }
