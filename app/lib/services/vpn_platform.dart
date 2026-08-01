@@ -13,7 +13,7 @@ import 'package:flutter/services.dart';
 class VpnPlatform {
   const VpnPlatform._();
 
-  static const _channel = MethodChannel('com.liostunnel.app/vpn');
+  static const _channel = MethodChannel('id.liostech.liostunnel/vpn');
 
   /// Raises the system VPN consent dialog when consent has not been given.
   ///

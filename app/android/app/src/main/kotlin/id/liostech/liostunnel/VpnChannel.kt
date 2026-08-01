@@ -1,4 +1,4 @@
-package com.liostunnel.app
+package id.liostech.liostunnel
 
 import android.app.Activity
 import android.content.Intent
@@ -17,7 +17,7 @@ import io.flutter.plugin.common.MethodChannel
 class VpnChannel(private val activity: Activity) : MethodChannel.MethodCallHandler {
 
     companion object {
-        const val CHANNEL = "com.liostunnel.app/vpn"
+        const val CHANNEL = "id.liostech.liostunnel/vpn"
         const val REQUEST_CONSENT = 9001
     }
 

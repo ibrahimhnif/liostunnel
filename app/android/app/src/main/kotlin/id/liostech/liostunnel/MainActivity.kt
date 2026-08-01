@@ -1,4 +1,4 @@
-package com.liostunnel.app
+package id.liostech.liostunnel
 
 import android.content.Intent
 import io.flutter.embedding.android.FlutterActivity

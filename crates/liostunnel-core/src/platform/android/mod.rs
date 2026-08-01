@@ -2,16 +2,22 @@
 //!
 //! # Symbol names are load-bearing
 //!
-//! JNI resolves `external fun nativeStart` on `com.liostunnel.app.LiosVpnService`
-//! to the exported symbol `Java_com_liostunnel_app_LiosVpnService_nativeStart`.
+//! JNI resolves `external fun nativeStart` on `id.liostech.liostunnel.LiosVpnService`
+//! to the exported symbol `Java_id_liostech_liostunnel_LiosVpnService_nativeStart`.
 //! Renaming the Kotlin class, moving it between packages, or changing
 //! `applicationId` silently breaks the link — the app builds, installs, and
 //! throws `UnsatisfiedLinkError` the moment the service starts.
 //!
-//! The package was normalised to `com.liostunnel.app` in Task 1 for this
-//! reason: `flutter create` derives it from the project name, which would have
-//! produced `com.liostunnel.liostunnel_app`, and JNI escapes an underscore in
-//! a package segment to `_1`.
+//! The package has been renamed twice, and both times every symbol below had
+//! to move with it. `flutter create` first derived `com.liostunnel.liostunnel_app`
+//! from the project name, which JNI would have rendered as
+//! `Java_com_liostunnel_liostunnel_1app_...` because an underscore in a package
+//! segment escapes to `_1`. It is now `id.liostech.liostunnel`, which has no
+//! underscores and so needs no escaping.
+//!
+//! Nothing checks this at build time. `testing/verify-jni-symbols.sh` compares
+//! what this file exports against what Kotlin declares, which is the only
+//! mechanism that has actually caught a mismatch here.
 
 pub mod engine;
 
@@ -70,7 +76,7 @@ static SERVICE: OnceLock<GlobalRef> = OnceLock::new();
 /// Called by `LiosVpnService.onStartCommand` before the tunnel is established
 /// and therefore before any socket exists to protect.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeInit(
+pub extern "system" fn Java_id_liostech_liostunnel_LiosVpnService_nativeInit(
     env: JNIEnv,
     this: JObject,
 ) {
@@ -152,7 +158,7 @@ pub fn protect_fd(fd: RawFd) -> io::Result<()> {
 /// Task 2 stub — Task 4 replaces the body with `AndroidTun` construction and
 /// starts the engine on it.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeStart(
+pub extern "system" fn Java_id_liostech_liostunnel_LiosVpnService_nativeStart(
     _env: JNIEnv,
     _this: JObject,
     fd: i32,
@@ -174,7 +180,7 @@ pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeStart(
 /// address and `StackConfig::address` have to agree, and a silent divergence
 /// would leave the stack answering on an address the descriptor never carries.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeTunAddress<'a>(
+pub extern "system" fn Java_id_liostech_liostunnel_LiosVpnService_nativeTunAddress<'a>(
     env: JNIEnv<'a>,
     _this: JObject<'a>,
 ) -> jni::sys::jstring {
@@ -187,7 +193,7 @@ pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeTunAddress<'
 
 /// The MTU `VpnService.Builder` must use, for the same reason.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeTunMtu(
+pub extern "system" fn Java_id_liostech_liostunnel_LiosVpnService_nativeTunMtu(
     _env: JNIEnv,
     _this: JObject,
 ) -> i32 {
@@ -202,7 +208,7 @@ pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeTunMtu(
 /// Returning early would leave a thread reading a descriptor that is about to
 /// be closed underneath it.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeStop(
+pub extern "system" fn Java_id_liostech_liostunnel_LiosVpnService_nativeStop(
     _env: JNIEnv,
     _this: JObject,
 ) {

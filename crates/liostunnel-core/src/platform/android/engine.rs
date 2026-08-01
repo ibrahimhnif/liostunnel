@@ -39,9 +39,9 @@ use std::sync::{Arc, Mutex};
 /// must name the same address, or the stack answers on one the descriptor
 /// never carries and the tunnel silently carries nothing. Rather than write
 /// the literal twice, Kotlin reads it from
-/// [`Java_com_liostunnel_app_LiosVpnService_nativeTunAddress`].
+/// [`Java_id_liostech_liostunnel_LiosVpnService_nativeTunAddress`].
 ///
-/// [`Java_com_liostunnel_app_LiosVpnService_nativeTunAddress`]: super::Java_com_liostunnel_app_LiosVpnService_nativeTunAddress
+/// [`Java_id_liostech_liostunnel_LiosVpnService_nativeTunAddress`]: super::Java_id_liostech_liostunnel_LiosVpnService_nativeTunAddress
 pub const TUN_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 90, 0, 1);
 
 /// Matches `Builder.setMtu`, for the same reason as [`TUN_ADDRESS`].
@@ -337,7 +337,7 @@ async fn assemble(
 /// Inside the app's own data directory: an Android app has no `$HOME`, and
 /// this is the only location it is guaranteed to be able to write.
 fn known_hosts_path() -> std::path::PathBuf {
-    std::path::PathBuf::from("/data/data/com.liostunnel.app/files/known_hosts")
+    std::path::PathBuf::from("/data/data/id.liostech.liostunnel/files/known_hosts")
 }
 
 /// Stops the engine and releases the descriptor.

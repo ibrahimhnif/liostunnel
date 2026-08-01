@@ -6,13 +6,15 @@ plugins {
 }
 
 android {
-    // `flutter create` derives this from the project name, giving
-    // `com.liostunnel.liostunnel_app`. Normalised to `com.liostunnel.app`
-    // because JNI escapes an underscore in a package segment to `_1`, so the
-    // generated name would make every native symbol read
-    // `Java_com_liostunnel_liostunnel_1app_...`. The JNI function names in
-    // `platform/android` depend on this value.
-    namespace = "com.liostunnel.app"
+    // The app's identity, and load-bearing beyond that: JNI derives every
+    // native symbol name from it, so `platform/android` must be renamed in
+    // step with this line or the service throws UnsatisfiedLinkError on
+    // start. `testing/verify-jni-symbols.sh` is what checks the two agree.
+    //
+    // No underscores here on purpose. JNI escapes one in a package segment to
+    // `_1`, which is what `flutter create`'s derived
+    // `com.liostunnel.liostunnel_app` would have produced.
+    namespace = "id.liostech.liostunnel"
     compileSdk = 34
     ndkVersion = "27.1.12297006"
 
@@ -26,7 +28,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.liostunnel.app"
+        applicationId = "id.liostech.liostunnel"
         // Pinned rather than inherited from `flutter.*`: the VpnService work
         // targets a known API surface, and a Flutter upgrade silently moving
         // either of these would change which foreground-service rules apply.

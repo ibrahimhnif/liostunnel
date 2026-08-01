@@ -1,4 +1,4 @@
-package com.liostunnel.app
+package id.liostech.liostunnel
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -30,7 +30,7 @@ class LiosVpnService : VpnService() {
         private const val NOTIFICATION_ID = 1
 
         /** Asks a running service to tear the tunnel down. See onStartCommand. */
-        const val ACTION_DISCONNECT = "com.liostunnel.app.DISCONNECT"
+        const val ACTION_DISCONNECT = "id.liostech.liostunnel.DISCONNECT"
 
 
         /**

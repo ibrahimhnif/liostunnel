@@ -241,6 +241,11 @@ jobs:
           for apk in app/build/app/outputs/flutter-apk/*release*.apk; do
             ./testing/verify-apk.sh "$apk"
           done
+      # Nothing else catches a package rename that did not reach the Rust
+      # side: everything compiles, the APK builds, and the service throws
+      # UnsatisfiedLinkError the first time a user taps Connect.
+      - name: verify the JNI symbols match Kotlin
+        run: ./testing/verify-jni-symbols.sh
       - uses: actions/upload-artifact@v4
         with:
           name: liostunnel-android-${{ github.sha }}

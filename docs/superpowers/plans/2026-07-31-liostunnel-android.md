@@ -23,7 +23,7 @@
 - **`doh` stays enabled.** Do not disable it to save size.
 - **Release builds are per-ABI** (`--split-per-abi`), never universal.
 - **Commit messages go through a file with `git commit -F`.** Never `-m` with backticks.
-- **The applicationId is `com.liostunnel.app`.** JNI symbol names depend on it.
+- **The applicationId is `id.liostech.liostunnel`.** JNI symbol names depend on it.
 
 ## Testing Reality
 
@@ -40,8 +40,8 @@ A task is not complete until its stated verification kind has actually been run.
 | File | Responsibility |
 |---|---|
 | `app/android/**` | Generated Flutter Android project (Task 1) |
-| `app/android/app/src/main/kotlin/com/liostunnel/app/LiosVpnService.kt` | `VpnService` subclass: builder, fd, foreground notification |
-| `app/android/app/src/main/kotlin/com/liostunnel/app/VpnChannel.kt` | `MethodChannel` handler: consent, start, stop |
+| `app/android/app/src/main/kotlin/id/liostech/liostunnel/LiosVpnService.kt` | `VpnService` subclass: builder, fd, foreground notification |
+| `app/android/app/src/main/kotlin/id/liostech/liostunnel/VpnChannel.kt` | `MethodChannel` handler: consent, start, stop |
 | `app/android/app/src/main/AndroidManifest.xml` | Service declaration, permissions, foreground service type |
 | `crates/liostunnel-core/src/platform/android/mod.rs` | JNI bridge: `JavaVM`/service refs, `protect_fd` |
 | `crates/liostunnel-core/src/net/android_tun.rs` | `AndroidTun`: `PacketIo` over the VpnService fd |
@@ -82,7 +82,7 @@ Expected: no "Android license status unknown".
 - [ ] **Step 2: Generate the Android platform directory**
 
 ```bash
-cd app && flutter create --platforms=android --org com.liostunnel .
+cd app && flutter create --platforms=android --org id.liostech .
 ```
 
 Verify the applicationId — the JNI symbol names in Task 3 depend on it:
@@ -91,7 +91,7 @@ Verify the applicationId — the JNI symbol names in Task 3 depend on it:
 grep -rn "applicationId" app/android/app/build.gradle.kts
 ```
 
-Expected: `applicationId = "com.liostunnel.app"`. If it differs, **stop and report** — do not proceed with a mismatched package.
+Expected: `applicationId = "id.liostech.liostunnel"`. If it differs, **stop and report** — do not proceed with a mismatched package.
 
 - [ ] **Step 3: Set the SDK levels**
 
@@ -103,7 +103,7 @@ android {
     ndkVersion = "27.1.12297006"
 
     defaultConfig {
-        applicationId = "com.liostunnel.app"
+        applicationId = "id.liostech.liostunnel"
         minSdk = 29
         targetSdk = 34
     }
@@ -146,8 +146,8 @@ git commit -F /tmp/task1.txt
 ### Task 2: LiosVpnService — consent, tunnel, foreground
 
 **Files:**
-- Create: `app/android/app/src/main/kotlin/com/liostunnel/app/LiosVpnService.kt`
-- Create: `app/android/app/src/main/kotlin/com/liostunnel/app/VpnChannel.kt`
+- Create: `app/android/app/src/main/kotlin/id/liostech/liostunnel/LiosVpnService.kt`
+- Create: `app/android/app/src/main/kotlin/id/liostech/liostunnel/VpnChannel.kt`
 - Create: `app/lib/services/vpn_platform.dart`
 - Modify: `app/android/app/src/main/AndroidManifest.xml`
 
@@ -182,7 +182,7 @@ git commit -F /tmp/task1.txt
 - [ ] **Step 2: The service**
 
 ```kotlin
-package com.liostunnel.app
+package id.liostech.liostunnel
 
 import android.app.*
 import android.content.Intent
@@ -265,7 +265,7 @@ class LiosVpnService : VpnService() {
 `VpnService.prepare(context)` returns an `Intent` when consent has not been granted, and `null` when it has.
 
 ```kotlin
-package com.liostunnel.app
+package id.liostech.liostunnel
 
 import android.app.Activity
 import android.content.Intent
@@ -275,7 +275,7 @@ import io.flutter.plugin.common.MethodChannel
 class VpnChannel(private val activity: Activity) : MethodChannel.MethodCallHandler {
 
     companion object {
-        const val CHANNEL = "com.liostunnel.app/vpn"
+        const val CHANNEL = "id.liostech.liostunnel/vpn"
         const val REQUEST_CONSENT = 9001
     }
 
@@ -323,7 +323,7 @@ class VpnChannel(private val activity: Activity) : MethodChannel.MethodCallHandl
 import 'package:flutter/services.dart';
 
 class VpnPlatform {
-  static const _channel = MethodChannel('com.liostunnel.app/vpn');
+  static const _channel = MethodChannel('id.liostech.liostunnel/vpn');
 
   /// Raises the system VPN consent dialog if needed.
   /// Returns true when consent is granted.
@@ -341,14 +341,14 @@ Task 3 implements these. For now, in `crates/liostunnel-core/src/platform/androi
 
 ```rust
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeStart(
+pub extern "system" fn Java_id_liostech_liostunnel_LiosVpnService_nativeStart(
     _env: jni::JNIEnv, _this: jni::objects::JObject, fd: i32,
 ) {
     tracing::info!(fd, "nativeStart called");
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeStop(
+pub extern "system" fn Java_id_liostech_liostunnel_LiosVpnService_nativeStop(
     _env: jni::JNIEnv, _this: jni::objects::JObject,
 ) {
     tracing::info!("nativeStop called");
@@ -422,7 +422,7 @@ static SERVICE: OnceLock<GlobalRef> = OnceLock::new();
 
 /// Called once by `LiosVpnService.onStartCommand`, before any socket exists.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeInit(
+pub extern "system" fn Java_id_liostech_liostunnel_LiosVpnService_nativeInit(
     env: JNIEnv,
     this: JObject,
 ) {
@@ -487,7 +487,7 @@ Add, to be deleted in Step 7:
 
 ```rust
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_liostunnel_app_LiosVpnService_nativeProbeProtect(
+pub extern "system" fn Java_id_liostech_liostunnel_LiosVpnService_nativeProbeProtect(
     _env: JNIEnv, _this: JObject,
 ) {
     std::thread::spawn(|| {
