@@ -245,6 +245,29 @@ established. The phase-closing checks:
 | AND-7 | Disconnect tears down the tunnel and the notification |
 | AND-8 | Release builds are per-ABI, not universal |
 
+### Verified
+
+All eight, on the `Medium_Phone_API_36.1` emulator against `testing/docker`
+(shadowsocks-libev, a real sshd, nginx behind them, and a resolver reachable
+only through the relay). Recorded here because the phase's own rule was that
+an emulator pass never substitutes for evidence, and this is the evidence.
+
+| | Evidence |
+|---|---|
+| AND-1 | protected socket connects in 23ms, unprotected one times out after 133s |
+| AND-2 | `HTTP/1.1 200 OK` from 192.168.158.4, reachable only through the relay |
+| AND-3 | the same, over SSH — the `connect_stream` + `protect_fd` path |
+| AND-4 | 30 concurrent flows, 30 × 200 OK, 0 failed, on **both** protocols |
+| AND-5 | Activity destroyed, traffic still flowing, counters continued on reopen rather than resetting |
+| AND-6 | state, totals and live speed rendered from the polled stream |
+| AND-7 | `nativeStop`, tun0 gone, zero service records, relay unreachable again |
+| AND-8 | three APKs, one ABI each, verified by content in CI |
+
+AND-3 was the last and went unexercised longest: the code was written, compiled
+for both architectures and reviewed twice before it ever ran. It worked first
+time, which is not evidence that writing it carefully was sufficient — the
+three defects AND-5 and AND-7 exposed were also written carefully.
+
 **AND-4 is the one to care about.** AND-2 and AND-3 can pass with a broken
 `protect()` on an emulator or a lucky first request; AND-4 is what fails when a
 socket escapes, and it is the failure that would otherwise reach a user as
