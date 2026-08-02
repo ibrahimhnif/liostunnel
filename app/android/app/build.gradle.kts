@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("kotlin-android")
@@ -46,11 +48,44 @@ android {
         versionName = flutter.versionName
     }
 
+    // The upload key, read from a file that is never committed.
+    //
+    // `android/key.properties` holds the keystore path and its passwords. It
+    // is git-ignored, and so is the keystore itself: an upload key in the
+    // repository is an upload key in every clone and every CI log.
+    //
+    // Absent, the release build falls back to debug signing so that CI and
+    // `flutter run --release` keep working. That fallback is deliberately
+    // LOUD, and `testing/verify-apk.sh` refuses to call a debug-signed
+    // artifact publishable -- a debug-signed bundle is rejected by Play, and
+    // finding that out at upload time is a wasted trip.
+    val keyProps = Properties()
+    val keyPropsFile = rootProject.file("key.properties")
+    val hasUploadKey = keyPropsFile.exists()
+    if (hasUploadKey) {
+        keyPropsFile.inputStream().use { keyProps.load(it) }
+    } else {
+        logger.warn("key.properties absent: release builds will be DEBUG-SIGNED and cannot be uploaded to Play. See docs/ANDROID-RELEASE.md")
+    }
+
+    signingConfigs {
+        if (hasUploadKey) {
+            create("upload") {
+                storeFile = file(keyProps.getProperty("storeFile"))
+                storePassword = keyProps.getProperty("storePassword")
+                keyAlias = keyProps.getProperty("keyAlias")
+                keyPassword = keyProps.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (hasUploadKey) {
+                signingConfigs.getByName("upload")
+            } else {
+                signingConfigs.getByName("debug")
+            }
         }
     }
 }
