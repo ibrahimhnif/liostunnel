@@ -1,0 +1,31 @@
+LiosTunnel routes your device's traffic through a server you control, using
+Shadowsocks or SSH.
+
+It is not a VPN subscription. There is no LiosTunnel network, no shared exit
+and nothing to sign up for. You point it at a server you already run, and it
+connects only there.
+
+WHAT IT DOES
+
+• Shadowsocks (aes-128-gcm, aes-256-gcm, chacha20-ietf-poly1305)
+• SSH, with host key verification on by default
+• All traffic through the tunnel, with DNS resolved through it too
+• Live connection state, byte totals and current speed
+• Keeps running when you switch apps or close the task
+
+WHAT IT DOES NOT DO
+
+• No accounts, no telemetry, no analytics, no advertising identifiers
+• No traffic logging. Payload bytes and DNS names are never written to a log,
+  by design and not by configuration
+• No third-party SDKs
+• Nothing leaves your device except the traffic you asked to be tunnelled, and
+  that goes only to the server in your profile
+
+Your server credentials stay on the device, in the app's private storage.
+
+OPEN SOURCE
+
+The whole client is open source, including the packet engine. If you want to
+know what it does with your traffic, the answer is readable rather than
+promised.
