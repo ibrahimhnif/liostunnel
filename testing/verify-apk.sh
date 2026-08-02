@@ -82,7 +82,52 @@ else
     bad "AndroidManifest.xml does not declare LiosVpnService"
 fi
 
-# 5. Flutter's own assets are present, so this is an app rather than a shell.
+# 5. The native library is 16 KB page aligned.
+#
+# Android 15 brought devices with a 16 KB memory page size, and a library whose
+# LOAD segments are aligned to the older 4 KB cannot be mapped on them: the app
+# installs and then fails to load its own engine. Play requires this of anything
+# targeting 15 or later, which this app does.
+#
+# The ELF headers are parsed here rather than shelled out to readelf, which is
+# not present on every runner. Checked in the artifact rather than the build
+# tree, because the thing that ships is the only thing worth asserting about.
+lib="$(printf '%s\n' "$listing" | awk '{print $4}' | grep 'libliostunnel_ffi\.so$' | head -1)"
+if [ -z "$lib" ]; then
+    bad "no native library to check alignment on"
+else
+    align="$(unzip -p "$apk" "$lib" 2>/dev/null | python3 -c '
+import struct, sys
+d = sys.stdin.buffer.read()
+if d[:4] != b"\x7fELF":
+    print("not-elf"); raise SystemExit
+is64 = d[4] == 2
+if is64:
+    phoff, = struct.unpack_from("<Q", d, 0x20)
+    phentsize, phnum = struct.unpack_from("<HH", d, 0x36)
+    ptype_off, align_off = 0, 48
+else:
+    phoff, = struct.unpack_from("<I", d, 0x1c)
+    phentsize, phnum = struct.unpack_from("<HH", d, 0x2a)
+    ptype_off, align_off = 0, 28
+worst = None
+for i in range(phnum):
+    o = phoff + i * phentsize
+    ptype, = struct.unpack_from("<I", d, o + ptype_off)
+    if ptype != 1:          # PT_LOAD
+        continue
+    a, = struct.unpack_from("<Q" if is64 else "<I", d, o + align_off)
+    worst = a if worst is None else min(worst, a)
+print(worst if worst is not None else "no-load")
+')"
+    case "$align" in
+        16384|32768|65536) ok "native library is $align-byte page aligned" ;;
+        not-elf|no-load|"") bad "could not read ELF program headers from $lib" ;;
+        *) bad "native library aligned to $align, needs at least 16384 for Android 15+ devices" ;;
+    esac
+fi
+
+# 6. Flutter's own assets are present, so this is an app rather than a shell.
 if printf '%s\n' "$listing" | grep -q 'flutter_assets'; then
     ok "carries flutter_assets"
 else

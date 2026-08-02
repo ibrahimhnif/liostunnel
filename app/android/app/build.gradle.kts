@@ -15,7 +15,7 @@ android {
     // `_1`, which is what `flutter create`'s derived
     // `com.liostunnel.liostunnel_app` would have produced.
     namespace = "id.liostech.liostunnel"
-    compileSdk = 34
+    compileSdk = 36
     ndkVersion = "27.1.12297006"
 
     compileOptions {
@@ -33,7 +33,15 @@ android {
         // targets a known API surface, and a Flutter upgrade silently moving
         // either of these would change which foreground-service rules apply.
         minSdk = 29
-        targetSdk = 34
+        // 36, not 34. Google Play requires new apps and updates to target
+        // Android 16 from 31 August 2026; an app on 34 cannot be submitted
+        // after that and is only served to devices running 34 or older.
+        //
+        // This crossed two releases that both tightened what this app depends
+        // on -- foreground service types in 15, and 15's 16 KB native page
+        // size, which matters here because we ship .so files. Neither is
+        // theoretical for a VpnService with a Rust engine behind it.
+        targetSdk = 36
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
